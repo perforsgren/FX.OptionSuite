@@ -228,6 +228,7 @@ namespace FX.UI.WinForms
         private bool _suspendDealPricingSummary = true;
         public void SuspendDealPricingSummary(bool on) => _suspendDealPricingSummary = on;
 
+        public event EventHandler SpotRefreshRequested;
 
         #region === Constructor & init ===
 
@@ -3301,6 +3302,12 @@ namespace FX.UI.WinForms
             {
                 PriceRequested?.Invoke(this, new PriceRequestUiArgs { TargetLeg = null });
                 return true;
+            }
+
+            if (keyData == Keys.F5)
+            {
+                SpotRefreshRequested?.Invoke(this, EventArgs.Empty);
+                return true; // markerat som hanterat
             }
 
             // F2: in i edit mode + markera allt innehåll

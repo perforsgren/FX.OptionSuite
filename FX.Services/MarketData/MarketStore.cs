@@ -160,33 +160,50 @@ namespace FX.Services.MarketData
 
             EnsureSnapshotPair(p6);
 
+            const double EPS = 1e-10;
+
             var cur = MarketSnapshot.TryGet(_current.RdByLeg, legId);
             if (cur == null)
             {
                 _current.RdByLeg[legId] = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
-            }
-            else
-            {
-                switch (cur.Override)
-                {
-                    case OverrideMode.Mid:
-                    case OverrideMode.Both:
-                        break; // låst
-                    case OverrideMode.Bid:
-                        cur.Replace(cur.Effective.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                        break;
-                    case OverrideMode.Ask:
-                        cur.Replace(cur.Effective.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                        break;
-                    case OverrideMode.None:
-                        cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
-                        break;
-                }
-                cur.MarkStale(isStale, nowUtc);
+                RaiseChanged("FeedRd:" + legId);
+                return;
             }
 
+            // === Idempotens: om effektivt värde redan är (nästan) samma → no-op ===
+            var eff = cur.Effective; // TwoWay<double>
+            bool same;
+            switch (cur.Override)
+            {
+                case OverrideMode.Bid:
+                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Ask:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Mid:
+                case OverrideMode.Both:
+                    // Låst – ingen feedpåverkan
+                    return;
+
+                case OverrideMode.None:
+                default:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
+                    break;
+            }
+
+            cur.MarkStale(isStale, nowUtc);
             RaiseChanged("FeedRd:" + legId);
         }
+
 
         /// <summary>Feed → rf för ett leg. Samma regler som rd.</summary>
         public void SetRfFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
@@ -197,33 +214,48 @@ namespace FX.Services.MarketData
 
             EnsureSnapshotPair(p6);
 
+            const double EPS = 1e-10;
+
             var cur = MarketSnapshot.TryGet(_current.RfByLeg, legId);
             if (cur == null)
             {
                 _current.RfByLeg[legId] = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
-            }
-            else
-            {
-                switch (cur.Override)
-                {
-                    case OverrideMode.Mid:
-                    case OverrideMode.Both:
-                        break;
-                    case OverrideMode.Bid:
-                        cur.Replace(cur.Effective.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                        break;
-                    case OverrideMode.Ask:
-                        cur.Replace(cur.Effective.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                        break;
-                    case OverrideMode.None:
-                        cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
-                        break;
-                }
-                cur.MarkStale(isStale, nowUtc);
+                RaiseChanged("FeedRf:" + legId);
+                return;
             }
 
+            var eff = cur.Effective;
+            bool same;
+            switch (cur.Override)
+            {
+                case OverrideMode.Bid:
+                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Ask:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Mid:
+                case OverrideMode.Both:
+                    return;
+
+                case OverrideMode.None:
+                default:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
+                    break;
+            }
+
+            cur.MarkStale(isStale, nowUtc);
             RaiseChanged("FeedRf:" + legId);
         }
+
 
         // =========================
         // RD/RF – USER
@@ -331,8 +363,27 @@ namespace FX.Services.MarketData
         private void RaiseChanged(string reason)
         {
             var snap = _current;
+
+            // Debug: visa tråd, reason, pair och Effective spot
+            System.Diagnostics.Debug.WriteLine(
+                $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] " +
+                $"reason={reason} pair={snap?.Pair6} " +
+                (snap?.Spot == null
+                    ? "spotEff=null"
+                    : $"spotEff={snap.Spot.Effective.Bid:F6}/{snap.Spot.Effective.Ask:F6}")
+            );
+
             var h = Changed;
-            if (h != null) h(this, new MarketChangedEventArgs(snap, reason));
+            if (h != null)
+                h(this, new MarketChangedEventArgs(snap, reason));
         }
+
+
+
+
+
+
+
+
     }
 }

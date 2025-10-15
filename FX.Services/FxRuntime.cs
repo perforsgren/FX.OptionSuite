@@ -2,51 +2,51 @@
 // (Uppdaterad: valfri MarketStore-ref + hjälpare för rd/rf-feeding)
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Threading;
-using FX.Core;                     // PriceRequest/PriceResult (POCOs)
-using CoreI = FX.Core.Interfaces;  // Interfaces (IMessageBus, IPriceEngine)
+using FX.Core.Interfaces;
 using FX.Messages.Commands;
 using FX.Messages.Events;
 using FX.Core.Domain;
 using FX.Core.Domain.MarketData;   // IMarketStore
 using FX.Services.MarketData;      // UsdAnchoredRateFeeder (och ev. orchestrator senare)
+using Microsoft.Extensions.DependencyInjection;
 
 
 namespace FX.Services
 {
     public sealed class FxRuntime : IDisposable
     {
-        private readonly CoreI.IMessageBus _bus;
-        private readonly CoreI.IPriceEngine _price;
-        private readonly AppStateStore _state;
+        private readonly IMessageBus _bus;
+        private readonly IPriceEngine _price;
+        private readonly ISpotSetDateService _spotSvc;
         private readonly IMarketStore _marketStore; // valfri, för rd/rf/spot via store
-
         private readonly List<IDisposable> _subscriptions = new List<IDisposable>();
+        private readonly AppStateStore _state;
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
-        private readonly FX.Core.Interfaces.ISpotSetDateService _spotSvc;
 
         /// <summary>
-        /// Standardkonstruktor (utan MarketStore).
+        /// Enda publika konstruktorn – kräver både MarketStore (för spot/rd/rf)
+        /// och SpotSetDateService (för spot/settlement-datum).
         /// </summary>
-        public FxRuntime(CoreI.IMessageBus bus, CoreI.IPriceEngine price, AppStateStore state /* valfritt */, FX.Core.Interfaces.ISpotSetDateService spotSvc)
-            : this(bus, price, state, marketStore: null)
+        [ActivatorUtilitiesConstructor]
+        public FxRuntime(IMessageBus bus, IPriceEngine price, AppStateStore state, IMarketStore marketStore, ISpotSetDateService spotSvc)
         {
+            if (bus == null) throw new ArgumentNullException(nameof(bus));
+            if (price == null) throw new ArgumentNullException(nameof(price));
+            if (state == null) throw new ArgumentNullException(nameof(state));
+            if (marketStore == null) throw new ArgumentNullException(nameof(marketStore));
+            if (spotSvc == null) throw new ArgumentNullException(nameof(spotSvc));
 
-            _spotSvc = spotSvc ?? throw new ArgumentNullException(nameof(spotSvc));
+            _bus = bus;
+            _price = price;
+            _state = state;
+            _marketStore = marketStore;
+            _spotSvc = spotSvc;
 
-        }
-
-        /// <summary>
-        /// Överlagrad konstruktor om du vill injicera MarketStore för rd/rf och spot.
-        /// </summary>
-        public FxRuntime(CoreI.IMessageBus bus, CoreI.IPriceEngine price, AppStateStore state, IMarketStore marketStore)
-        {
-            _bus = bus; _price = price; _state = state; _marketStore = marketStore;
-
+            // Bus-subscriptions
             _subscriptions.Add(_bus.Subscribe<RequestPrice>(HandleRequestPrice));
-            // _subscriptions.Add(_bus.Subscribe<RebuildVolSurface>(HandleRebuildSurface)); // ← steg 8
+            // _subscriptions.Add(_bus.Subscribe<RebuildVolSurface>(HandleRebuildSurface)); // om/när du aktiverar
         }
 
 
@@ -64,6 +64,20 @@ namespace FX.Services
                 // === 0) Normalize pair & enkla defaults ===
                 string pair6 = (cmd.Pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
                 string legId = "A"; // nuvarande iteration använder ett leg-id; utöka vid behov
+
+                // Säkerställ att store är på rätt par innan Build
+                var current = _marketStore.Current;
+                if (current == null || !string.Equals(current.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Byt par på ett "neutralt" sätt: lägg in en stämplad, stale spot = 0/0
+                    // (Bytet triggar Changed så UI kan uppdatera rubriker/viewmode korrekt.)
+                    _marketStore.SetSpotFromFeed(
+                        pair6,
+                        new TwoWay<double>(0d, 0d),
+                        DateTime.UtcNow,
+                        isStale: true
+                    );
+                }
 
                 // === 1) Bestäm datum ===
                 var src1 = cmd.Legs[0];

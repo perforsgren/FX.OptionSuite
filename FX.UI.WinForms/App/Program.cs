@@ -5,6 +5,7 @@ using FX.Services;                 // AddFxServices(), FxRuntime
 using FX.UI.WinForms;              // Form1, IAppInstance, PricerAppInstance, LegacyPricerView/Presenter
 using System.Runtime.InteropServices;
 using FX.Core.Domain.MarketData;
+using FX.Services.MarketData;
 
 namespace FX.UI.WinForms
 {
@@ -30,8 +31,11 @@ namespace FX.UI.WinForms
             services.AddTransient<LegacyPricerView>();
             services.AddTransient<LegacyPricerPresenter>();
 
-            // *** Ny rad: registrera själva app-instansen (IAppInstance) för Pricer ***
+            // Registrera själva app-instansen (IAppInstance) för Pricer
             services.AddTransient<PricerAppInstance>();
+
+            // Registrera EN global MarketStore för hela appen
+            services.AddSingleton<IMarketStore, MarketStore>();
 
             // FX-tjänster (din runtime m.m.)
             services.AddFxServices();
@@ -41,10 +45,10 @@ namespace FX.UI.WinForms
 
             using (var sp = services.BuildServiceProvider())
             {
-                // Starta din runtime (oförändrat)
+                // Starta runtime
                 sp.GetRequiredService<FxRuntime>();
 
-                // Starta huvudfönstret (Form1) – oförändrat
+                // Starta huvudfönstret (Form1)
                 Application.Run(sp.GetRequiredService<Form1>());
             }
         }

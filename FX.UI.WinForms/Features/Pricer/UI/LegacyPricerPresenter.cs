@@ -5,8 +5,12 @@ using System.Globalization;
 using FX.Core.Interfaces;
 using FX.Infrastructure.Calendars.Legacy;
 using FX.Messages.Events;
-using FX.Core.Domain.MarketData;   // TwoWay, MarketSnapshot, IMarketStore, enums
-using FX.Services.MarketData;      // MarketStore-implementation
+using FX.Core.Domain.MarketData; 
+using FX.Services.MarketData;
+
+using System.Diagnostics;
+using System.Threading;
+using System.Drawing;
 
 namespace FX.UI.WinForms
 {
@@ -15,13 +19,10 @@ namespace FX.UI.WinForms
     /// - Kopplar UI-händelser till bus/servicelager.
     /// - Hanterar expiry-resolve, spot-snapshots och prissättning per ben / alla ben.
     /// - Lyssnar på bus-events (PriceCalculated, ErrorOccurred) och uppdaterar vyn.
-    /// 
-    /// Funktionalitet är oförändrad mot din inlämnade kod; endast strukturering/kommentarer och regions har lagts till.
     /// </summary>
     public sealed class LegacyPricerPresenter : IDisposable
     {
         #region Variables
-
 
         private readonly LegacyPricerView _view;
         private readonly Dictionary<Guid, Guid> _corrToLegId = new Dictionary<Guid, Guid>();
@@ -32,6 +33,12 @@ namespace FX.UI.WinForms
         private readonly IMarketStore _mktStore;
         private readonly int _spotTimeoutMs = 3000;
 
+        // Debounce/single-flight för Reprice
+        private const int RepriceDebounceMs = 50; // justera 10–100 ms efter smak
+        private readonly object _repriceGate = new object();
+        private Timer _repriceTimer;           // System.Threading.Timer
+        private volatile bool _repricePending; // det har kommit events under väntetiden
+        private volatile bool _repriceRunning; // en reprice kör just nu
         #endregion
 
         #region Constructor / Dispose
@@ -40,7 +47,7 @@ namespace FX.UI.WinForms
         /// Skapar presenter och ansluter UI- och bus-händelser.
         /// Om <paramref name="spotFeed"/> inte tillhandahålls används <see cref="BloombergSpotFeed"/> med timeout 3000 ms.
         /// </summary>
-        public LegacyPricerPresenter(IMessageBus bus, LegacyPricerView view, ISpotFeed spotFeed = null, IMarketStore marketStore = null)
+        public LegacyPricerPresenter(IMessageBus bus, LegacyPricerView view, IMarketStore marketStore)
         {
             _bus = bus ?? throw new ArgumentNullException(nameof(bus));
             _view = view ?? throw new ArgumentNullException(nameof(view));
@@ -53,9 +60,11 @@ namespace FX.UI.WinForms
                 _view.BindLegIdToLabel(ls.LegId, ls.Label); // håller UI-label i sync
             }
 
-            _spotFeed = spotFeed ?? new BloombergSpotFeed(_spotTimeoutMs);
+            // Spot-feed kör vi lokalt (ingen DI för den i detta steg)
+            _spotFeed = new BloombergSpotFeed(_spotTimeoutMs);
 
-            _mktStore = marketStore ?? new MarketStore();
+            // Viktigt: använd den injicerade, delade MarketStore-instansen
+            _mktStore = marketStore ?? throw new ArgumentNullException(nameof(marketStore));
             _mktStore.Changed += OnMarketChanged;
 
             // UI →
@@ -64,6 +73,8 @@ namespace FX.UI.WinForms
             _view.SpotEdited += OnSpotEditedFromView;
             _view.ExpiryEditRequested += OnExpiryEditRequested;
             _view.SpotModeChanged += OnSpotModeChanged;
+
+            _view.SpotRefreshRequested += (_, __) => RefreshSpotSnapshot();
 
             // Initialt ViewMode till Store
             {
@@ -434,83 +445,112 @@ namespace FX.UI.WinForms
         #region Spot feed
 
         /// <summary>
-        /// Hämtar snapshot av tvåvägs spot (BID/ASK) för aktuellt par via <see cref="ISpotFeed"/>,
-        /// uppdaterar Deal/legs i vyn och triggar prisning för alla ben.
-        /// UI-uppdatering sker på UI-tråden om möjligt.
+        /// Hämtar en spot-snapshot från feed och skriver till MarketStore.
+        /// UI uppdateras via OnMarketChanged (store-driven).
         /// </summary>
-        public void RefreshSpotSnapshot()
+        /// <summary>
+        /// Hämtar en spot-snapshot från feed och skriver till MarketStore.
+        /// UI uppdateras via OnMarketChanged (store-driven).
+        /// </summary>
+        private void RefreshSpotSnapshot()
         {
-            var pair6 = _view.ReadPair6();
-            if (string.IsNullOrWhiteSpace(pair6) || pair6.Length < 6) return;
-
-            System.Threading.Tasks.Task.Run(() =>
+            try
             {
-                try
+                var p6 = NormalizePair6(_view.ReadPair6());
+                if (p6 == null) return;
+
+                // Din feed-signatur: bool TryGetTwoWay(string pair6, out double bid, out double ask)
+                double bid, ask;
+                var ok = _spotFeed.TryGetTwoWay(p6, out bid, out ask);
+                if (!ok) return;
+
+
+                System.Diagnostics.Debug.WriteLine($"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
+
+
+                // Skriv ENDAST till store; OnMarketChanged tar UI-visningen
+                _mktStore.SetSpotFromFeed(
+                    p6,
+                    new TwoWay<double>(bid, ask),
+                    DateTime.UtcNow,
+                    isStale: false
+                );
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(new ErrorOccurred
                 {
-                    double bid, ask;
-                    if (!_spotFeed.TryGetTwoWay(pair6, out bid, out ask))
-                    {
-                        _bus.Publish(new ErrorOccurred
-                        {
-                            Source = "SpotFeed",
-                            Message = "Misslyckades hämta spot (BID/ASK).",
-                            Detail = pair6,
-                            CorrelationId = Guid.Empty
-                        });
-                        return;
-                    }
-
-                    // Update Store (oförändrat)
-                    _mktStore.SetSpotFromFeed(pair6, new TwoWay<double>(bid, ask), DateTime.UtcNow, isStale: false);
-
-                    // Visa i UI med exakt 4 d.p.
-                    _view.ShowSpotFeedFixed4(bid, ask);
-
-                    // (Valfritt) synka vy så användaren ser siffrorna
-                    var ctrl = _view as System.Windows.Forms.Control;
-                    if (ctrl != null && !ctrl.IsDisposed)
-                    {
-                        ctrl.BeginInvoke((Action)(() =>
-                        {
-                            _view.ApplyMarketSpotTwoWayForDeal(bid, ask, true);
-                        }));
-                    }
-                    else
-                    {
-                        _view.ApplyMarketSpotTwoWayForDeal(bid, ask, true);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _bus.Publish(new ErrorOccurred
-                    {
-                        Source = "SpotFeed",
-                        Message = "Undantag vid hämtning av spot.",
-                        Detail = ex.Message,
-                        CorrelationId = Guid.Empty
-                    });
-                }
-            });
+                    Source = "Presenter.RefreshSpotSnapshot",
+                    Message = ex.Message,
+                    Detail = ex.ToString(),
+                    CorrelationId = Guid.Empty
+                });
+            }
         }
+
+
 
         #endregion
 
         #region Events
 
+        private void OnUi(Action action)
+        {
+            var ctrl = _view as System.Windows.Forms.Control;
+            if (ctrl == null || ctrl.IsDisposed)
+            {
+                // Fallback (om view inte är ett Control): kör direkt
+                action();
+                return;
+            }
+
+            if (ctrl.IsHandleCreated)
+            {
+                ctrl.BeginInvoke(action);
+                return;
+            }
+
+            // Vänta tills handle skapats – kör sedan en gång
+            System.EventHandler handler = null;
+            handler = (s, e2) =>
+            {
+                ctrl.HandleCreated -= handler;
+                if (!ctrl.IsDisposed)
+                    ctrl.BeginInvoke(action);
+            };
+            ctrl.HandleCreated += handler;
+        }
+
+
         /// <summary>
-        /// När MarketStore ändras (t.ex. användare eller feed har satt Spot)
-        /// reprisar vi alla ben. Här kan man lägga debounce senare om behövs.
+        /// MarketStore har ändrats. Uppdatera UI selektivt (spot när reason är spot)
+        /// och prisa om därefter – med säker UI-dispatch före HandleCreated.
         /// </summary>
         private void OnMarketChanged(object sender, FX.Core.Domain.MarketData.MarketChangedEventArgs e)
         {
             try
             {
+                var snap = _mktStore.Current;
+                var effOpt = snap?.Spot?.Effective; // TwoWay<double>?
+
+                // 1) Uppdatera SPOT i UI endast vid spot-relaterat reason
+                if (IsSpotReason(e?.Reason) && effOpt.HasValue)
+                {
+                    var bid = effOpt.Value.Bid;
+                    var ask = effOpt.Value.Ask;
+
+                    OnUi(() => _view.ShowSpotFeedFixed4(bid, ask));
+                }
+
+                // 2) Reprice (oförändrat)
                 string reason;
                 if (!CanPriceNow(out reason))
                 {
                     System.Diagnostics.Debug.WriteLine("[Presenter] Skip reprice: " + reason);
                     return;
                 }
+
+                // Om du vill kan även Reprice postas via OnUi, men behövs normalt inte:
                 RepriceAllLegs();
             }
             catch (Exception ex)
@@ -524,6 +564,10 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
+
+
+
 
 
         /// <summary>
@@ -826,6 +870,16 @@ namespace FX.UI.WinForms
 
 
         #endregion
+
+
+        private static bool IsSpotReason(string reason)
+        {
+            if (string.IsNullOrEmpty(reason)) return false;
+            return reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase)
+                || reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase);
+        }
+
 
 
     }
