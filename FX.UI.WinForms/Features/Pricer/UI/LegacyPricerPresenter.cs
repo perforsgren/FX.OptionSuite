@@ -74,7 +74,7 @@ namespace FX.UI.WinForms
             _view.ExpiryEditRequested += OnExpiryEditRequested;
             _view.SpotModeChanged += OnSpotModeChanged;
 
-            _view.SpotRefreshRequested += (_, __) => RefreshSpotSnapshot();
+            _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
 
             // Initialt ViewMode till Store
             {
@@ -90,11 +90,25 @@ namespace FX.UI.WinForms
             _subPrice = _bus.Subscribe<PriceCalculated>(OnPriceCalculated);
             _subError = _bus.Subscribe<ErrorOccurred>(OnError);
 
-            // Seed expiry + prisa
-            TrySeedDefaultExpiryAndReprice();
+            var ctrl = _view as System.Windows.Forms.Control;
+            if (ctrl != null)
+            {
+                ctrl.HandleCreated += (s, e) =>
+                {
+                    ctrl.BeginInvoke((Action)(() =>
+                    {
+                        TrySeedDefaultExpiryAndReprice();           // snabbt – mest UI-läsning
+                        System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot()); // tungt – kör bakgrunden
+                    }));
+                };
+            }
 
-            // Första spot-snapshot
-            RefreshSpotSnapshot();
+
+            //// Seed expiry + prisa
+            //TrySeedDefaultExpiryAndReprice();
+
+            //// Första spot-snapshot
+            //RefreshSpotSnapshot();
         }
 
         /// <summary>
@@ -359,7 +373,7 @@ namespace FX.UI.WinForms
         }
             };
 
-            _bus.Publish(cmd);
+            System.Threading.Tasks.Task.Run(() => _bus.Publish(cmd));
         }
 
 
@@ -385,9 +399,14 @@ namespace FX.UI.WinForms
 
             _corrToLegId.Remove(e.CorrelationId);
 
-            _view.ShowTwoWayPremiumFromPerUnitById(legId, e.PremiumBid, e.PremiumAsk);
-            _view.ShowLegResultById(legId, e.PremiumMid, e.Delta, e.Vega, e.Gamma, e.Theta);
+            // UI-uppdateringar MÅSTE gå via UI-tråden nu
+            OnUi(() =>
+            {
+                _view.ShowTwoWayPremiumFromPerUnitById(legId, e.PremiumBid, e.PremiumAsk);
+                _view.ShowLegResultById(legId, e.PremiumMid, e.Delta, e.Vega, e.Gamma, e.Theta);
+            });
         }
+
 
 
 
@@ -521,10 +540,78 @@ namespace FX.UI.WinForms
             ctrl.HandleCreated += handler;
         }
 
+        /// <summary>
+        /// Begär en reprice med debounce (skjuts upp RepriceDebounceMs ms).
+        /// Flera begäran samlas ihop till en körning.
+        /// </summary>
+        private void ScheduleRepriceDebounced()
+        {
+            lock (_repriceGate)
+            {
+                _repricePending = true;
+
+                if (_repriceTimer == null)
+                {
+                    _repriceTimer = new Timer(RepriceTimerCallback, null, RepriceDebounceMs, Timeout.Infinite);
+                }
+                else
+                {
+                    // Reset timer – börja om för att samla ihop fler ändringar
+                    _repriceTimer.Change(RepriceDebounceMs, Timeout.Infinite);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Körs på timer-tråd. Startar EN reprice om ingen pågår. Annars lämnas _repricePending true,
+        /// och vi schemalägger igen när pågående reprice avslutas (i finally-blocket).
+        /// </summary>
+        private void RepriceTimerCallback(object state)
+        {
+            bool shouldRun = false;
+
+            lock (_repriceGate)
+            {
+                if (!_repriceRunning)
+                {
+                    _repriceRunning = true;
+                    _repricePending = false; // vi tar ansvar för att köra denna batch
+                    shouldRun = true;
+                }
+                // annars: låt _repricePending vara kvar = true; vi tar den efter pågående körning
+            }
+
+            if (!shouldRun) return;
+
+            // Kör själva repricen på UI-tråden
+            OnUi(() =>
+            {
+                try
+                {
+                    string reason;
+                    if (CanPriceNow(out reason))
+                        RepriceAllLegs();
+                    else
+                        System.Diagnostics.Debug.WriteLine("[Presenter] Skip reprice: " + reason);
+                }
+                finally
+                {
+                    lock (_repriceGate)
+                    {
+                        _repriceRunning = false;
+
+                        // Om det kom nya events under körningen – starta om debouncern
+                        if (_repricePending && _repriceTimer != null)
+                            _repriceTimer.Change(RepriceDebounceMs, Timeout.Infinite);
+                    }
+                }
+            });
+        }
+
 
         /// <summary>
         /// MarketStore har ändrats. Uppdatera UI selektivt (spot när reason är spot)
-        /// och prisa om därefter – med säker UI-dispatch före HandleCreated.
+        /// och trigga reprice via debounce/single-flight.
         /// </summary>
         private void OnMarketChanged(object sender, FX.Core.Domain.MarketData.MarketChangedEventArgs e)
         {
@@ -542,16 +629,8 @@ namespace FX.UI.WinForms
                     OnUi(() => _view.ShowSpotFeedFixed4(bid, ask));
                 }
 
-                // 2) Reprice (oförändrat)
-                string reason;
-                if (!CanPriceNow(out reason))
-                {
-                    System.Diagnostics.Debug.WriteLine("[Presenter] Skip reprice: " + reason);
-                    return;
-                }
-
-                // Om du vill kan även Reprice postas via OnUi, men behövs normalt inte:
-                RepriceAllLegs();
+                // 2) Reprice: debounce + single-flight
+                ScheduleRepriceDebounced();
             }
             catch (Exception ex)
             {
@@ -564,11 +643,6 @@ namespace FX.UI.WinForms
                 });
             }
         }
-
-
-
-
-
 
         /// <summary>
         /// Får normaliserad two-way Spot från vyn (Bid/Ask + WasMid) och skriver den som User till MarketStore.

@@ -49,6 +49,10 @@ namespace FX.Services
             // _subscriptions.Add(_bus.Subscribe<RebuildVolSurface>(HandleRebuildSurface)); // om/när du aktiverar
         }
 
+        private void HandleRequestPrice(RequestPrice cmd)
+        {
+            _ = System.Threading.Tasks.Task.Run(() => HandleRequestPriceWorkerAsync(cmd));
+        }
 
         /// <summary>
         /// Huvudhandler för prisförfrågningar. Variant 1:
@@ -57,155 +61,173 @@ namespace FX.Services
         /// 3) Kör befintliga motorn (_price.PriceAsync) så premien beräknas på samma rd/rf.
         /// 4) Publicera PriceCalculated (oförändrat).
         /// </summary>
-        private async void HandleRequestPrice(RequestPrice cmd)
+        private async System.Threading.Tasks.Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
         {
             try
             {
-                // === 0) Normalize pair & enkla defaults ===
-                string pair6 = (cmd.Pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
-                string legId = "A"; // nuvarande iteration använder ett leg-id; utöka vid behov
-
-                // Säkerställ att store är på rätt par innan Build
-                var current = _marketStore.Current;
-                if (current == null || !string.Equals(current.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
+                try
                 {
-                    // Byt par på ett "neutralt" sätt: lägg in en stämplad, stale spot = 0/0
-                    // (Bytet triggar Changed så UI kan uppdatera rubriker/viewmode korrekt.)
-                    _marketStore.SetSpotFromFeed(
-                        pair6,
-                        new TwoWay<double>(0d, 0d),
-                        DateTime.UtcNow,
-                        isStale: true
-                    );
-                }
+                    // === 0) Normalize pair & enkla defaults ===
+                    string pair6 = (cmd.Pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
+                    string legId = "A"; // nuvarande iteration använder ett leg-id; utöka vid behov
 
-                // === 1) Bestäm datum ===
-                var src1 = cmd.Legs[0];
-                var today = DateTime.Today;
-                var expiry = DateTime.Today;
-                if (!string.IsNullOrWhiteSpace(src1.ExpiryIso))
-                    DateTime.TryParse(src1.ExpiryIso, out expiry);
-                //var expiry = …; // som du redan plockar från cmd
-
-                // Kalla din legacy-tjänst för datum, precis som i adaptern
-                var dates = _spotSvc.Compute(pair6, today, expiry);
-                var spotDate = dates.SpotDate;
-                var settlement = dates.SettlementDate;
-
-
-                // === 2) Kör Orchestrator.Build(...) först (autofetch via feeder om rd/rf saknas) ===
-                var orchestrator = FX.Services.MarketData.OrchestratorFactory.Create(_marketStore);
-                var build = orchestrator.Build(pair6, legId, today, expiry, spotDate, settlement, useMid: false);
-
-                // === 3) Läs tillbaka rd/rf (effektiva) ur MarketStore så premien räknas på samma nivåer ===
-                var snap = _marketStore.Current;
-
-                // TwoWay<double>? eftersom ?.Effective på en struct ger Nullable<T> i C# 7.3
-                var rdEff = snap.TryGetRd(legId)?.Effective; // TwoWay<double>?
-                var rfEff = snap.TryGetRf(legId)?.Effective; // TwoWay<double>?
-
-                // === 4) Spot (bid/ask) – använd overrides om de skickades, annars feed från MarketStore.Spot ===
-                double feedSpotMid = snap?.Spot != null ? 0.5 * (snap.Spot.Effective.Bid + snap.Spot.Effective.Ask) : 0.0;
-                double spotBid = cmd.SpotBidOverride ?? cmd.SpotOverride ?? (snap?.Spot?.Effective.Bid ?? feedSpotMid);
-                double spotAsk = cmd.SpotAskOverride ?? cmd.SpotOverride ?? (snap?.Spot?.Effective.Ask ?? feedSpotMid);
-
-                // === 5) rd/rf att stoppa in i motorns PricingRequest ===
-                // FIX: rdEff/rfEff är Nullable → kontrollera HasValue och använd .Value.Bid/.Value.Ask
-                double rdMid = rdEff.HasValue ? 0.5 * (rdEff.Value.Bid + rdEff.Value.Ask) : 0.02;
-                double rfMid = rfEff.HasValue ? 0.5 * (rfEff.Value.Bid + rfEff.Value.Ask) : 0.01;
-
-                double rd = cmd.RdOverride ?? rdMid;
-                double rf = cmd.RfOverride ?? rfMid;
-
-                // === 6) Mappa legs och bygg domänens PricingRequest (oförändrat från din baseline) ===
-                var legs = new System.Collections.Generic.List<OptionLeg>();
-                if (cmd.Legs != null)
-                {
-                    for (int i = 0; i < cmd.Legs.Count; i++)
+                    // Säkerställ att store är på rätt par innan Build
+                    var current = _marketStore.Current;
+                    if (current == null || !string.Equals(current.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
                     {
-                        var src = cmd.Legs[i];
-
-                        var sideEnum = ParseSide(src.Side);
-                        var typeEnum = ParseType(src.Type);
-
-                        DateTime legExpiry = expiry;
-                        if (!string.IsNullOrWhiteSpace(src.ExpiryIso))
-                            DateTime.TryParse(src.ExpiryIso, out legExpiry);
-
-                        var spotMidForStrike = (spotBid > 0 && spotAsk > 0)
-                            ? 0.5 * (spotBid + spotAsk)
-                            : (spotBid > 0 ? spotBid : (spotAsk > 0 ? spotAsk : 0));
-
-                        var strikeDom = FX.Core.Domain.Strike.ParseStrict(src.Strike, (decimal)spotMidForStrike);
-                        var domExpiry = new Expiry(legExpiry);
-                        var pair = new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3));
-
-                        legs.Add(new OptionLeg(
-                            pair: pair,
-                            side: sideEnum,
-                            type: typeEnum,
-                            strike: strikeDom,
-                            expiry: domExpiry,
-                            notional: src.Notional
-                        ));
+                        // Byt par på ett "neutralt" sätt: lägg in en stämplad, stale spot = 0/0
+                        // (Bytet triggar Changed så UI kan uppdatera rubriker/viewmode korrekt.)
+                        _marketStore.SetSpotFromFeed(
+                            pair6,
+                            new TwoWay<double>(0d, 0d),
+                            DateTime.UtcNow,
+                            isStale: true
+                        );
                     }
+
+                    // === 1) Bestäm datum ===
+                    var src1 = cmd.Legs[0];
+                    var today = DateTime.Today;
+                    var expiry = DateTime.Today;
+                    if (!string.IsNullOrWhiteSpace(src1.ExpiryIso))
+                        DateTime.TryParse(src1.ExpiryIso, out expiry);
+                    //var expiry = …; // som du redan plockar från cmd
+
+                    // Kalla din legacy-tjänst för datum, precis som i adaptern
+                    var dates = _spotSvc.Compute(pair6, today, expiry);
+                    var spotDate = dates.SpotDate;
+                    var settlement = dates.SettlementDate;
+
+
+                    // === 2) Kör Orchestrator.Build(...) först (autofetch via feeder om rd/rf saknas) ===
+                    var orchestrator = FX.Services.MarketData.OrchestratorFactory.Create(_marketStore);
+                    var build = orchestrator.Build(pair6, legId, today, expiry, spotDate, settlement, useMid: false);
+
+                    // === 3) Läs tillbaka rd/rf (effektiva) ur MarketStore så premien räknas på samma nivåer ===
+                    var snap = _marketStore.Current;
+
+                    // TwoWay<double>? eftersom ?.Effective på en struct ger Nullable<T> i C# 7.3
+                    var rdEff = snap.TryGetRd(legId)?.Effective; // TwoWay<double>?
+                    var rfEff = snap.TryGetRf(legId)?.Effective; // TwoWay<double>?
+
+                    // === 4) Spot (bid/ask) – använd overrides om de skickades, annars feed från MarketStore.Spot ===
+                    double feedSpotMid = snap?.Spot != null ? 0.5 * (snap.Spot.Effective.Bid + snap.Spot.Effective.Ask) : 0.0;
+                    double spotBid = cmd.SpotBidOverride ?? cmd.SpotOverride ?? (snap?.Spot?.Effective.Bid ?? feedSpotMid);
+                    double spotAsk = cmd.SpotAskOverride ?? cmd.SpotOverride ?? (snap?.Spot?.Effective.Ask ?? feedSpotMid);
+
+                    // === 5) rd/rf att stoppa in i motorns PricingRequest ===
+                    // FIX: rdEff/rfEff är Nullable → kontrollera HasValue och använd .Value.Bid/.Value.Ask
+                    double rdMid = rdEff.HasValue ? 0.5 * (rdEff.Value.Bid + rdEff.Value.Ask) : 0.02;
+                    double rfMid = rfEff.HasValue ? 0.5 * (rfEff.Value.Bid + rfEff.Value.Ask) : 0.01;
+
+                    double rd = cmd.RdOverride ?? rdMid;
+                    double rf = cmd.RfOverride ?? rfMid;
+
+                    // === 6) Mappa legs och bygg domänens PricingRequest (oförändrat från din baseline) ===
+                    var legs = new System.Collections.Generic.List<OptionLeg>();
+                    if (cmd.Legs != null)
+                    {
+                        for (int i = 0; i < cmd.Legs.Count; i++)
+                        {
+                            var src = cmd.Legs[i];
+
+                            var sideEnum = ParseSide(src.Side);
+                            var typeEnum = ParseType(src.Type);
+
+                            DateTime legExpiry = expiry;
+                            if (!string.IsNullOrWhiteSpace(src.ExpiryIso))
+                                DateTime.TryParse(src.ExpiryIso, out legExpiry);
+
+                            var spotMidForStrike = (spotBid > 0 && spotAsk > 0)
+                                ? 0.5 * (spotBid + spotAsk)
+                                : (spotBid > 0 ? spotBid : (spotAsk > 0 ? spotAsk : 0));
+
+                            var strikeDom = FX.Core.Domain.Strike.ParseStrict(src.Strike, (decimal)spotMidForStrike);
+                            var domExpiry = new Expiry(legExpiry);
+                            var pair = new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3));
+
+                            legs.Add(new OptionLeg(
+                                pair: pair,
+                                side: sideEnum,
+                                type: typeEnum,
+                                strike: strikeDom,
+                                expiry: domExpiry,
+                                notional: src.Notional
+                            ));
+                        }
+                    }
+
+                    var domainReq = new PricingRequest(
+                        pair: new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3)),
+                        legs: legs,
+                        spotBid: spotBid,
+                        spotAsk: spotAsk,
+                        rd: rd,
+                        rf: rf,
+                        surfaceId: cmd.SurfaceId ?? "default",
+                        stickyDelta: cmd.StickyDelta
+                    );
+
+                    // Tvåvägsvol: procent → decimal
+                    double? bidDec = cmd.VolBidPct.HasValue ? cmd.VolBidPct.Value / 100.0 : (double?)null;
+                    double? askDec = cmd.VolAskPct.HasValue ? cmd.VolAskPct.Value / 100.0 : (double?)null;
+                    domainReq.SetVol(new VolQuote(bidDec, askDec));
+
+                    // === 7) Kör din befintliga motor (premium) – nu på samma rd/rf som i MarketStore ===
+                    var unit = await _price.PriceAsync(domainReq, _cts.Token).ConfigureAwait(false);
+
+                    // === 8) Välj sida för per-unit premium (BUY→Ask, SELL→Bid; fallback Mid i engine) ===
+                    string firstSide = (cmd.Legs != null && cmd.Legs.Count > 0 ? cmd.Legs[0].Side : "BUY")
+                                       ?.ToUpperInvariant() ?? "BUY";
+                    bool isBuy = string.Equals(firstSide, "BUY", StringComparison.OrdinalIgnoreCase);
+
+                    double pricePerUnit = isBuy ? unit.PremiumAsk : unit.PremiumBid;
+                    string boldSide = (unit.PremiumBid == unit.PremiumAsk)
+                                        ? "MID"
+                                        : (isBuy ? "ASK" : "BID");
+
+                    // === 9) Publicera resultat (oförändrat) ===
+                    _bus.Publish(new PriceCalculated
+                    {
+                        CorrelationId = cmd.CorrelationId,
+                        Price = pricePerUnit,
+                        PremiumBid = unit.PremiumBid,
+                        PremiumMid = unit.PremiumMid,
+                        PremiumAsk = unit.PremiumAsk,
+                        BoldSide = boldSide,
+                        Delta = unit.Delta,
+                        Vega = unit.Vega,
+                        Gamma = unit.Gamma,
+                        Theta = unit.Theta
+                    });
                 }
-
-                var domainReq = new PricingRequest(
-                    pair: new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3)),
-                    legs: legs,
-                    spotBid: spotBid,
-                    spotAsk: spotAsk,
-                    rd: rd,
-                    rf: rf,
-                    surfaceId: cmd.SurfaceId ?? "default",
-                    stickyDelta: cmd.StickyDelta
-                );
-
-                // Tvåvägsvol: procent → decimal
-                double? bidDec = cmd.VolBidPct.HasValue ? cmd.VolBidPct.Value / 100.0 : (double?)null;
-                double? askDec = cmd.VolAskPct.HasValue ? cmd.VolAskPct.Value / 100.0 : (double?)null;
-                domainReq.SetVol(new VolQuote(bidDec, askDec));
-
-                // === 7) Kör din befintliga motor (premium) – nu på samma rd/rf som i MarketStore ===
-                var unit = await _price.PriceAsync(domainReq, _cts.Token).ConfigureAwait(false);
-
-                // === 8) Välj sida för per-unit premium (BUY→Ask, SELL→Bid; fallback Mid i engine) ===
-                string firstSide = (cmd.Legs != null && cmd.Legs.Count > 0 ? cmd.Legs[0].Side : "BUY")
-                                   ?.ToUpperInvariant() ?? "BUY";
-                bool isBuy = string.Equals(firstSide, "BUY", StringComparison.OrdinalIgnoreCase);
-
-                double pricePerUnit = isBuy ? unit.PremiumAsk : unit.PremiumBid;
-                string boldSide = (unit.PremiumBid == unit.PremiumAsk)
-                                    ? "MID"
-                                    : (isBuy ? "ASK" : "BID");
-
-                // === 9) Publicera resultat (oförändrat) ===
-                _bus.Publish(new PriceCalculated
+                catch (Exception ex)
                 {
-                    CorrelationId = cmd.CorrelationId,
-                    Price = pricePerUnit,
-                    PremiumBid = unit.PremiumBid,
-                    PremiumMid = unit.PremiumMid,
-                    PremiumAsk = unit.PremiumAsk,
-                    BoldSide = boldSide,
-                    Delta = unit.Delta,
-                    Vega = unit.Vega,
-                    Gamma = unit.Gamma,
-                    Theta = unit.Theta
-                });
+                    _bus.Publish(new ErrorOccurred
+                    {
+                        Source = "PriceEngine",
+                        Message = ex.Message,
+                        Detail = ex.ToString(),
+                        CorrelationId = cmd.CorrelationId
+                    });
+                }
             }
             catch (Exception ex)
             {
-                _bus.Publish(new ErrorOccurred
+                // samma felpublicering som tidigare
+                _bus.Publish(new FX.Messages.Events.ErrorOccurred
                 {
-                    Source = "PriceEngine",
+                    Source = "FxRuntime.HandleRequestPrice",
                     Message = ex.Message,
                     Detail = ex.ToString(),
-                    CorrelationId = cmd.CorrelationId
+                    CorrelationId = cmd?.CorrelationId ?? Guid.Empty
                 });
             }
         }
+
+
+
+
 
 
 
