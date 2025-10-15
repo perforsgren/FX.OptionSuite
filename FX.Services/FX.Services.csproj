@@ -1,0 +1,113 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{4B66C7DC-F0F0-4FD9-9E1C-CC91D916A346}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>FX.Services</RootNamespace>
+    <AssemblyName>FX.Services</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Bloomberglp.Blpapi, Version=3.6.1.0, Culture=neutral, PublicKeyToken=ec3efa8c033c2bc5, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>bin\Debug\Bloomberglp.Blpapi.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Bcl.AsyncInterfaces, Version=9.0.0.9, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>..\packages\Microsoft.Bcl.AsyncInterfaces.9.0.9\lib\net462\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.DependencyInjection, Version=9.0.0.9, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
+      <HintPath>..\packages\Microsoft.Extensions.DependencyInjection.9.0.9\lib\net462\Microsoft.Extensions.DependencyInjection.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.DependencyInjection.Abstractions, Version=9.0.0.9, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
+      <HintPath>..\packages\Microsoft.Extensions.DependencyInjection.Abstractions.9.0.9\lib\net462\Microsoft.Extensions.DependencyInjection.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Runtime.CompilerServices.Unsafe, Version=4.0.4.1, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
+      <HintPath>..\packages\System.Runtime.CompilerServices.Unsafe.4.5.3\lib\net461\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Threading.Tasks.Extensions, Version=4.2.0.1, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>..\packages\System.Threading.Tasks.Extensions.4.5.4\lib\net461\System.Threading.Tasks.Extensions.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Xml.Linq" />
+    <Reference Include="System.Data.DataSetExtensions" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Xml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="AppState.cs" />
+    <Compile Include="Calendars\CalendarResolverDefault.cs" />
+    <Compile Include="Calendars\DbBusinessCalendar.cs" />
+    <Compile Include="Calendars\LegacyCalendarResolverAdapter.cs" />
+    <Compile Include="Calendars\LegacyExpiryInputResolverAdapter.cs" />
+    <Compile Include="Calendars\LegacySpotSetDateService.cs" />
+    <Compile Include="Calendars\Legacy\CurrencyCalendarMapper.cs" />
+    <Compile Include="Calendars\Legacy\DateConvention.cs" />
+    <Compile Include="Calendars\Legacy\ExpiryInputResolver.cs" />
+    <Compile Include="Calendars\Legacy\HolidayCalendar.cs" />
+    <Compile Include="Calendars\Legacy\HolidaySet.cs" />
+    <Compile Include="Calendars\SpotSetDateService.cs" />
+    <Compile Include="Calendars\WeekendOnlyBusinessCalendar.cs" />
+    <Compile Include="DayWeightService.cs" />
+    <Compile Include="DtoMapper.cs" />
+    <Compile Include="FlatVolInterpolator.cs" />
+    <Compile Include="FxRuntime.cs" />
+    <Compile Include="InProcMessageBus.cs" />
+    <Compile Include="LegacyPriceEngineAdapter.cs" />
+    <Compile Include="MarketData\BloombergSpotFeed.cs" />
+    <Compile Include="MarketData\BloombergStaticData.cs" />
+    <Compile Include="MarketData\DfCurve.cs" />
+    <Compile Include="MarketData\FxSwapPoints.cs" />
+    <Compile Include="MarketData\ISpotFeed.cs" />
+    <Compile Include="MarketData\MarketStore.cs" />
+    <Compile Include="MarketData\OrchestratorFactory.cs" />
+    <Compile Include="MarketData\PricingOrchestrator.cs" />
+    <Compile Include="MarketData\UsdAnchoredRateFeeder.cs" />
+    <Compile Include="MarketData\UsdSofrCurve.cs" />
+    <Compile Include="Normal.cs" />
+    <Compile Include="PricingServiceCollectionExtensions.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="ServiceCollectionExtensions.cs" />
+    <Compile Include="VolService.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\FX.Core\FX.Core.csproj">
+      <Project>{5279732b-1a94-4b23-8ac2-299302d14dc6}</Project>
+      <Name>FX.Core</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\FX.Messages\FX.Messages.csproj">
+      <Project>{d484d46a-e2e6-48f5-8258-329fde043700}</Project>
+      <Name>FX.Messages</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup />
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
