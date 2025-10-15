@@ -93,6 +93,13 @@ namespace FX.UI.WinForms
         {
             _subPrice?.Dispose();
             _subError?.Dispose();
+
+            if (_mktStore != null)
+                _mktStore.Changed -= OnMarketChanged;
+
+            (_spotFeed as IDisposable)?.Dispose();
+
+
         }
 
         #endregion
