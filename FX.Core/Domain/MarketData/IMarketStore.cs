@@ -107,6 +107,16 @@ namespace FX.Core.Domain.MarketData
         /// </summary>
         void SetRfOverride(string pair6, string legId, OverrideMode ov, DateTime nowUtc);
 
+        /// <summary>
+        /// Ogiltigförklarar RD/RF för ett specifikt ben så att nästa prisning
+        /// måste re-derivera kurvorna från cache (ingen fresh-hämtning här).
+        /// Implementeras av <c>MarketStore</c>.
+        /// </summary>
+        /// <param name="pair6">Valutapar 6 tecken, t.ex. "EURSEK".</param>
+        /// <param name="legId">Benets stabila Guid (string).</param>
+        /// <param name="nowUtc">Aktuell UTC-tid för spårning/logg.</param>
+        void InvalidateRatesForLeg(string pair6, string legId, DateTime nowUtc);
+
     }
 
 

@@ -94,8 +94,7 @@ namespace FX.UI.WinForms
         private DataGridView _dgv;
         private DataGridViewCell _pendingBeginEditCell;
 
-        //private readonly string[] _legs = new[] { "Vanilla 1", "Vanilla 2" };
-        private readonly string[] _legs = new[] { "Vanilla 1" };
+        private string[] _legs = new[] { "Vanilla 1" };
         private readonly List<RowSpec> _rows = new List<RowSpec>
         {
             new RowSpec(L.DealDetails, Section.DealDetails, "SECTION"),
@@ -185,6 +184,7 @@ namespace FX.UI.WinForms
         public event EventHandler<PriceRequestUiArgs> PriceRequested;
         public event EventHandler NotionalChanged;
         public event EventHandler<ExpiryEditRequestedEventArgs> ExpiryEditRequested;
+        public event EventHandler AddLegRequested; //Fired när användaren vill lägga till ett nytt ben(via F6 eller annat UI).
 
         /// <summary>
         /// Signal upp till presentern att Spot ändrats av användaren (parsningsklar, normaliserad two-way).
@@ -3297,18 +3297,6 @@ namespace FX.UI.WinForms
         /// </summary>
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            // F9: reprice alla ben (oförändrat)
-            if (keyData == Keys.F9)
-            {
-                PriceRequested?.Invoke(this, new PriceRequestUiArgs { TargetLeg = null });
-                return true;
-            }
-
-            if (keyData == Keys.F5)
-            {
-                SpotRefreshRequested?.Invoke(this, EventArgs.Empty);
-                return true; // markerat som hanterat
-            }
 
             // F2: in i edit mode + markera allt innehåll
             if (keyData == Keys.F2)
@@ -3327,6 +3315,25 @@ namespace FX.UI.WinForms
                     return true;
                 }
                 return false; // ej editerbar → låt bas hantera
+            }
+
+            if (keyData == Keys.F5)
+            {
+                SpotRefreshRequested?.Invoke(this, EventArgs.Empty);
+                return true; // markerat som hanterat
+            }
+
+            if (keyData == Keys.F6)
+            {
+                AddLegRequested?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
+
+            // F9: reprice alla ben (oförändrat)
+            if (keyData == Keys.F9)
+            {
+                PriceRequested?.Invoke(this, new PriceRequestUiArgs { TargetLeg = null });
+                return true;
             }
 
             return base.ProcessCmdKey(ref msg, keyData);
@@ -3356,6 +3363,105 @@ namespace FX.UI.WinForms
         #endregion
 
         #region === Helpers ===
+
+        /// <summary>
+        /// Säkerställer att en UI-kolumn med namn <paramref name="label"/> finns.
+        /// Om den saknas skapas den och seedas från <paramref name="seedFromLabel"/> om angiven och giltig,
+        /// annars från första ben-kolumnen. Kopierar både Value och Tag så format/hints följer med.
+        /// </summary>
+        private void EnsureLegColumnExists(string label, string seedFromLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(label)) return;
+
+            // Finns kolumnen redan? Se till att _legs känner till den och returnera.
+            if (_dgv.Columns.Contains(label))
+            {
+                bool known = false;
+                for (int i = 0; i < _legs.Length; i++)
+                {
+                    if (string.Equals(_legs[i], label, StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+                }
+                if (!known)
+                {
+                    Array.Resize(ref _legs, _legs.Length + 1);
+                    _legs[_legs.Length - 1] = label;
+                }
+                return;
+            }
+
+            // Skapa ny benkolumn
+            var col = new DataGridViewTextBoxColumn
+            {
+                Name = label,
+                HeaderText = label,
+                Width = ColumnLegWidth,
+                ValueType = typeof(string),
+                DefaultCellStyle = new DataGridViewCellStyle
+                {
+                    Alignment = DataGridViewContentAlignment.MiddleRight,
+                    Padding = new Padding(0, 0, 10, 0)
+                }
+            };
+            _dgv.Columns.Add(col);
+
+            // Välj seed-källa: specificerad kolumn om den finns och är ett ben; annars första benkolumnen.
+            string srcCol = null;
+            if (!string.IsNullOrWhiteSpace(seedFromLabel) &&
+                _dgv.Columns.Contains(seedFromLabel) &&
+                IsLegColumn(seedFromLabel))
+            {
+                srcCol = seedFromLabel;
+            }
+            else
+            {
+                var first = FirstLegColumn();
+                if (!string.IsNullOrEmpty(first) && IsLegColumn(first))
+                    srcCol = first;
+            }
+
+            // Kopiera cellinnehåll (Value + Tag) rad för rad
+            for (int r = 0; r < _dgv.Rows.Count; r++)
+            {
+                var dst = _dgv.Rows[r].Cells[label];
+
+                if (!string.IsNullOrEmpty(srcCol) && _dgv.Columns.Contains(srcCol))
+                {
+                    var src = _dgv.Rows[r].Cells[srcCol];
+                    dst.Value = src?.Value; // inkl. formaterad expiry "[1M] yyyy-mm-dd (Wed)"
+                    dst.Tag = src?.Tag;   // om du sparar metadata här
+                }
+                else
+                {
+                    dst.Value = null;
+                    dst.Tag = null;
+                }
+
+                // Sätt readonly/utseende för vissa rader enligt din initlogik
+                var rowLabel = Convert.ToString(_dgv.Rows[r].Cells["FIELD"].Value ?? "");
+                if (string.Equals(rowLabel, L.Pair, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(rowLabel, L.Delivery, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase) ||
+                    rowLabel == L.PremUnit || rowLabel == L.PremTot || rowLabel == L.PremPips || rowLabel == L.PremPct ||
+                    rowLabel == L.Delta || rowLabel == L.DeltaPct || rowLabel == L.Vega || rowLabel == L.Gamma || rowLabel == L.Theta)
+                {
+                    dst.ReadOnly = true;
+                    if (string.Equals(rowLabel, L.Pair, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(rowLabel, L.Delivery, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        dst.Style.ForeColor = Color.Gray;
+                    }
+                }
+            }
+
+            // Registrera kolumnen i _legs så att övriga loopar tar med den
+            Array.Resize(ref _legs, _legs.Length + 1);
+            _legs[_legs.Length - 1] = label;
+
+            _dgv.Invalidate();
+        }
+
+
 
         private static (string Base, string Quote) GetBaseQuoteFromPair6(string pair6)
         {
@@ -3489,20 +3595,39 @@ namespace FX.UI.WinForms
 
         #endregion
 
-
+        #region === LegId ↔ UI-kolumn ===
 
         // === NEW: LegId → label-karta i vyn ===
         private readonly Dictionary<Guid, string> _legIdToLabel = new Dictionary<Guid, string>();
 
         /// <summary>
-        /// Registrerar kopplingen mellan ett stabilt LegId och aktuell UI-etikett (t.ex. "Vanilla 1").
-        /// Kallas från presentern när leg-listan initieras/uppdateras.
+        /// Registrerar kopplingen mellan ett stabilt LegId och en UI-etikett (t.ex. "Vanilla 2").
+        /// Säkerställer att kolumnen för etiketten finns (skapas vid behov) innan bindningen.
         /// </summary>
         public void BindLegIdToLabel(Guid legId, string label)
         {
             if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
+
+            // Se till att UI-kolumnen finns
+            EnsureLegColumnExists(label);
+
+            // Registrera mappningen
             _legIdToLabel[legId] = label;
         }
+
+        /// <summary>
+        /// Binder ett stabilt <paramref name="legId"/> till en UI-kolumn/etikett <paramref name="label"/> och
+        /// säkerställer att kolumnen finns. Om <paramref name="seedFromLabel"/> anges och finns,
+        /// seedas värden (Value/Tag) från den kolumnen i stället för default.
+        /// </summary>
+        public void BindLegIdToLabel(Guid legId, string label, string seedFromLabel)
+        {
+            if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
+            EnsureLegColumnExists(label, seedFromLabel);
+            _legIdToLabel[legId] = label;
+        }
+
+
 
         /// <summary>Slår upp UI-etiketten för ett LegId. Returnerar null om okänt.</summary>
         private string TryGetLabel(Guid legId)
@@ -3511,6 +3636,8 @@ namespace FX.UI.WinForms
                 return label;
             return null;
         }
+
+
 
         /// <summary>Uppdaterar tvåväg per-unit för ett specifikt ben via LegId.</summary>
         public void ShowTwoWayPremiumFromPerUnitById(Guid legId, double bid, double ask)
@@ -3564,6 +3691,15 @@ namespace FX.UI.WinForms
             return Array.Find(all, s => string.Equals(s.Leg,   // filtrera på kolumn/label
                                   label, StringComparison.OrdinalIgnoreCase));
         }
+
+        #endregion
+
+
+        /// <summary>
+        /// Programmatisk trigger för att lägga till ett nytt ben (motsvarar F6).
+        /// </summary>
+        public void TriggerAddLeg() => AddLegRequested?.Invoke(this, EventArgs.Empty);
+
 
         // Formatter skapas on-demand utifrån pair och vald display-ccy
         private PricingFormatter CreateFormatter()

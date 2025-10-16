@@ -7,10 +7,9 @@ using FX.Infrastructure.Calendars.Legacy;
 using FX.Messages.Events;
 using FX.Core.Domain.MarketData; 
 using FX.Services.MarketData;
-
 using System.Diagnostics;
 using System.Threading;
-using System.Drawing;
+using System.Linq;
 
 namespace FX.UI.WinForms
 {
@@ -39,6 +38,7 @@ namespace FX.UI.WinForms
         private Timer _repriceTimer;           // System.Threading.Timer
         private volatile bool _repricePending; // det har kommit events under väntetiden
         private volatile bool _repriceRunning; // en reprice kör just nu
+
         #endregion
 
         #region Constructor / Dispose
@@ -58,6 +58,7 @@ namespace FX.UI.WinForms
                 var ls = new LegState(Guid.NewGuid(), "Vanilla 1");
                 _legStates.Add(ls);
                 _view.BindLegIdToLabel(ls.LegId, ls.Label); // håller UI-label i sync
+                Debug.WriteLine($"[Presenter.AddNewLeg] Added leg Vanilla {_legStates.Count} ({ls.LegId})");
             }
 
             // Spot-feed kör vi lokalt (ingen DI för den i detta steg)
@@ -73,6 +74,7 @@ namespace FX.UI.WinForms
             _view.SpotEdited += OnSpotEditedFromView;
             _view.ExpiryEditRequested += OnExpiryEditRequested;
             _view.SpotModeChanged += OnSpotModeChanged;
+            _view.AddLegRequested += OnAddLegRequested; // Lägg till ben (F6)
 
             _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
 
@@ -133,15 +135,15 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Hanterar användarens editering av expiry (Deal eller specifikt ben).
-        /// - För Deal: resolve appliceras för samtliga ben (via _legacyColumns) och varje ben prissätts.
-        /// - För specifikt ben: resolve + rollback vid fel och prissätt just benet.
+        /// - Deal: resolve + apply för samtliga ben, invaliddera RD/RF för varje ben och prissätt alla.
+        /// - Ben: resolve + apply för just det benet, invaliddera RD/RF och prissätt bara det.
         /// </summary>
         private void OnExpiryEditRequested(object sender, LegacyPricerView.ExpiryEditRequestedEventArgs e)
         {
             var pair6 = (e.Pair6 ?? _view.ReadPair6() ?? "EURSEK").Replace("/", "").ToUpperInvariant();
             var holidays = LoadHolidaysForPair(pair6);
 
-            // Deal → alla ben via LegId
+            // === Deal → alla ben ===
             if (string.Equals(e.LegColumn, "Deal", StringComparison.OrdinalIgnoreCase))
             {
                 foreach (var ls in _legStates)
@@ -149,13 +151,16 @@ namespace FX.UI.WinForms
                     try
                     {
                         var r = ExpiryInputResolver.Resolve(e.Raw, pair6, holidays);
-                        var wdEn = r.ExpiryDate.ToString("ddd", CultureInfo.GetCultureInfo("en-US"));
+                        var wdEn = r.ExpiryDate.ToString("ddd", System.Globalization.CultureInfo.GetCultureInfo("en-US"));
                         var rawHint = string.Equals(r.Mode, "Tenor", StringComparison.OrdinalIgnoreCase)
                                       ? r.Normalized?.ToUpperInvariant()
                                       : null;
 
                         _view.ShowResolvedExpiryById(ls.LegId, r.ExpiryIso, wdEn, rawHint);
                         _view.ShowResolvedSettlementById(ls.LegId, r.SettlementIso);
+
+                        // Invalidera RD/RF för benet → cache-only re-derive vid prisning
+                        _mktStore.InvalidateRatesForLeg(pair6, ls.LegId.ToString(), DateTime.UtcNow);
 
                         PriceSingleLeg(ls.LegId);
                     }
@@ -173,16 +178,27 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            // Ben-specifik: om e.LegColumn kommer från UI kan vi mappa till LegId,
-            // men här antar vi att Presentern redan jobbar med LegId från UI-events framöver.
-            // Vi riktar oss därför mot "första benet" som fallback om kolumnnamn saknas.
-            var target = _legStates.Count > 0 ? _legStates[0] : null;
-            if (target == null) return;
+            // === Ben → hitta rätt leg via kolumnnamn ===
+            LegState target = null;
+            for (int i = 0; i < _legStates.Count; i++)
+            {
+                var ls = _legStates[i];
+                if (string.Equals(ls.Label, e.LegColumn, StringComparison.OrdinalIgnoreCase))
+                {
+                    target = ls;
+                    break;
+                }
+            }
+            if (target == null)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Presenter.Expiry] Okänd legkolumn '{e.LegColumn}', avbryter.");
+                return;
+            }
 
             try
             {
                 var res = ExpiryInputResolver.Resolve(e.Raw, pair6, holidays);
-                var wd = res.ExpiryDate.ToString("ddd", CultureInfo.GetCultureInfo("en-US"));
+                var wd = res.ExpiryDate.ToString("ddd", System.Globalization.CultureInfo.GetCultureInfo("en-US"));
                 var hint = string.Equals(res.Mode, "Tenor", StringComparison.OrdinalIgnoreCase)
                            ? res.Normalized?.ToUpperInvariant()
                            : null;
@@ -190,12 +206,13 @@ namespace FX.UI.WinForms
                 _view.ShowResolvedExpiryById(target.LegId, res.ExpiryIso, wd, hint);
                 _view.ShowResolvedSettlementById(target.LegId, res.SettlementIso);
 
+                // Invalidera RD/RF för det här benet → cache-only re-derive vid prisning
+                _mktStore.InvalidateRatesForLeg(pair6, target.LegId.ToString(), DateTime.UtcNow);
+
                 PriceSingleLeg(target.LegId);
             }
             catch (Exception ex)
             {
-                // rollback i dagens UI är label-baserad; tills din vy byter helt till LegId
-                // låter vi vyn hantera rollback själv om du vill (annars ingen rollback här)
                 _bus.Publish(new ErrorOccurred
                 {
                     Source = "ExpiryResolver",
@@ -205,7 +222,6 @@ namespace FX.UI.WinForms
                 });
             }
         }
-
 
 
         /// <summary>
@@ -253,7 +269,7 @@ namespace FX.UI.WinForms
             string reason;
             if (!CanPriceNow(out reason))
             {
-                System.Diagnostics.Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
+                Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
                 return;
             }
 
@@ -301,7 +317,7 @@ namespace FX.UI.WinForms
 
             if (pair6 == null)
             {
-                System.Diagnostics.Debug.WriteLine("[Presenter] Skip pricing: pair6 saknas/ogiltigt.");
+                Debug.WriteLine("[Presenter] Skip pricing: pair6 saknas/ogiltigt.");
                 return;
             }
 
@@ -330,7 +346,7 @@ namespace FX.UI.WinForms
 
             if (sb <= 0.0 || sa <= 0.0)
             {
-                System.Diagnostics.Debug.WriteLine("[Presenter] Skip pricing: Spot not set.");
+                Debug.WriteLine("[Presenter] Skip pricing: Spot not set.");
                 return;
             }
 
@@ -414,7 +430,7 @@ namespace FX.UI.WinForms
         private void OnError(FX.Messages.Events.ErrorOccurred e)
         {
             _corrToLegId.Remove(e.CorrelationId);   // ändrat namn
-            System.Diagnostics.Debug.WriteLine($"[ERR] {e.Source}: {e.Message}");
+            Debug.WriteLine($"[ERR] {e.Source}: {e.Message}");
         }
 
         #endregion
@@ -475,10 +491,8 @@ namespace FX.UI.WinForms
                 double bid, ask;
                 var ok = _spotFeed.TryGetTwoWay(p6, out bid, out ask);
                 if (!ok) return;
-
-
-                System.Diagnostics.Debug.WriteLine($"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
-
+                    
+                Debug.WriteLine($"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
 
                 // Skriv ENDAST till store; OnMarketChanged tar UI-visningen
                 _mktStore.SetSpotFromFeed(
@@ -589,7 +603,7 @@ namespace FX.UI.WinForms
                     if (CanPriceNow(out reason))
                         RepriceAllLegs();
                     else
-                        System.Diagnostics.Debug.WriteLine("[Presenter] Skip reprice: " + reason);
+                        Debug.WriteLine("[Presenter] Skip reprice: " + reason);
                 }
                 finally
                 {
@@ -710,6 +724,77 @@ namespace FX.UI.WinForms
             }
         }
 
+        /// <summary>
+        /// UI-event: användaren vill lägga till ett nytt ben (t.ex. via F6).
+        /// Skapar benet, binder kolumnen i vyn, sätter default expiry till "1M"
+        /// och triggar EN debouncad priscykel för alla ben.
+        /// </summary>
+        private void OnAddLegRequested(object sender, EventArgs e)
+        {
+            var newLegId = AddNewLeg();
+            if (newLegId == Guid.Empty) return;
+
+            // Logg för spårbarhet
+            Debug.WriteLine($"[Presenter.AddNewLeg] Added leg {_legStates[_legStates.Count - 1].Label} ({newLegId})");
+
+            // Posta UI-init + default expiry + reprice i samma UI-vända
+            OnUi(() =>
+            {
+                var leg = _legStates[_legStates.Count - 1];
+
+                // Säkerställ att kolumnen finns och är bunden (din Notify-view gör det)
+                NotifyViewLegAdded(leg.LegId, leg.Label);
+
+                // Default expiry = "1M" (visas som [1M] yyyy-MM-dd (ddd) i UI)
+                SeedDefaultExpiry1M(leg.LegId);
+
+                // Kör en lugn, samlad prisning
+                ScheduleRepriceDebounced();
+            });
+        }
+
+        /// <summary>
+        /// Sätter default expiry = "1M" för ett ben (by LegId).
+        /// Resolv:ar mot aktuellt par & helgdagar och skriver till UI som:
+        ///   [1M] yyyy-MM-dd (ddd)
+        /// samt visar resolved settlement. Invaliderar RD/RF för benet så att
+        /// nästa prisning re-deriverar från cache (ingen fresh).
+        /// </summary>
+        private void SeedDefaultExpiry1M(Guid legId)
+        {
+            try
+            {
+                var pair6 = (_view.ReadPair6() ?? "EURSEK").Replace("/", "").ToUpperInvariant();
+                var holidays = LoadHolidaysForPair(pair6);
+
+                var res = ExpiryInputResolver.Resolve("1M", pair6, holidays);
+
+                var wd = res.ExpiryDate.ToString("ddd", System.Globalization.CultureInfo.GetCultureInfo("en-US"));
+
+                _view.ShowResolvedExpiryById(legId, res.ExpiryIso, wd, "1M");
+                _view.ShowResolvedSettlementById(legId, res.SettlementIso);
+
+                // Viktigt: invaliddera RD/RF för detta ben → cache-only re-derive vid prisning
+                _mktStore.InvalidateRatesForLeg(pair6, legId.ToString(), DateTime.UtcNow);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Presenter.SeedDefaultExpiry1M] leg={legId} → [1M] {res.ExpiryIso} ({wd}), settle={res.SettlementIso} (rates invalidated)");
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(new ErrorOccurred
+                {
+                    Source = "SeedDefaultExpiry1M",
+                    Message = ex.Message,
+                    Detail = ex.ToString(),
+                    CorrelationId = Guid.Empty
+                });
+            }
+        }
+
+
+
+
         #endregion
 
         #region Helpers
@@ -754,6 +839,40 @@ namespace FX.UI.WinForms
             if (string.IsNullOrWhiteSpace(s)) return null;
             var p = s.Replace("/", "").Trim().ToUpperInvariant();
             return p.Length == 6 ? p : null;
+        }
+
+        /// <summary>
+        /// Returnerar true om reason avser spot-förändring (FeedSpot/UserSpot/SpotViewMode)
+        /// eller om det är ett batch-reason med Spot>0 (Batch:…Spot=K…). Används för att uppdatera spot-UI selektivt.
+        /// </summary>
+        private static bool IsSpotReason(string reason)
+        {
+            if (string.IsNullOrEmpty(reason)) return false;
+
+            if (reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase) ||
+                reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Känn igen batch med Spot>0
+            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+            {
+                // Enkel parsing: leta "Spot=" och kolla att det inte är 0
+                var idx = reason.IndexOf("Spot=", StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    // Försök läsa ut talet efter Spot=
+                    var start = idx + 5;
+                    int end = reason.IndexOfAny(new[] { ';', ' ' }, start);
+                    var numTxt = (end >= 0 ? reason.Substring(start, end - start) : reason.Substring(start)).Trim();
+
+                    int spotCount;
+                    if (int.TryParse(numTxt, out spotCount))
+                        return spotCount > 0;
+                }
+            }
+
+            return false;
         }
 
         #endregion
@@ -835,21 +954,46 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
+        /// Hittar första lediga UI-kolumn (leg) genom att jämföra vy:ns ben-kolumner
+        /// med etiketter som redan används av våra LegState-objekt.
+        /// Returnerar kolumnnamn (t.ex. "Vanilla 2") eller null om inga lediga finns.
+        /// </summary>
+        private string FindFirstFreeUiLegColumn()
+        {
+            var all = _view.GetLegColumns(); // från vyn
+            var used = new HashSet<string>(_legStates.Select(ls => ls.Label),
+                                           StringComparer.OrdinalIgnoreCase);
+
+            foreach (var col in all)
+                if (!used.Contains(col))
+                    return col;
+
+            return null;
+        }
+
+        /// <summary>
         /// Skapar ett nytt ben sist i listan med ett nytt stabilt <see cref="Guid"/> och
-        /// etikett "Vanilla N". Returnerar det skapade LegId.
+        /// etikett "Vanilla N". Säkerställer att UI-kolumnen finns via vyn och binder Id↔label.
         /// </summary>
         private Guid AddNewLeg()
         {
             var newId = Guid.NewGuid();
             var newLabel = $"Vanilla {_legStates.Count + 1}";
 
+            // 1) Lägg till i presenter-state
             _legStates.Add(new LegState(newId, newLabel));
 
-            // UI-hook (no-op tills du kopplar mot vyn)
+            // 2) Låt vyn säkra kolumnen + registrera Id→label-mappningen
+            //    (BindLegIdToLabel skapar kolumn vid behov via EnsureLegColumnExists.)
             NotifyViewLegAdded(newId, newLabel);
+
+            // 3) Debug-spår
+            //System.Diagnostics.Debug.WriteLine($"[Presenter.AddNewLeg] Added leg {newLabel} ({newId})");
 
             return newId;
         }
+
+
 
         /// <summary>
         /// Klonar ett befintligt ben: skapar ett nytt ben direkt efter källbenet
@@ -913,12 +1057,27 @@ namespace FX.UI.WinForms
             }
         }
 
-        /// <summary>Hook för att låta vyn lägga in en ny rad för ett ben.</summary>
+        /// <summary>
+        /// Meddelar vyn att ett nytt ben lagts till så att UI-kolumn skapas/binds.
+        /// Kolumnen seedas från föregående ben (om det finns) så att format/hints (t.ex. "[1M] …") följer med.
+        /// </summary>
         private void NotifyViewLegAdded(Guid legId, string label)
         {
-            _view.BindLegIdToLabel(legId, label);
-            // Här kan du senare be vyn skapa en kolumn/tab etc.
+            OnUi(() =>
+            {
+                // Hitta seed-källa: föregående leg i listan (dvs. benet vi "kopierar")
+                string seedFrom = null;
+                if (_legStates.Count >= 2)
+                {
+                    // Nytt ben är sist; föregående är näst sist
+                    seedFrom = _legStates[_legStates.Count - 2].Label;
+                }
+
+                // Använd nya överlagringen i vyn som seedar från seedFrom
+                _view.BindLegIdToLabel(legId, label, seedFrom);
+            });
         }
+
 
         /// <summary>Hook för att låta vyn klona UI-raden.</summary>
         private void NotifyViewLegCloned(Guid sourceId, Guid newId, string newLabel)
@@ -942,40 +1101,6 @@ namespace FX.UI.WinForms
 
 
         #endregion
-
-        /// <summary>
-        /// Returnerar true om reason avser spot-förändring (FeedSpot/UserSpot/SpotViewMode)
-        /// eller om det är ett batch-reason med Spot>0 (Batch:…Spot=K…). Används för att uppdatera spot-UI selektivt.
-        /// </summary>
-        private static bool IsSpotReason(string reason)
-        {
-            if (string.IsNullOrEmpty(reason)) return false;
-
-            if (reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase) ||
-                reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            // Känn igen batch med Spot>0
-            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
-            {
-                // Enkel parsing: leta "Spot=" och kolla att det inte är 0
-                var idx = reason.IndexOf("Spot=", StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
-                {
-                    // Försök läsa ut talet efter Spot=
-                    var start = idx + 5;
-                    int end = reason.IndexOfAny(new[] { ';', ' ' }, start);
-                    var numTxt = (end >= 0 ? reason.Substring(start, end - start) : reason.Substring(start)).Trim();
-
-                    int spotCount;
-                    if (int.TryParse(numTxt, out spotCount))
-                        return spotCount > 0;
-                }
-            }
-
-            return false;
-        }
 
     }
 }

@@ -440,6 +440,62 @@ namespace FX.Services.MarketData
             RaiseChanged("RfOverride:" + legId);
         }
 
+        /// <summary>
+        /// Ogiltigförklarar RD/RF för ett specifikt ben så att nästa prisning
+        /// måste re-derivera kurvorna från cache (ingen fresh-hämtning här).
+        /// Tar bort befintliga fält i snapshotets RdByLeg/RfByLeg och triggar Changed (batchas).
+        /// Skriver debug (om <c>DebugFlags.RatesWrite</c> är på) om vad som togs bort.
+        /// </summary>
+        public void InvalidateRatesForLeg(string pair6, string legId, DateTime nowUtc)
+        {
+            var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
+
+            if (string.IsNullOrEmpty(legId))
+            {
+                if (DebugFlags.RatesWrite)
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg=(null) SKIP – legId saknas");
+                return;
+            }
+
+            // Säkerställ att vi har ett snapshot för paret (skapar tomt vid behov)
+            EnsureSnapshotPair(p6);
+
+            bool hadRd = _current.RdByLeg != null && _current.RdByLeg.ContainsKey(legId);
+            bool hadRf = _current.RfByLeg != null && _current.RfByLeg.ContainsKey(legId);
+
+            if (DebugFlags.RatesWrite)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} before: hadRd={hadRd} hadRf={hadRf}");
+            }
+
+            if (hadRd)
+            {
+                _current.RdByLeg.Remove(legId);
+                RaiseChanged("InvalidateRd:" + legId);
+            }
+
+            if (hadRf)
+            {
+                _current.RfByLeg.Remove(legId);
+                RaiseChanged("InvalidateRf:" + legId);
+            }
+
+            if (DebugFlags.RatesWrite)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} after: removedRd={hadRd} removedRf={hadRf}");
+                if (!hadRd && !hadRf)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} nothing to invalidate");
+                }
+            }
+        }
+
+
+
         #endregion
 
         #region Helpers
