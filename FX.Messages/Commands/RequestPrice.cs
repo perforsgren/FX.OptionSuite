@@ -36,6 +36,14 @@ namespace FX.Messages.Commands
         /// <summary>Nästlad typ för ett ben i affären.</summary>
         public sealed class Leg
         {
+
+            /// <summary>
+            /// Stabil identitet för benet. Måste vara satt av klienten (UI/presenter)
+            /// så att pipeline kan lagra/hämta RD/RF/spot per-ben utan "A/B"-översättningar.
+            /// </summary>
+            public Guid LegId { get; set; }
+
+
             public string Side { get; set; }      // "BUY"/"SELL"
             public string Type { get; set; }      // "CALL"/"PUT"
             public string Strike { get; set; }    // "11.00" eller "25D"

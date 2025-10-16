@@ -39,6 +39,10 @@ namespace FX.UI.WinForms
         private volatile bool _repricePending; // det har kommit events under väntetiden
         private volatile bool _repriceRunning; // en reprice kör just nu
 
+        private volatile bool _pricingInFlight; // Vakt mot dubbelprisning: true under pågående priscall från presentern.
+        private DateTime _lastPriceFinishedUtc = DateTime.MinValue; //Tidpunkt då senaste priscall avslutades (för cooldown).
+        private static readonly TimeSpan _rateWriteCooldown = TimeSpan.FromMilliseconds(200); // Kort buffert där vi ignorerar FeedRd/Rf efter nyss avslutad priscall. Hindrar “egen-skrivning → omedelbar dubbelprisning”.
+
         #endregion
 
         #region Constructor / Dispose
@@ -104,13 +108,6 @@ namespace FX.UI.WinForms
                     }));
                 };
             }
-
-
-            //// Seed expiry + prisa
-            //TrySeedDefaultExpiryAndReprice();
-
-            //// Första spot-snapshot
-            //RefreshSpotSnapshot();
         }
 
         /// <summary>
@@ -125,8 +122,6 @@ namespace FX.UI.WinForms
                 _mktStore.Changed -= OnMarketChanged;
 
             (_spotFeed as IDisposable)?.Dispose();
-
-
         }
 
         #endregion
@@ -295,7 +290,7 @@ namespace FX.UI.WinForms
                     var pair6x = (snap.Pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
                     var holidays = LoadHolidaysForPair(pair6x);
                     var r = ExpiryInputResolver.Resolve(snap.ExpiryRaw, pair6x, holidays);
-                    var wd = r.ExpiryDate.ToString("ddd", CultureInfo.GetCultureInfo("en-US"));
+                    var wd = r.ExpiryDate.ToString("ddd", System.Globalization.CultureInfo.GetCultureInfo("en-US"));
                     var hint = string.Equals(r.Mode, "Tenor", StringComparison.OrdinalIgnoreCase)
                                 ? r.Normalized?.ToUpperInvariant()
                                 : null;
@@ -340,19 +335,12 @@ namespace FX.UI.WinForms
             }
             else
             {
-                var mid = snap.SpotMid > 0.0 ? snap.SpotMid : snap.Spot;
+                var mid = snap.SpotMid > 0.0 ? snap.SpotMid : 0.0;
                 sb = mid; sa = mid;
-            }
-
-            if (sb <= 0.0 || sa <= 0.0)
-            {
-                Debug.WriteLine("[Presenter] Skip pricing: Spot not set.");
-                return;
             }
 
             int dp = 4;
             try { dp = _view.GetSpotUiDecimals(); } catch { dp = 4; }
-
             sb = Math.Round(sb, dp, MidpointRounding.AwayFromZero);
             sa = Math.Round(sa, dp, MidpointRounding.AwayFromZero);
 
@@ -380,17 +368,20 @@ namespace FX.UI.WinForms
         {
             new FX.Messages.Commands.RequestPrice.Leg
             {
-                Side      = snap.Side,
-                Type      = snap.Type,
-                Strike    = snap.Strike,
-                ExpiryIso = string.IsNullOrWhiteSpace(iso) ? "2030-12-31" : iso,
-                Notional  = snap.Notional
+                LegId    = legId,                                  // ← NYTT! bär med stabil Guid
+                Side     = snap.Side,
+                Type     = snap.Type,
+                Strike   = snap.Strike,
+                ExpiryIso= string.IsNullOrWhiteSpace(iso) ? "2030-12-31" : iso,
+                Notional = snap.Notional
             }
         }
             };
 
-            System.Threading.Tasks.Task.Run(() => _bus.Publish(cmd));
+            _pricingInFlight = true;
+            _bus.Publish(cmd);
         }
+
 
 
 
@@ -420,6 +411,8 @@ namespace FX.UI.WinForms
             {
                 _view.ShowTwoWayPremiumFromPerUnitById(legId, e.PremiumBid, e.PremiumAsk);
                 _view.ShowLegResultById(legId, e.PremiumMid, e.Delta, e.Vega, e.Gamma, e.Theta);
+                _pricingInFlight = false;
+                _lastPriceFinishedUtc = DateTime.UtcNow;
             });
         }
 
@@ -625,35 +618,98 @@ namespace FX.UI.WinForms
         /// och schemalägger prisning via debounce/single-flight (ScheduleRepriceDebounced()).
         /// Inget tungt arbete görs på UI-tråden direkt.
         /// </summary>
-        private void OnMarketChanged(object sender, FX.Core.Domain.MarketData.MarketChangedEventArgs e)
+        private void OnMarketChanged(object sender, MarketChangedEventArgs e)
         {
-            try
+            var reason = (e != null ? (e.Reason ?? string.Empty) : string.Empty);
+            var snap = _mktStore.Current;
+            var p6 = (snap != null ? snap.Pair6 : "(n/a)");
+            var spotField = (snap != null ? snap.Spot : null);
+            TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
+
+            var spotText = eff.HasValue
+                ? eff.Value.Bid.ToString("F6", CultureInfo.InvariantCulture) + "/" +
+                  eff.Value.Ask.ToString("F6", CultureInfo.InvariantCulture)
+                : "N/A";
+
+            Debug.WriteLine("[OnMarketChanged][T" + Thread.CurrentThread.ManagedThreadId + "] reason=" + reason + " pair=" + p6 + " spotEff=" + spotText);
+
+            // 1) Spot-relaterat → uppdatera UI + prissätt
+            if (IsSpotReason(reason))
             {
-                var snap = _mktStore.Current;
-                var effOpt = snap?.Spot?.Effective; // TwoWay<double>?
+                if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                ScheduleRepriceDebounced();
+                return;
+            }
 
-                // 1) Uppdatera SPOT i UI endast vid spot-relaterat reason
-                if (IsSpotReason(e?.Reason) && effOpt.HasValue)
+            // 2) Rate-only (enstaka rd/rf)
+            bool isRateOnly =
+                reason.StartsWith("FeedRd", StringComparison.OrdinalIgnoreCase) ||
+                reason.StartsWith("FeedRf", StringComparison.OrdinalIgnoreCase);
+
+            // 3) Batch: prissätt ENDAST om Spot>0, annars behandla som rate-only
+            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+            {
+                int rd, rf, spot, other;
+                if (TryParseBatchCounts(reason, out rd, out rf, out spot, out other))
                 {
-                    var bid = effOpt.Value.Bid;
-                    var ask = effOpt.Value.Ask;
+                    if (spot > 0)
+                    {
+                        if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                        ScheduleRepriceDebounced();
+                        return;
+                    }
+                    isRateOnly = (rd + rf) > 0 && spot == 0;
+                }
+            }
 
-                    OnUi(() => _view.ShowSpotFeedFixed4(bid, ask));
+            if (isRateOnly)
+            {
+                // Filtrera bort dubbelprisning från våra egna ensure-skrivningar
+                if (_pricingInFlight)
+                {
+                    Debug.WriteLine("[OnMarketChanged] Skip reprice: pricing in-flight → RD/RF write ignored.");
+                    return;
                 }
 
-                // 2) Reprice: debounce + single-flight
-                ScheduleRepriceDebounced();
-            }
-            catch (Exception ex)
-            {
-                _bus.Publish(new ErrorOccurred
+                if ((DateTime.UtcNow - _lastPriceFinishedUtc) < _rateWriteCooldown)
                 {
-                    Source = "Presenter.OnMarketChanged",
-                    Message = ex.Message,
-                    Detail = ex.ToString(),
-                    CorrelationId = Guid.Empty
-                });
+                    Debug.WriteLine("[OnMarketChanged] Skip reprice: RD/RF within cooldown after own pricerun.");
+                    return;
+                }
+
+                // Extern RD/RF-ändring → prissätt
+                ScheduleRepriceDebounced();
+                return;
             }
+
+            // 4) Övriga orsaker → ingen auto-prisning här.
+        }
+
+
+        /// <summary>
+        /// Parsar Batch-reason "Batch:Rd=1;Rf=1;Spot=0;Other=0 …" till fyra heltal.
+        /// </summary>
+        private static bool TryParseBatchCounts(string reason, out int rd, out int rf, out int spot, out int other)
+        {
+            rd = rf = spot = other = 0;
+            try
+            {
+                int Read(string key)
+                {
+                    var idx = reason.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) return 0;
+                    idx += key.Length;
+                    int end = reason.IndexOfAny(new[] { ';', ' ', '\t' }, idx);
+                    string s = (end >= 0 ? reason.Substring(idx, end - idx) : reason.Substring(idx)).Trim();
+                    int val; return int.TryParse(s, out val) ? val : 0;
+                }
+                rd = Read("Rd=");
+                rf = Read("Rf=");
+                spot = Read("Spot=");
+                other = Read("Other=");
+                return true;
+            }
+            catch { return false; }
         }
 
         /// <summary>

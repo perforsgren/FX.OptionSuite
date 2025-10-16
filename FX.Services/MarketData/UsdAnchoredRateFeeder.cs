@@ -23,20 +23,20 @@ namespace FX.Services.MarketData
         private UsdSofrCurve _usdCurve;
 
         // Cache per dag (ValDate). Vi håller det superenkelt och dag-baserat.
-        private readonly object _cacheLock = new object();
-        private DateTime _cacheValDate = DateTime.MinValue;
-        private UsdSofrCurve _cachedUsdCurve; // senast laddade USD-kurva (för dagen)
-        private DateTime _usdLoadedUtc = DateTime.MinValue; // När USD-kurvan senast laddades
+        private static readonly object s_cacheLock = new object();
+        private static DateTime s_cacheValDate = DateTime.MinValue;
+        private static UsdSofrCurve s_cachedUsdCurve;          // senast laddade USD-kurva (för dagen)
+        private static DateTime s_usdLoadedUtc = DateTime.MinValue; // När USD-kurvan senast laddades
 
         // FX-leg cache: ticker → (ben, lastLoadedUtc)
-        private readonly System.Collections.Generic.Dictionary<string, FxSwapPoints> _fxLegCache
+        private static readonly System.Collections.Generic.Dictionary<string, FxSwapPoints> s_fxLegCache
             = new System.Collections.Generic.Dictionary<string, FxSwapPoints>(StringComparer.OrdinalIgnoreCase);
-        private readonly System.Collections.Generic.Dictionary<string, DateTime> _fxLegLoadedUtc
+        private static readonly System.Collections.Generic.Dictionary<string, DateTime> s_fxLegLoadedUtc
             = new System.Collections.Generic.Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
 
-        // TTL (”stale”-trösklar). Kan flyttas till settings senare.
-        private static readonly TimeSpan UsdCurveTtl = TimeSpan.FromMinutes(15);  // rekommenderad: 15 min
-        private static readonly TimeSpan FxLegTtl = TimeSpan.FromMinutes(3);   // rekommenderad: 3 min
+        // TTL (”stale”-trösklar). (kan ligga kvar som static readonly)
+        private static readonly TimeSpan UsdCurveTtl = TimeSpan.FromMinutes(15);
+        private static readonly TimeSpan FxLegTtl = TimeSpan.FromMinutes(3);
 
 
         public UsdAnchoredRateFeeder(IMarketStore store)
@@ -48,141 +48,28 @@ namespace FX.Services.MarketData
         /// Säkerställ att rd/rf finns för valt par/leg. Hämtar data från Bloomberg vid behov
         /// och skriver in som feed i MarketStore (mid ⇒ bid=ask).
         /// </summary>
-        public void EnsureRdRfFor(string pair6, string legId,
-                                  DateTime today, DateTime spotDate, DateTime settlement)
+        public void EnsureRdRfFor(string pair6, string legId, DateTime today, DateTime spotDate, DateTime settlement)
         {
-            if (string.IsNullOrWhiteSpace(pair6)) throw new ArgumentNullException(nameof(pair6));
-            if (string.IsNullOrWhiteSpace(legId)) throw new ArgumentNullException(nameof(legId));
-
-            pair6 = NormalizePair(pair6);
-            var baseCcy = pair6.Substring(0, 3);
-            var quoteCcy = pair6.Substring(3, 3);
-
-            // 1) Starta/öppna Bloomberg-session och USD-kurva (cache per dag)
-            EnsureBloombergSession();
-            EnsureUsdCurveLoaded();
-
-            // 2) USD par-MM (simple) för SPOT→SETTLEMENT (CIP-ankare)
-            var dfUsdSpot = Clamp01(_usdCurve.DiscountFactor(spotDate));
-            var dfUsdSet = Clamp01(_usdCurve.DiscountFactor(settlement));
-            var T_usd = YearFracMm(spotDate, settlement, "USD");
-            var r_usd_par = ParMmRate(dfUsdSpot, dfUsdSet, T_usd); // används direkt för USD-sida i USD-par
-
-            // Hjälpare: outright forward i “rätt” riktning
-            double ForwardAt(FxSwapPoints leg, string requiredPair6, double spot)
-                => leg.ForwardAt(settlement, requiredPair6, spot, dfProvider: null, useDfRatioIfAvailable: false);
-
-            double rd_mid = 0.0; // quote-valutans MM-ränta
-            double rf_mid = 0.0; // base-valutans MM-ränta
-
-            // 3) Branching beroende på om BASE eller QUOTE är USD
-            if (string.Equals(baseCcy, "USD", StringComparison.OrdinalIgnoreCase))
-            {
-                // BASE = USD (ex: USDSEK)
-                // - rf (base) = USD par-MM direkt
-                // - rd (quote) via USD↔QUOTE-benet
-                rf_mid = ClampRate(r_usd_par);
-
-                var legUsdQuote = GetFxLeg("USD" + quoteCcy, quoteCcy + "USD"); // USDQUOTE eller QUOTEUSD
-                bool usdIsBase = legUsdQuote.Pair6.StartsWith("USD", StringComparison.OrdinalIgnoreCase);
-                string required = usdIsBase ? ("USD" + quoteCcy) : (quoteCcy + "USD");
-                double S_q = legUsdQuote.SpotMid;
-                double F_q = ForwardAt(legUsdQuote, required, S_q);
-
-                double Tq = YearFracMm(spotDate, settlement, quoteCcy);
-                double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tq, 1e-12);
-
-                // usdIsBase:   USD/QUOTE →  F = S * (1+rd*Tq)/(1+r_usd*Tq) ⇒ rd = ((1+r_usd*Tq)*F/S - 1)/Tq
-                // !usdIsBase:  QUOTE/USD →  F = S * (1+r_usd*Tq)/(1+rd*Tq) ⇒ rd = ((1+r_usd*Tq)*S/F - 1)/Tq
-                double rd_calc = usdIsBase
-                    ? ((onePlus_usdT * F_q / Math.Max(S_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12)
-                    : ((onePlus_usdT * Math.Max(S_q, 1e-12) / Math.Max(F_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12);
-
-                rd_mid = ClampRate(rd_calc);
-            }
-            else if (string.Equals(quoteCcy, "USD", StringComparison.OrdinalIgnoreCase))
-            {
-                // QUOTE = USD (ex: EURUSD)
-                // - rd (quote) = USD par-MM direkt
-                // - rf (base) via BASE↔USD-benet
-                rd_mid = ClampRate(r_usd_par);
-
-                var legBaseUsd = GetFxLeg(baseCcy + "USD", "USD" + baseCcy); // BASEUSD eller USDBASE
-                bool usdIsQuote = legBaseUsd.Pair6.EndsWith("USD", StringComparison.OrdinalIgnoreCase); // "BASEUSD"
-                string required = usdIsQuote ? (baseCcy + "USD") : ("USD" + baseCcy);
-                double S_b = legBaseUsd.SpotMid;
-                double F_b = ForwardAt(legBaseUsd, required, S_b);
-
-                double Tb = YearFracMm(spotDate, settlement, baseCcy);
-                double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tb, 1e-12);
-
-                // usdIsQuote: BASE/USD →  rf = ((1+r_usd*Tb)*S/F - 1)/Tb
-                // !usdIsQuote: USD/BASE →  rf = ((1+r_usd*Tb)*F/S - 1)/Tb
-                double rf_calc = usdIsQuote
-                    ? ((onePlus_usdT * Math.Max(S_b, 1e-12) / Math.Max(F_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12)
-                    : ((onePlus_usdT * F_b / Math.Max(S_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12);
-
-                rf_mid = ClampRate(rf_calc);
-            }
-            else
-            {
-                // Korspar (ex: EURSEK, AUDSEK, CHFSEK)
-                // - rf (base) via BASE↔USD-benet
-                // - rd (quote) via USD↔QUOTE-benet
-                var legBaseUsd = GetFxLeg(baseCcy + "USD", "USD" + baseCcy);
-                var legUsdQuote = GetFxLeg("USD" + quoteCcy, quoteCcy + "USD");
-
-                // rf (base)
-                {
-                    bool usdIsQuote = legBaseUsd.Pair6.EndsWith("USD", StringComparison.OrdinalIgnoreCase); // "BASEUSD"
-                    string required = usdIsQuote ? (baseCcy + "USD") : ("USD" + baseCcy);
-                    double S_b = legBaseUsd.SpotMid;
-                    double F_b = ForwardAt(legBaseUsd, required, S_b);
-
-                    double Tb = YearFracMm(spotDate, settlement, baseCcy);
-                    double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tb, 1e-12);
-
-                    double rf_calc = usdIsQuote
-                        ? ((onePlus_usdT * Math.Max(S_b, 1e-12) / Math.Max(F_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12)
-                        : ((onePlus_usdT * F_b / Math.Max(S_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12);
-
-                    rf_mid = ClampRate(rf_calc);
-                }
-
-                // rd (quote)
-                {
-                    bool usdIsBase = legUsdQuote.Pair6.StartsWith("USD", StringComparison.OrdinalIgnoreCase);
-                    string required = usdIsBase ? ("USD" + quoteCcy) : (quoteCcy + "USD");
-                    double S_q = legUsdQuote.SpotMid;
-                    double F_q = ForwardAt(legUsdQuote, required, S_q);
-
-                    double Tq = YearFracMm(spotDate, settlement, quoteCcy);
-                    double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tq, 1e-12);
-
-                    double rd_calc = usdIsBase
-                        ? ((onePlus_usdT * F_q / Math.Max(S_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12)
-                        : ((onePlus_usdT * Math.Max(S_q, 1e-12) / Math.Max(F_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12);
-
-                    rd_mid = ClampRate(rd_calc);
-                }
-            }
-
-            // 4) Mata in i store (MID ⇒ bid=ask). För paret A/B är rd = r_B (quote), rf = r_A (base).
-            var now = DateTime.UtcNow;
-            _store.SetRdFromFeed(pair6, legId, new TwoWay<double>(rd_mid, rd_mid), now, isStale: false);
-            _store.SetRfFromFeed(pair6, legId, new TwoWay<double>(rf_mid, rf_mid), now, isStale: false);
+            // Standardpolicy när denna kallas: använd cache om möjligt
+            EnsureRdRfFor(pair6, legId, today, spotDate, settlement, forceRefresh: false);
         }
 
         /// <summary>
-        /// Bygger och matar in rd/rf för par A/B (A=base, B=quote) i MarketStore.
-        /// - Använder cache + TTL (SOFR 15 min, FX-swap 3 min) för stale-indikatorn.
-        /// - forceRefresh=true ignorerar cache och laddar alltid om.
-        /// - Vid enbart tenor/datum-byten: kalla med forceRefresh=false (återanvänd cache; UI ser IsStale).
-        /// - Vid parbyte eller explicit ”Refresh”: forceRefresh=true.
+        /// Bygger och matar in RD/RF för par A/B (A=base, B=quote) i <see cref="IMarketStore"/>.
+        /// - Använder gemensam (statisk) cache + TTL (SOFR 15 min, FX-swap 3 min) för stale-indikatorn.
+        /// - <paramref name="forceRefresh"/>=true ignorerar cache och laddar alltid om från källa (Bloomberg).
+        /// - Vid enbart tenor/datum-byten: kalla med <paramref name="forceRefresh"/>=false (återanvänd cache; UI ser IsStale).
+        /// - Vid parbyte eller explicit ”Refresh”: <paramref name="forceRefresh"/>=true.
+        /// - Viktigt: <see cref="EnsureUsdCurveCached(bool)"/> ansvarar för att starta Bloomberg-session lazily
+        ///   och uppdatera den statiska cachen endast när det behövs.
         /// </summary>
-        public void EnsureRdRfFor(string pair6, string legId,
-                                  DateTime today, DateTime spotDate, DateTime settlement,
-                                  bool forceRefresh = false)
+        public void EnsureRdRfFor(
+            string pair6,
+            string legId,
+            DateTime today,
+            DateTime spotDate,
+            DateTime settlement,
+            bool forceRefresh = false)
         {
             if (string.IsNullOrWhiteSpace(pair6)) throw new ArgumentNullException(nameof(pair6));
             if (string.IsNullOrWhiteSpace(legId)) throw new ArgumentNullException(nameof(legId));
@@ -191,19 +78,19 @@ namespace FX.Services.MarketData
             var baseCcy = pair6.Substring(0, 3);
             var quoteCcy = pair6.Substring(3, 3);
 
-            // 1) Session + cache-laddningar
-            EnsureBloombergSession();
+            // 1) Säkerställ att USD-kurvan finns i den STATISKA cachen (hämtar fresh vid behov/forceRefresh)
+            //    OBS: EnsureUsdCurveCached() ska internt hantera sessionstart när cache saknas/stale.
             EnsureUsdCurveCached(forceRefresh);
 
             // 2) USD par-MM (simple) SPOT→SETTLEMENT från cachead kurva
-            var usdCurve = _cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
+            var usdCurve = s_cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
             var dfUsdSpot = Clamp01(usdCurve.DiscountFactor(spotDate));
             var dfUsdSet = Clamp01(usdCurve.DiscountFactor(settlement));
             var T_usd = YearFracMm(spotDate, settlement, "USD");
             var r_usd_par = ParMmRate(dfUsdSpot, dfUsdSet, T_usd);
 
-            // Stale för USD utifrån TTL
-            bool usdStale = IsStaleByTtl(_usdLoadedUtc, UsdCurveTtl);
+            // Stale för USD utifrån TTL (statisk tidsstämpel)
+            bool usdStale = IsStaleByTtl(s_usdLoadedUtc, UsdCurveTtl);
 
             // Hjälpare: outright forward i ”rätt” riktning
             double ForwardAt(FxSwapPoints leg, string requiredPair6, double spot)
@@ -311,6 +198,7 @@ namespace FX.Services.MarketData
             _store.SetRdFromFeed(pair6, legId, new TwoWay<double>(rd_mid, rd_mid), now, isStale);
             _store.SetRfFromFeed(pair6, legId, new TwoWay<double>(rf_mid, rf_mid), now, isStale);
         }
+
 
 
 
@@ -442,28 +330,36 @@ namespace FX.Services.MarketData
         /// - Laddar om från Bloomberg annars.
         /// - Sätter _usdLoadedUtc för stale-bedömning.
         /// </summary>
-        private void EnsureUsdCurveCached(bool forceRefresh)
+        void EnsureUsdCurveCached(bool forceRefresh)
         {
-            lock (_cacheLock)
+            // 1) Försök använda befintlig cache
+            lock (s_cacheLock)
             {
                 bool canUseCache =
                     !forceRefresh &&
-                    _cachedUsdCurve != null &&
-                    _cacheValDate.Date == DateTime.Today &&
-                    !IsStaleByTtl(_usdLoadedUtc, UsdCurveTtl);
+                    s_cachedUsdCurve != null &&
+                    s_cacheValDate.Date == DateTime.Today &&
+                    !IsStaleByTtl(s_usdLoadedUtc, UsdCurveTtl);
 
                 if (canUseCache)
                     return;
+            }
 
-                // Ladda om från Bloomberg
-                var fresh = new UsdSofrCurve();
-                fresh.LoadFromBloomberg(_bbgSession);
+            // 2) Behöver fylla/uppdatera cache → säkerställ session lokalt
+            EnsureBloombergSession();
 
-                _cachedUsdCurve = fresh;
-                _cacheValDate = DateTime.Today;
-                _usdLoadedUtc = DateTime.UtcNow;
+            // 3) Ladda färsk USD-kurva och uppdatera cache (låst sektion)
+            var fresh = new UsdSofrCurve();
+            fresh.LoadFromBloomberg(_bbgSession);
+
+            lock (s_cacheLock)
+            {
+                s_cachedUsdCurve = fresh;
+                s_cacheValDate = DateTime.Today;
+                s_usdLoadedUtc = DateTime.UtcNow;
             }
         }
+
 
 
         /// <summary>
@@ -475,6 +371,8 @@ namespace FX.Services.MarketData
         {
             FxSwapPoints LoadFromBbg(string pair6)
             {
+                // Sesion endast när vi MÅSTE ladda
+                EnsureBloombergSession();
                 var leg = new FxSwapPoints();
                 leg.LoadFromBloomberg(_bbgSession, pair6 + " BGN Curncy", ResolveSpotDateForPair);
                 return leg;
@@ -483,20 +381,21 @@ namespace FX.Services.MarketData
             string keyPreferred = (preferredPair6 + " BGN Curncy").ToUpperInvariant();
             string keyAlt = (altPair6 + " BGN Curncy").ToUpperInvariant();
 
-            lock (_cacheLock)
+            // 1) Cache-hit om möjligt
+            lock (s_cacheLock)
             {
-                if (!forceRefresh && _fxLegCache.TryGetValue(keyPreferred, out var cachedA) && cachedA != null)
+                if (!forceRefresh && s_fxLegCache.TryGetValue(keyPreferred, out var cachedA) && cachedA != null)
                 {
-                    var loadedA = _fxLegLoadedUtc.TryGetValue(keyPreferred, out var tA) ? tA : DateTime.MinValue;
+                    var loadedA = s_fxLegLoadedUtc.TryGetValue(keyPreferred, out var tA) ? tA : DateTime.MinValue;
                     if (!IsStaleByTtl(loadedA, FxLegTtl))
                     {
                         lastLoadedUtc = loadedA;
                         return cachedA;
                     }
                 }
-                if (!forceRefresh && _fxLegCache.TryGetValue(keyAlt, out var cachedB) && cachedB != null)
+                if (!forceRefresh && s_fxLegCache.TryGetValue(keyAlt, out var cachedB) && cachedB != null)
                 {
-                    var loadedB = _fxLegLoadedUtc.TryGetValue(keyAlt, out var tB) ? tB : DateTime.MinValue;
+                    var loadedB = s_fxLegLoadedUtc.TryGetValue(keyAlt, out var tB) ? tB : DateTime.MinValue;
                     if (!IsStaleByTtl(loadedB, FxLegTtl))
                     {
                         lastLoadedUtc = loadedB;
@@ -505,8 +404,8 @@ namespace FX.Services.MarketData
                 }
             }
 
-            // Ladda "preferred" först, annars "alt"
-            FxSwapPoints legLoaded = null;
+            // 2) Cache miss/stale → välj vilken som ska laddas
+            FxSwapPoints legLoaded;
             string usedKey;
             try
             {
@@ -519,14 +418,16 @@ namespace FX.Services.MarketData
                 usedKey = keyAlt;
             }
 
-            lock (_cacheLock)
+            // 3) Uppdatera cache (tråd-säkert)
+            lock (s_cacheLock)
             {
-                _fxLegCache[usedKey] = legLoaded;
-                _fxLegLoadedUtc[usedKey] = DateTime.UtcNow;
-                lastLoadedUtc = _fxLegLoadedUtc[usedKey];
+                s_fxLegCache[usedKey] = legLoaded;
+                s_fxLegLoadedUtc[usedKey] = DateTime.UtcNow;
+                lastLoadedUtc = s_fxLegLoadedUtc[usedKey];
             }
             return legLoaded;
         }
+
 
 
 
