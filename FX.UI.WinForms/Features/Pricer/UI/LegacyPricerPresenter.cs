@@ -10,6 +10,7 @@ using FX.Services.MarketData;
 using System.Diagnostics;
 using System.Threading;
 using System.Linq;
+using FX.Services;
 
 namespace FX.UI.WinForms
 {
@@ -28,6 +29,7 @@ namespace FX.UI.WinForms
         private readonly IDisposable _subPrice;
         private readonly IDisposable _subError;
         private readonly IMessageBus _bus;
+        private readonly ISpotSetDateService _spotSvc;
         private readonly ISpotFeed _spotFeed;
         private readonly IMarketStore _mktStore;
         private readonly int _spotTimeoutMs = 3000;
@@ -51,10 +53,12 @@ namespace FX.UI.WinForms
         /// Skapar presenter och ansluter UI- och bus-händelser.
         /// Om <paramref name="spotFeed"/> inte tillhandahålls används <see cref="BloombergSpotFeed"/> med timeout 3000 ms.
         /// </summary>
-        public LegacyPricerPresenter(IMessageBus bus, LegacyPricerView view, IMarketStore marketStore)
+        public LegacyPricerPresenter(IMessageBus bus, LegacyPricerView view, IMarketStore marketStore, ISpotSetDateService spotSvc)
         {
             _bus = bus ?? throw new ArgumentNullException(nameof(bus));
             _view = view ?? throw new ArgumentNullException(nameof(view));
+
+            _spotSvc = spotSvc ?? throw new ArgumentNullException(nameof(spotSvc));
 
             // === Ben: se till att vi startar med 1 stabilt ben ("Vanilla 1") ===
             if (_legStates.Count == 0)
@@ -79,6 +83,7 @@ namespace FX.UI.WinForms
             _view.ExpiryEditRequested += OnExpiryEditRequested;
             _view.SpotModeChanged += OnSpotModeChanged;
             _view.AddLegRequested += OnAddLegRequested; // Lägg till ben (F6)
+            _view.RatesRefreshRequested += OnRatesRefreshRequested; //Refresh rates (F7)
 
             _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
 
@@ -257,14 +262,15 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Prissätter ett ben via stabil identitet (LegId).
-        /// Läser UI-snapshot för benet, löser expiry vid behov och skickar RequestPrice.
+        /// Bygger RequestPrice från UI-snapshot och skickar över bus.
+        /// Kan begära force refresh av RD/RF (F7).
         /// </summary>
-        private void PriceSingleLeg(Guid legId)
+        private void PriceSingleLeg(Guid legId, bool forceRefreshRates)
         {
             string reason;
             if (!CanPriceNow(out reason))
             {
-                Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
+                System.Diagnostics.Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
                 return;
             }
 
@@ -281,7 +287,7 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            // --- Expiry resolve (best effort) ---
+            // --- (samma expiry-resolve som du redan har) ---
             var iso = _view.TryGetResolvedExpiryIsoById(legId);
             if (string.IsNullOrWhiteSpace(iso) && !string.IsNullOrWhiteSpace(snap.ExpiryRaw))
             {
@@ -302,27 +308,20 @@ namespace FX.UI.WinForms
                 catch { /* best effort */ }
             }
 
-            // --- Spot från MarketStore (samma logik som tidigare) ---
+            // --- Spot enligt store (samma logik som tidigare) ---
             var storeSnap = _mktStore.Current;
-
-            var pair6 =
-                NormalizePair6(snap.Pair6) ??
-                NormalizePair6(_mktStore.Current?.Pair6) ??
-                NormalizePair6(_view.ReadPair6());
-
+            var pair6 = NormalizePair6(snap.Pair6) ?? NormalizePair6(storeSnap?.Pair6) ?? NormalizePair6(_view.ReadPair6());
             if (pair6 == null)
             {
-                Debug.WriteLine("[Presenter] Skip pricing: pair6 saknas/ogiltigt.");
+                System.Diagnostics.Debug.WriteLine("[Presenter] Skip pricing: pair6 saknas/ogiltigt.");
                 return;
             }
 
             double sb = 0.0, sa = 0.0;
-
             if (storeSnap != null && string.Equals(storeSnap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
             {
                 var field = storeSnap.Spot;
                 var tw = field.Effective;
-
                 if (field.ViewMode == ViewMode.Mid || field.Override == OverrideMode.Mid)
                 {
                     var mid = 0.5 * (tw.Bid + tw.Ask);
@@ -344,11 +343,10 @@ namespace FX.UI.WinForms
             sb = Math.Round(sb, dp, MidpointRounding.AwayFromZero);
             sa = Math.Round(sa, dp, MidpointRounding.AwayFromZero);
 
-            // --- Vol (decimal → procent) ---
+            // Vol i procent
             double? volBidPct = (snap.VolBid > 0.0) ? (double?)(snap.VolBid * 100.0) : null;
             double? volAskPct = (snap.VolHasTwoWay && snap.VolAsk > 0.0) ? (double?)(snap.VolAsk * 100.0) : null;
 
-            // --- Publisera kommandot ---
             var corr = Guid.NewGuid();
             _corrToLegId[corr] = legId;
 
@@ -363,12 +361,13 @@ namespace FX.UI.WinForms
                 SurfaceId = "default",
                 StickyDelta = false,
                 VolBidPct = volBidPct,
-                VolAskPct = volAskPct,
+                VolAskPct = volBidPct.HasValue && volAskPct.HasValue ? volAskPct : null,
+                ForceRefreshRates = forceRefreshRates, // ← NYTT
                 Legs = new System.Collections.Generic.List<FX.Messages.Commands.RequestPrice.Leg>
         {
             new FX.Messages.Commands.RequestPrice.Leg
             {
-                LegId    = legId,                                  // ← NYTT! bär med stabil Guid
+                LegId    = legId,
                 Side     = snap.Side,
                 Type     = snap.Type,
                 Strike   = snap.Strike,
@@ -378,9 +377,19 @@ namespace FX.UI.WinForms
         }
             };
 
+            // In-flight vakt för dubbelprisning
             _pricingInFlight = true;
             _bus.Publish(cmd);
         }
+
+        /// <summary>
+        /// Bekvämlighetsöverlagring: standard = ingen force refresh.
+        /// </summary>
+        private void PriceSingleLeg(Guid legId)
+        {
+            PriceSingleLeg(legId, false);
+        }
+
 
 
 
@@ -612,78 +621,122 @@ namespace FX.UI.WinForms
             });
         }
 
-
         /// <summary>
-        /// Reagerar på MarketStore-ändringar: uppdaterar spot-UI vid spot-relaterad reason
-        /// och schemalägger prisning via debounce/single-flight (ScheduleRepriceDebounced()).
-        /// Inget tungt arbete görs på UI-tråden direkt.
+        /// MarketStore → Presenter: något i marknaden ändrades.
+        /// - Spot: uppdatera UI (spot + rates + fwd/pts) och trigga reprice (debounced).
+        /// - RD/RF: uppdatera UI (rates + fwd/pts) och trigga reprice om ej in-flight och utanför cooldown.
+        /// - Batch:
+        ///     * Spot>0  → spot + rates + fwd/pts → reprice.
+        ///     * Spot=0 & rd/rf>0 → rates + fwd/pts → reprice enligt skydd.
+        /// - Övrigt: loggas men triggar inget.
         /// </summary>
         private void OnMarketChanged(object sender, MarketChangedEventArgs e)
         {
-            var reason = (e != null ? (e.Reason ?? string.Empty) : string.Empty);
-            var snap = _mktStore.Current;
-            var p6 = (snap != null ? snap.Pair6 : "(n/a)");
-            var spotField = (snap != null ? snap.Spot : null);
-            TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
-
-            var spotText = eff.HasValue
-                ? eff.Value.Bid.ToString("F6", CultureInfo.InvariantCulture) + "/" +
-                  eff.Value.Ask.ToString("F6", CultureInfo.InvariantCulture)
-                : "N/A";
-
-            Debug.WriteLine("[OnMarketChanged][T" + Thread.CurrentThread.ManagedThreadId + "] reason=" + reason + " pair=" + p6 + " spotEff=" + spotText);
-
-            // 1) Spot-relaterat → uppdatera UI + prissätt
-            if (IsSpotReason(reason))
+            try
             {
-                if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                ScheduleRepriceDebounced();
-                return;
-            }
+                var reason = (e != null ? (e.Reason ?? string.Empty) : string.Empty);
 
-            // 2) Rate-only (enstaka rd/rf)
-            bool isRateOnly =
-                reason.StartsWith("FeedRd", StringComparison.OrdinalIgnoreCase) ||
-                reason.StartsWith("FeedRf", StringComparison.OrdinalIgnoreCase);
+                var snap = _mktStore.Current;
+                var p6 = (snap != null ? snap.Pair6 : "(n/a)");
+                var spotField = (snap != null ? snap.Spot : null);
+                TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
 
-            // 3) Batch: prissätt ENDAST om Spot>0, annars behandla som rate-only
-            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
-            {
-                int rd, rf, spot, other;
-                if (TryParseBatchCounts(reason, out rd, out rf, out spot, out other))
+                var ci = System.Globalization.CultureInfo.InvariantCulture;
+                var spotText = eff.HasValue
+                    ? eff.Value.Bid.ToString("F6", ci) + "/" + eff.Value.Ask.ToString("F6", ci)
+                    : "N/A";
+
+                System.Diagnostics.Debug.WriteLine(
+                    "[OnMarketChanged][T" + System.Threading.Thread.CurrentThread.ManagedThreadId +
+                    "] reason=" + reason + " pair=" + p6 + " spotEff=" + spotText);
+
+                // 1) Spot-relaterat → UI + reprice
+                if (IsSpotReason(reason))
                 {
-                    if (spot > 0)
+                    if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                    PushRatesUiAllLegs();
+                    PushForwardUiAllLegs();
+                    ScheduleRepriceDebounced();
+                    return;
+                }
+
+                // 2) Batch → om Spot>0: UI + reprice, annars rate-only
+                if (reason.StartsWith("Batch:", System.StringComparison.OrdinalIgnoreCase))
+                {
+                    int rd = 0, rf = 0, spot = 0, other = 0;
+                    if (TryParseBatchCounts(reason, out rd, out rf, out spot, out other))
                     {
-                        if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                        ScheduleRepriceDebounced();
-                        return;
+                        if (spot > 0)
+                        {
+                            if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                            PushRatesUiAllLegs();
+                            PushForwardUiAllLegs();
+                            ScheduleRepriceDebounced();
+                            return;
+                        }
+
+                        // Rate-only batch (ingen spot men rd/rf finns)
+                        if ((rd + rf) > 0)
+                        {
+                            PushRatesUiAllLegs();
+                            PushForwardUiAllLegs();
+
+                            // Reprice-skydd: undvik dubbletter vid egna writes
+                            if (!_pricingInFlight &&
+                                (System.DateTime.UtcNow - _lastPriceFinishedUtc) >= _rateWriteCooldown)
+                            {
+                                ScheduleRepriceDebounced();
+                            }
+                            return;
+                        }
                     }
-                    isRateOnly = (rd + rf) > 0 && spot == 0;
                 }
-            }
 
-            if (isRateOnly)
+                // 3) Enstaka RD/RF → UI + ev. reprice
+                bool isRateOnly =
+                    reason.StartsWith("FeedRd", System.StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("FeedRf", System.StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdOverride", System.StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfOverride", System.StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdViewMode", System.StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfViewMode", System.StringComparison.OrdinalIgnoreCase);
+
+                if (isRateOnly)
+                {
+                    // UI: uppdatera specifikt ben om guid finns i reason, annars alla
+                    System.Guid gid;
+                    if (TryParseLegGuidFromReason(reason, out gid) && gid != System.Guid.Empty)
+                    {
+                        PushRatesUiForLeg(gid);
+                        PushForwardUiForLeg(gid);
+                    }
+                    else
+                    {
+                        PushRatesUiAllLegs();
+                        PushForwardUiAllLegs();
+                    }
+
+                    // Reprice-skydd: undvik dubbelprisning från våra egna ensure-writes
+                    if (_pricingInFlight) return;
+                    if ((System.DateTime.UtcNow - _lastPriceFinishedUtc) < _rateWriteCooldown) return;
+
+                    ScheduleRepriceDebounced();
+                    return;
+                }
+
+                // 4) Övrigt (vol/other) – ingen auto-prisning här.
+                System.Diagnostics.Debug.WriteLine("[OnMarketChanged] ignored: " + reason);
+            }
+            catch (System.Exception ex)
             {
-                // Filtrera bort dubbelprisning från våra egna ensure-skrivningar
-                if (_pricingInFlight)
-                {
-                    Debug.WriteLine("[OnMarketChanged] Skip reprice: pricing in-flight → RD/RF write ignored.");
-                    return;
-                }
-
-                if ((DateTime.UtcNow - _lastPriceFinishedUtc) < _rateWriteCooldown)
-                {
-                    Debug.WriteLine("[OnMarketChanged] Skip reprice: RD/RF within cooldown after own pricerun.");
-                    return;
-                }
-
-                // Extern RD/RF-ändring → prissätt
-                ScheduleRepriceDebounced();
-                return;
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
-
-            // 4) Övriga orsaker → ingen auto-prisning här.
         }
+
+
+
+
+
 
 
         /// <summary>
@@ -848,12 +901,63 @@ namespace FX.UI.WinForms
             }
         }
 
+        /// <summary>
+        /// UI: F7 – användaren vill hämta nya RD/RF från källa (force refresh)
+        /// och därefter prissätta alla ben. Vi gör det genom att skicka våra vanliga
+        /// RequestPrice, men med ForceRefreshRates=true.
+        /// </summary>
+        private void OnRatesRefreshRequested(object sender, EventArgs e)
+        {
+            try
+            {
+                System.Diagnostics.Debug.WriteLine("[Presenter.F7] Force refresh rates for all legs…");
+
+                // Reprisa alla ben men med flaggan på
+                for (int i = 0; i < _legStates.Count; i++)
+                {
+                    var legId = _legStates[i].LegId;
+                    PriceSingleLeg(legId, /*forceRefreshRates:*/ true);
+                }
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(new ErrorOccurred
+                {
+                    Source = "Presenter.OnRatesRefreshRequested",
+                    Message = ex.Message,
+                    Detail = ex.ToString(),
+                    CorrelationId = Guid.Empty
+                });
+            }
+        }
 
 
 
         #endregion
 
         #region Helpers
+
+        /// <summary>
+        /// Money-market year fraction (samma konvention som i feedern/runtime).
+        /// Default = ACT/360. Vissa valutor (ex. GBP/AUD/NZD) = ACT/365.
+        /// </summary>
+        private static double YearFracMm(DateTime start, DateTime end, string ccy)
+        {
+            if (end <= start) return 0.0;
+            var days = (end - start).TotalDays;
+
+            switch ((ccy ?? "").ToUpperInvariant())
+            {
+                case "GBP":
+                case "AUD":
+                case "NZD":
+                    return days / 365.0;
+                default:
+                    return days / 360.0;
+            }
+        }
+
+
 
         /// <summary>
         /// Returnerar true om vi har minsta uppsättning marknadsdata för att prisa.
@@ -1157,6 +1261,202 @@ namespace FX.UI.WinForms
 
 
         #endregion
+
+
+        /// <summary>
+        /// Räknar fram Forward och Swap Points för ett ben och visar i UI.
+        /// - Spot: effektiv från MarketStore (ViewMode/Override respekteras).
+        /// - RD/RF: mitt från MarketStore (per legId).
+        /// - Datum: spotDate/settlement från ISpotSetDateService (samma som runtime).
+        /// - T: YearFracMm(spotDate, settlement, ccy) (samma som feedern).
+        /// - Fwd = S * (1 + rd*T_quote) / (1 + rf*T_base),  Pts = Fwd − S.
+        /// </summary>
+        private void PushForwardUiForLeg(Guid legId)
+        {
+            var snap = _mktStore?.Current;
+            if (snap == null) { _view.ShowForwardById(legId, null, null); return; }
+
+            var pair6 = snap.Pair6;
+            if (string.IsNullOrWhiteSpace(pair6) || pair6.Length != 6) { _view.ShowForwardById(legId, null, null); return; }
+            var baseCcy = pair6.Substring(0, 3);
+            var quoteCcy = pair6.Substring(3, 3);
+
+            // 1) Spot mid (respektera ViewMode/Override)
+            var sf = snap.Spot;
+            var se = sf.Effective;
+            double sBid, sAsk;
+            if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
+            {
+                var mid = 0.5 * (se.Bid + se.Ask);
+                sBid = mid; sAsk = mid;
+            }
+            else
+            {
+                sBid = se.Bid; sAsk = se.Ask;
+            }
+            var S = 0.5 * (sBid + sAsk);
+            if (S <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
+
+            // 2) RD/RF (mid) från store för detta leg
+            var key = legId.ToString();
+            var rdFld = snap.TryGetRd(key);
+            var rfFld = snap.TryGetRf(key);
+            if (rdFld == null || rfFld == null) { _view.ShowForwardById(legId, null, null); return; }
+
+            var rdMid = 0.5 * (rdFld.Effective.Bid + rdFld.Effective.Ask);
+            var rfMid = 0.5 * (rfFld.Effective.Bid + rfFld.Effective.Ask);
+
+            // 3) Datum via samma tjänst som runtime
+            //    Expiry hämtas ur vyns resolverade ISO för detta ben (finns redan i din vy).
+            var today = DateTime.Today;
+            var expIso = _view.TryGetResolvedExpiryIsoById(legId);
+            DateTime expiry = today;
+            if (!string.IsNullOrWhiteSpace(expIso)) DateTime.TryParse(expIso, out expiry);
+
+            var dates = _spotSvc.Compute(pair6, today, expiry);
+            var spotDate = dates.SpotDate;
+            var settlement = dates.SettlementDate;
+
+            // 4) Year fractions enligt MM-konvention (samma som feeder)
+            var Tq = YearFracMm(spotDate, settlement, quoteCcy);
+            var Tb = YearFracMm(spotDate, settlement, baseCcy);
+            if (Tq <= 0.0 && Tb <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
+
+            // 5) Forward & Points
+            var denom = (1.0 + rfMid * Tb);
+            if (denom <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
+
+            var F = S * (1.0 + rdMid * Tq) / denom;
+            var P = F - S;
+
+            _view.ShowForwardById(legId, F, P);
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            System.Diagnostics.Debug.WriteLine(
+                $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
+                $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
+                $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
+                $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
+        }
+
+
+        /// <summary>
+        /// Uppdaterar Forward & Swap Points för alla kända ben i UI.
+        /// </summary>
+        private void PushForwardUiAllLegs()
+        {
+            for (int i = 0; i < _legStates.Count; i++)
+                PushForwardUiForLeg(_legStates[i].LegId);
+        }
+
+
+
+
+        /// <summary>
+        /// Läser RD/RF för ett specifikt ben (via legId) ur MarketStore.Current och
+        /// trycker ut till UI (utan att trigga prisning).
+        /// Om data saknas visas tomma celler.
+        /// </summary>
+        private void PushRatesUiForLeg(Guid legId)
+        {
+            var snap = _mktStore?.Current;
+            if (snap == null) return;
+
+            var key = legId.ToString();
+
+            // Hämta MarketField<double> för RD/RF (lagras i store per legId.ToString()).
+            var rdFld = FX.Core.Domain.MarketData.MarketSnapshot.TryGet(snap.RdByLeg, key);
+            var rfFld = FX.Core.Domain.MarketData.MarketSnapshot.TryGet(snap.RfByLeg, key);
+
+            double? rdMid = null, rfMid = null;
+            bool staleRd = false, staleRf = false;
+
+            if (rdFld != null)
+            {
+                var tw = rdFld.Effective; // TwoWay<double> (värdetyp) – kan inte vara null
+                rdMid = 0.5 * (tw.Bid + tw.Ask);
+                staleRd = rdFld.IsStale;  // ← rätt property
+            }
+            if (rfFld != null)
+            {
+                var tw = rfFld.Effective;
+                rfMid = 0.5 * (tw.Bid + tw.Ask);
+                staleRf = rfFld.IsStale;  // ← rätt property
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[Presenter.UI.Rates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} " +
+                $"rd={(rdMid.HasValue ? rdMid.Value.ToString("F6", System.Globalization.CultureInfo.InvariantCulture) : "-")} " +
+                $"rf={(rfMid.HasValue ? rfMid.Value.ToString("F6", System.Globalization.CultureInfo.InvariantCulture) : "-")} " +
+                $"staleRd={staleRd} staleRf={staleRf}");
+
+            OnUi(() =>
+            {
+                _view.ShowRatesById(legId, rdMid, rfMid, staleRd, staleRf);
+            });
+        }
+
+
+        /// <summary>
+        /// Uppdaterar RD/RF-visningen för alla kända ben i UI (utan reprice).
+        /// </summary>
+        private void PushRatesUiAllLegs()
+        {
+            for (int i = 0; i < _legStates.Count; i++)
+                PushRatesUiForLeg(_legStates[i].LegId);
+        }
+
+
+        /// <summary>
+        /// True om MarketStore-orsaken handlar om RD/RF (Feed/Override/ViewMode) och
+        /// *inte* innehåller spot. Hanterar även batch där endast RD/RF uppdaterats.
+        /// </summary>
+        private static bool IsRateOnlyReason(string reason)
+        {
+            if (string.IsNullOrEmpty(reason)) return false;
+
+            // Direkta rate-signaler
+            if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase)) return true;
+            if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase)) return true;
+            if (reason.StartsWith("RdOverride", StringComparison.OrdinalIgnoreCase)) return true;
+            if (reason.StartsWith("RfOverride", StringComparison.OrdinalIgnoreCase)) return true;
+            if (reason.StartsWith("RdViewMode", StringComparison.OrdinalIgnoreCase)) return true;
+            if (reason.StartsWith("RfViewMode", StringComparison.OrdinalIgnoreCase)) return true;
+
+            // Batch: "Batch:Rd=1;Rf=1;Spot=0;Other=0"
+            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+            {
+                var s = reason.ToUpperInvariant();
+                var hasRd = s.Contains("RD=") && !s.Contains("RD=0");
+                var hasRf = s.Contains("RF=") && !s.Contains("RF=0");
+                var hasSpot = s.Contains("SPOT=") && !s.Contains("SPOT=0");
+                return (hasRd || hasRf) && !hasSpot;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Försöker extrahera legId (Guid) ur en orsakstext med mönster "FeedRd:{guid}" eller "FeedRf:{guid}".
+        /// Returnerar true vid lyckad parse.
+        /// </summary>
+        private static bool TryParseLegGuidFromReason(string reason, out Guid legId)
+        {
+            legId = Guid.Empty;
+            if (string.IsNullOrEmpty(reason)) return false;
+
+            string guidPart = null;
+
+            if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase))
+                guidPart = reason.Substring("FeedRd:".Length).Trim();
+            else if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase))
+                guidPart = reason.Substring("FeedRf:".Length).Trim();
+
+            if (string.IsNullOrEmpty(guidPart)) return false;
+            return Guid.TryParse(guidPart, out legId);
+        }
+
+
 
     }
 }

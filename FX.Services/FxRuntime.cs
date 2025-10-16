@@ -57,10 +57,13 @@ namespace FX.Services
 
         /// <summary>
         /// Huvudhandler för prisförfrågningar.
-        /// 1) Säkerställ rd/rf i MarketStore (via orchestrator) för BENETS Guid.
-        /// 2) Läs effektiv rd/rf ur MarketStore (samma nyckel).
-        /// 3) Välj spot enligt store (respektera ViewMode/Override).
-        /// 4) Kör motorn och publicera PriceCalculated.
+        /// 1) Normalisera indata och räkna ut datum (expiry från cmd, spot/settle via tjänst).
+        /// 2) Säkerställ RD/RF för BENETS Guid i MarketStore:
+        ///    - ForceRefreshRates=true  → feeder.EnsureRdRfFor(..., forceRefresh:true).
+        ///    - annars                 → orchestrator.Build(...) (cache-först).
+        /// 3) Läs effektiv RD/RF ur MarketStore (samma legId).
+        /// 4) Välj spot enligt store (respektera ViewMode/Override).
+        /// 5) Bygg PricingRequest, kör motorn och publicera PriceCalculated.
         /// </summary>
         private async System.Threading.Tasks.Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
         {
@@ -81,7 +84,7 @@ namespace FX.Services
                     // Stabil ben-nyckel = Guid-string
                     string legId = leg0.LegId.ToString();
 
-                    // Säkerställ att store är på rätt par innan Build
+                    // Säkerställ att store är på rätt par innan datum/ensure
                     var current = _marketStore.Current;
                     if (current == null || !string.Equals(current.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
                     {
@@ -115,22 +118,46 @@ namespace FX.Services
                     }
 
                     System.Diagnostics.Debug.WriteLine(
-                        $"[FxRuntime.Request][T{Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} spotEff={spotEff.Bid:F6}/{spotEff.Ask:F6} vm={spotField.ViewMode} ov={spotField.Override} exp={expiry:yyyy-MM-dd} spotDate={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd}");
+                        $"[FxRuntime.Request][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} " +
+                        $"spotEff={spotEff.Bid:F6}/{spotEff.Ask:F6} vm={spotField.ViewMode} ov={spotField.Override} " +
+                        $"exp={expiry:yyyy-MM-dd} spotDate={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd}");
 
-                    // === 3) Kör Orchestratorn för att säkerställa RD/RF för just detta legId ===
-                    var orchestrator = FX.Services.MarketData.OrchestratorFactory.Create(_marketStore);
-                    var build = orchestrator.Build(pair6, legId, today, expiry, spotDate, settlement, useMid: false);
+                    // === 3) Säkerställ RD/RF för just detta legId ===
+                    if (cmd.ForceRefreshRates)
+                    {
+                        // F7-läge: tvinga fresh från källa
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[FxRuntime.EnsureRates][FORCE][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} " +
+                            $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd}");
 
-                    // === 4) Läs tillbaka effektiv RD/RF (TwoWay<double>?) ur MarketStore med samma legId ===
-                    snap = _marketStore.Current; // hämta igen efter build
+                        using (var feeder = new FX.Services.MarketData.UsdAnchoredRateFeeder(_marketStore))
+                        {
+                            feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, /*forceRefresh*/ true);
+                        }
+                    }
+                    else
+                    {
+                        // Normalfall: cache-först via orchestrator
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[FxRuntime.EnsureRates][CACHE][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} " +
+                            $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd}");
+
+                        var orchestrator = FX.Services.MarketData.OrchestratorFactory.Create(_marketStore);
+                        var ok = orchestrator.Build(pair6, legId, today, expiry, spotDate, settlement, useMid: false);
+                        // ok kan loggas om du vill; RD/RF läses alltid ur store nedan.
+                    }
+
+                    // === 4) Läs tillbaka effektiv RD/RF ur MarketStore med samma legId ===
+                    snap = _marketStore.Current; // hämta igen efter ensure
                     var rdEff = snap.TryGetRd(legId)?.Effective;
                     var rfEff = snap.TryGetRf(legId)?.Effective;
 
                     if (!rdEff.HasValue || !rfEff.HasValue)
-                        throw new InvalidOperationException("Effektiv RD/RF saknas efter orchestrator.Build().");
+                        throw new InvalidOperationException("Effektiv RD/RF saknas efter ensure.");
 
                     System.Diagnostics.Debug.WriteLine(
-                        $"[FxRuntime.Rates][T{Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} rdEff={rdEff.Value.Bid:F6}/{rdEff.Value.Ask:F6} rfEff={rfEff.Value.Bid:F6}/{rfEff.Value.Ask:F6}");
+                        $"[FxRuntime.Rates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={pair6} legId={legId} " +
+                        $"rdEff={rdEff.Value.Bid:F6}/{rdEff.Value.Ask:F6} rfEff={rfEff.Value.Bid:F6}/{rfEff.Value.Ask:F6}");
 
                     // === 5) rd/rf-mid (om overrides ej satta i cmd) ===
                     double rdMid = 0.5 * (rdEff.Value.Bid + rdEff.Value.Ask);
@@ -237,6 +264,7 @@ namespace FX.Services
                 });
             }
         }
+
 
 
         /// <summary>

@@ -27,6 +27,12 @@ namespace FX.Messages.Commands
         public string SurfaceId { get; set; }
         public bool StickyDelta { get; set; }
 
+        /// <summary>
+        /// Om true tvingar runtime en fresh-laddning av RD/RF från källa (för berörda ben)
+        /// innan prisning. Standard = false (cache först).
+        /// </summary>
+        public bool ForceRefreshRates { get; set; }
+
         // Benen som ska prissättas
         public List<Leg> Legs { get; set; } = new List<Leg>();
 

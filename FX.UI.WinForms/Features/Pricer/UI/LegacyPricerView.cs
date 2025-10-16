@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -199,6 +200,12 @@ namespace FX.UI.WinForms
         public event EventHandler SpotModeChanged;
 
         public event EventHandler PairChanged;
+
+        /// <summary>
+        /// Begär att nya räntor (RD/RF) ska hämtas från källa (force refresh).
+        /// Presentern lyssnar och initierar reprice med ForceRefreshRates=true.
+        /// </summary>
+        public event EventHandler RatesRefreshRequested;
 
         #endregion
 
@@ -3329,6 +3336,12 @@ namespace FX.UI.WinForms
                 return true;
             }
 
+            if (keyData == Keys.F7)
+            {
+                RatesRefreshRequested?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
+
             // F9: reprice alla ben (oförändrat)
             if (keyData == Keys.F9)
             {
@@ -4148,6 +4161,9 @@ namespace FX.UI.WinForms
 
         #endregion
 
+
+
+
         public override Size GetPreferredSize(Size proposedSize)
         {
             try
@@ -4180,7 +4196,101 @@ namespace FX.UI.WinForms
                 return new Size(1000, 600);
             }
         }
+
+        /// <summary>
+        /// Visar Forward och Swap Points för ett visst ben.
+        /// Fwd och Pts anges i prisunits (ej pips); du kan justera format om du vill visa pips.
+        /// </summary>
+        public void ShowForwardById(Guid legId, double? fwd, double? pts)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            int rFwd = R(L.FwdRate);   // se till att dessa rader finns i layouten
+            int rPts = R(L.FwdPts);
+            if (rFwd < 0 || rPts < 0) return;
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+            var cFwd = _dgv.Rows[rFwd].Cells[col];
+            var cPts = _dgv.Rows[rPts].Cells[col];
+
+            cFwd.Value = fwd.HasValue ? fwd.Value.ToString("F6", ci) : "";
+            cPts.Value = pts.HasValue ? pts.Value.ToString("F6", ci) : "";
+
+            _dgv.InvalidateRow(rFwd);
+            _dgv.InvalidateRow(rPts);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[View.ShowForward] leg={legId} col={col} " +
+                $"fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} " +
+                $"pts={(pts.HasValue ? pts.Value.ToString("F6", ci) : "-")}");
+        }
+
+
+        /// <summary>
+        /// Visar RD/RF (decimaler) för ett specifikt ben.
+        /// - Formaterar som procent med 3 d.p.
+        /// - Lagrar feed-baseline i Tag (double) för korrekt override-hantering.
+        /// - Om raderna inte finns än, eller kolumnen saknas, görs inget.
+        /// </summary>
+        public void ShowRatesById(Guid legId, double? rdDec, double? rfDec, bool staleRd, bool staleRf)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            int rRd = R(L.Rd);
+            int rRf = R(L.Rf);
+            if (rRd < 0 || rRf < 0) return; // rd/rf-rader saknas i layouten
+
+            // RD
+            var cRd = _dgv.Rows[rRd].Cells[col];
+            if (rdDec.HasValue)
+            {
+                cRd.Tag = rdDec.Value;                 // feed-baseline som decimal
+                cRd.Value = FormatPercent(rdDec.Value, 3);
+            }
+            else
+            {
+                cRd.Tag = null;
+                cRd.Value = "";
+            }
+            // feed ska inte markeras som override
+            MarkOverride(L.Rd, col, false);
+
+            // RF
+            var cRf = _dgv.Rows[rRf].Cells[col];
+            if (rfDec.HasValue)
+            {
+                cRf.Tag = rfDec.Value;                 // feed-baseline som decimal
+                cRf.Value = FormatPercent(rfDec.Value, 3);
+            }
+            else
+            {
+                cRf.Tag = null;
+                cRf.Value = "";
+            }
+            MarkOverride(L.Rf, col, false);
+
+            // (valfritt) Indikera stale i tooltip – icke-blockerande visuell hint
+            if (staleRd) cRd.ToolTipText = "Stale RD (cache TTL passerad)"; else cRd.ToolTipText = null;
+            if (staleRf) cRf.ToolTipText = "Stale RF (cache TTL passerad)"; else cRf.ToolTipText = null;
+
+            _dgv.InvalidateRow(rRd);
+            _dgv.InvalidateRow(rRf);
+
+            Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
+        }
+
+
+
+
+
+
+
     }
+
+
 
     #region Cell Data Classes
 
