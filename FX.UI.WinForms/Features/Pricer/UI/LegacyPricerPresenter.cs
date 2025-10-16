@@ -407,9 +407,6 @@ namespace FX.UI.WinForms
             });
         }
 
-
-
-
         /// <summary>
         /// Tar emot fel från bus och loggar/visar basinformation.
         /// </summary>
@@ -464,12 +461,8 @@ namespace FX.UI.WinForms
         #region Spot feed
 
         /// <summary>
-        /// Hämtar en spot-snapshot från feed och skriver till MarketStore.
-        /// UI uppdateras via OnMarketChanged (store-driven).
-        /// </summary>
-        /// <summary>
-        /// Hämtar en spot-snapshot från feed och skriver till MarketStore.
-        /// UI uppdateras via OnMarketChanged (store-driven).
+        /// Hämtar spot (TryGetTwoWay) från feed och skriver endast till MarketStore (FeedSpot).
+        /// UI uppdateras därefter via OnMarketChanged (store-driven). Loggar feedvärden om DebugFlags.SpotFeed=true.
         /// </summary>
         private void RefreshSpotSnapshot()
         {
@@ -513,6 +506,10 @@ namespace FX.UI.WinForms
 
         #region Events
 
+        /// <summary>
+        /// Kör en UI-uppdatering säkert: BeginInvoke om handle finns, annars väntar på HandleCreated och kör där.
+        /// Skyddar mot "Invoke/BeginInvoke before handle created".
+        /// </summary>
         private void OnUi(Action action)
         {
             var ctrl = _view as System.Windows.Forms.Control;
@@ -541,8 +538,8 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// Begär en reprice med debounce (skjuts upp RepriceDebounceMs ms).
-        /// Flera begäran samlas ihop till en körning.
+        /// Debounce för prisning: (re)startar en kort timer och markerar att reprice är pending.
+        /// Flera snabba ändringar coalescas till en reprice-körning.
         /// </summary>
         private void ScheduleRepriceDebounced()
         {
@@ -610,8 +607,9 @@ namespace FX.UI.WinForms
 
 
         /// <summary>
-        /// MarketStore har ändrats. Uppdatera UI selektivt (spot när reason är spot)
-        /// och trigga reprice via debounce/single-flight.
+        /// Reagerar på MarketStore-ändringar: uppdaterar spot-UI vid spot-relaterad reason
+        /// och schemalägger prisning via debounce/single-flight (ScheduleRepriceDebounced()).
+        /// Inget tungt arbete görs på UI-tråden direkt.
         /// </summary>
         private void OnMarketChanged(object sender, FX.Core.Domain.MarketData.MarketChangedEventArgs e)
         {
@@ -945,16 +943,39 @@ namespace FX.UI.WinForms
 
         #endregion
 
-
+        /// <summary>
+        /// Returnerar true om reason avser spot-förändring (FeedSpot/UserSpot/SpotViewMode)
+        /// eller om det är ett batch-reason med Spot>0 (Batch:…Spot=K…). Används för att uppdatera spot-UI selektivt.
+        /// </summary>
         private static bool IsSpotReason(string reason)
         {
             if (string.IsNullOrEmpty(reason)) return false;
-            return reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase)
-                || reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase);
+
+            if (reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase) ||
+                reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Känn igen batch med Spot>0
+            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+            {
+                // Enkel parsing: leta "Spot=" och kolla att det inte är 0
+                var idx = reason.IndexOf("Spot=", StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    // Försök läsa ut talet efter Spot=
+                    var start = idx + 5;
+                    int end = reason.IndexOfAny(new[] { ';', ' ' }, start);
+                    var numTxt = (end >= 0 ? reason.Substring(start, end - start) : reason.Substring(start)).Trim();
+
+                    int spotCount;
+                    if (int.TryParse(numTxt, out spotCount))
+                        return spotCount > 0;
+                }
+            }
+
+            return false;
         }
-
-
 
     }
 }

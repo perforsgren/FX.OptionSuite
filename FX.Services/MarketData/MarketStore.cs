@@ -18,6 +18,12 @@ namespace FX.Services.MarketData
         private MarketSnapshot _current;
         public MarketSnapshot Current => _current;
 
+        // === Batchning av Changed ===
+        private readonly object _chgGate = new object();
+        private System.Threading.Timer _chgTimer;
+        private const int ChangedDebounceMs = 30; // 20–50 ms är vanligtvis lagom
+        private int _chgRdCount, _chgRfCount, _chgSpotCount, _chgOtherCount;
+
         public MarketStore()
         {
             // Seed: tomt EURSEK-snapshot så Current aldrig är null.
@@ -34,13 +40,12 @@ namespace FX.Services.MarketData
             _current = new MarketSnapshot("EURSEK", spot);
         }
 
-        // =========================
-        // SPOT
-        // =========================
+        #region Spot
 
         /// <summary>
-        /// User → Spot. wasMid=true ⇒ lås Mid och lagra bid=ask=mid. ViewMode påverkar visning.
-        /// Bevarar RD/RF om paret är detsamma.
+        /// User → Spot. wasMid=true låser Mid (bid=ask=mid) och sätter Override=Mid; annars Override=Both i TwoWay-läge.
+        /// Skapar nytt Spot-snapshot och BEVARAR RD/RF för samma valutapar.
+        /// Triggar Changed (batchas) med reason "UserSpot".
         /// </summary>
         public void SetSpotFromUser(string pair6, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
         {
@@ -71,7 +76,10 @@ namespace FX.Services.MarketData
         }
 
         /// <summary>
-        /// Feed → Spot (two-way). Respekterar per-sida override.
+        /// Skriver spot från feed och skapar nytt snapshot för Spot.
+        /// Bevarar befintliga RD/RF-tabeller när paret är oförändrat, så att en spot-refresh inte tappar kurvor.
+        /// Respekterar Override/ViewMode och kan markera stale.
+        /// Triggar Changed (batchas) med reason "FeedSpot".
         /// </summary>
         public void SetSpotFromFeed(string pair6, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
@@ -131,10 +139,10 @@ namespace FX.Services.MarketData
             RaiseChanged("FeedSpot");
         }
 
-
         /// <summary>
-        /// Uppdaterar enbart view-mode för Spot (Mid/TwoWay). Värdet lämnas orört.
-        /// Bevarar RD/RF om paret är detsamma.
+        /// Uppdaterar endast Spot.ViewMode (Mid/TwoWay), behåller Effective/Source/Override.
+        /// Skapar nytt Spot-snapshot och BEVARAR RD/RF för samma valutapar (vid parbyte initieras tomt).
+        /// Triggar Changed (batchas) med reason "SpotViewMode".
         /// </summary>
         public void SetSpotViewMode(string pair6, ViewMode viewMode, DateTime nowUtc)
         {
@@ -184,10 +192,10 @@ namespace FX.Services.MarketData
             RaiseChanged("SpotViewMode");
         }
 
-
         /// <summary>
-        /// Uppdaterar enbart override (None/Mid/Bid/Ask/Both) för Spot.
-        /// Bevarar RD/RF om paret är detsamma.
+        /// Uppdaterar endast Spot.Override (None/Mid/Bid/Ask/Both), behåller Effective/Source/ViewMode.
+        /// Skapar nytt Spot-snapshot och BEVARAR RD/RF för samma valutapar.
+        /// Triggar Changed (batchas) med reason "SpotOverride".
         /// </summary>
         public void SetSpotOverride(string pair6, OverrideMode ov, DateTime nowUtc)
         {
@@ -214,15 +222,14 @@ namespace FX.Services.MarketData
             RaiseChanged("SpotOverride");
         }
 
+        #endregion
+        #region RD & RF
 
-
-
-
-        // =========================
-        // RD/RF – FEED
-        // =========================
-
-        /// <summary>Feed → rd för ett leg. Respekterar per-sida override.</summary>
+        /// <summary>
+        /// Skriver rd (domestic rate) från feed för angivet ben. Idempotent mot Effective-värden
+        /// (ingen ändring/Changed om värdet inte ändrats, med liten EPS-tolerans).
+        /// Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// </summary>
         public void SetRdFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
@@ -236,12 +243,20 @@ namespace FX.Services.MarketData
             var cur = MarketSnapshot.TryGet(_current.RdByLeg, legId);
             if (cur == null)
             {
-                _current.RdByLeg[legId] = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
+                var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
+                _current.RdByLeg[legId] = fld;
+
+                if (DebugFlags.RatesWrite)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Store.WriteRd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={tw.Bid:F6}/{tw.Ask:F6} src=Feed vm=TwoWay ov=None stale={isStale}"
+                    );
+                }
+
                 RaiseChanged("FeedRd:" + legId);
                 return;
             }
 
-            // === Idempotens: om effektivt värde redan är (nästan) samma → no-op ===
             var eff = cur.Effective; // TwoWay<double>
             bool same;
             switch (cur.Override)
@@ -272,11 +287,23 @@ namespace FX.Services.MarketData
             }
 
             cur.MarkStale(isStale, nowUtc);
+
+            if (DebugFlags.RatesWrite)
+            {
+                var ne = cur.Effective;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Store.WriteRd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={ne.Bid:F6}/{ne.Ask:F6} src={cur.Source} vm={cur.ViewMode} ov={cur.Override} stale={cur.IsStale}"
+                );
+            }
+
             RaiseChanged("FeedRd:" + legId);
         }
 
-
-        /// <summary>Feed → rf för ett leg. Samma regler som rd.</summary>
+        /// <summary>
+        /// Skriver rf (foreign rate) från feed för angivet ben. Idempotent mot Effective-värden
+        /// (ingen ändring/Changed om oförändrat). Respekterar Override-läge.
+        /// Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// </summary>
         public void SetRfFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
@@ -290,7 +317,16 @@ namespace FX.Services.MarketData
             var cur = MarketSnapshot.TryGet(_current.RfByLeg, legId);
             if (cur == null)
             {
-                _current.RfByLeg[legId] = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
+                var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
+                _current.RfByLeg[legId] = fld;
+
+                if (DebugFlags.RatesWrite)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Store.WriteRf][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={tw.Bid:F6}/{tw.Ask:F6} src=Feed vm=TwoWay ov=None stale={isStale}"
+                    );
+                }
+
                 RaiseChanged("FeedRf:" + legId);
                 return;
             }
@@ -324,13 +360,18 @@ namespace FX.Services.MarketData
             }
 
             cur.MarkStale(isStale, nowUtc);
+
+            if (DebugFlags.RatesWrite)
+            {
+                var ne = cur.Effective;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Store.WriteRf][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={ne.Bid:F6}/{ne.Ask:F6} src={cur.Source} vm={cur.ViewMode} ov={cur.Override} stale={cur.IsStale}"
+                );
+            }
+
             RaiseChanged("FeedRf:" + legId);
         }
 
-
-        // =========================
-        // RD/RF – USER
-        // =========================
 
         /// <summary>User → rd. wasMid=true ⇒ lås Mid (bid=ask=mid). ViewMode påverkar visning.</summary>
         public void SetRdFromUser(string pair6, string legId, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
@@ -362,9 +403,6 @@ namespace FX.Services.MarketData
             RaiseChanged("UserRf:" + legId);
         }
 
-        // =========================
-        // RD/RF – VIEWMODE & OVERRIDE
-        // =========================
 
         public void SetRdViewMode(string pair6, string legId, ViewMode viewMode, DateTime nowUtc)
         {
@@ -402,9 +440,9 @@ namespace FX.Services.MarketData
             RaiseChanged("RfOverride:" + legId);
         }
 
-        // =========================
-        // Hjälpare
-        // =========================
+        #endregion
+
+        #region Helpers
 
         private static TwoWay<double> NormalizeMonotone(TwoWay<double> tw)
         {
@@ -443,79 +481,91 @@ namespace FX.Services.MarketData
         private static string FmtTW(TwoWay<double> tw) =>
             string.Format(CultureInfo.InvariantCulture, "{0:F6}/{1:F6}", tw.Bid, tw.Ask);
 
+
+        /// <summary>
+        /// Samlar inkommande förändringsorsaker (reason) och (re)startar en kort debounce-timer.
+        /// När timern löper ut skickas ett enda Changed-event med aggregerad reason (Batch:Rd=…;Rf=…;Spot=…;Other=…).
+        /// Minskar event-storm och ger lugnare UI/prisflöde.
+        /// </summary>
         private void RaiseChanged(string reason)
         {
-            var snap = _current;
-
-            //if (DebugFlags.StoreChanged)
+            lock (_chgGate)
             {
-                // --- RD ---
-                if (TryParseLegReason(reason, "FeedRd:", out var rdLeg) || TryParseLegReason(reason, "UserRd:", out rdLeg))
+                // Klassificera reason och öka rätt räknare
+                if (!string.IsNullOrEmpty(reason))
                 {
-                    if (snap != null && snap.RdByLeg != null && snap.RdByLeg.TryGetValue(rdLeg, out var fld) && fld != null)
+                    if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase) ||
+                        reason.StartsWith("UserRd:", StringComparison.OrdinalIgnoreCase))
                     {
-                        var eff = fld.Effective; // TwoWay<double>
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] " +
-                            $"reason={reason} pair={snap.Pair6} RD({rdLeg}) eff={FmtTW(eff)} src={fld.Source} vm={fld.ViewMode} ov={fld.Override} stale={fld.IsStale}"
-                        );
+                        _chgRdCount++;
+                    }
+                    else if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase) ||
+                             reason.StartsWith("UserRf:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _chgRfCount++;
+                    }
+                    else if (string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase) ||
+                             reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase) ||
+                             reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _chgSpotCount++;
                     }
                     else
                     {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} pair={snap?.Pair6} RD({rdLeg})=null"
-                        );
+                        _chgOtherCount++;
                     }
                 }
-                // --- RF ---
-                else if (TryParseLegReason(reason, "FeedRf:", out var rfLeg) || TryParseLegReason(reason, "UserRf:", out rfLeg))
-                {
-                    if (snap != null && snap.RfByLeg != null && snap.RfByLeg.TryGetValue(rfLeg, out var fld) && fld != null)
-                    {
-                        var eff = fld.Effective;
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] " +
-                            $"reason={reason} pair={snap.Pair6} RF({rfLeg}) eff={FmtTW(eff)} src={fld.Source} vm={fld.ViewMode} ov={fld.Override} stale={fld.IsStale}"
-                        );
-                    }
-                    else
-                    {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} pair={snap?.Pair6} RF({rfLeg})=null"
-                        );
-                    }
-                }
-                // --- SPOT (Feed/User/ViewMode) ---
-                else if (string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase)
-                      || reason.StartsWith("FeedSpot", StringComparison.OrdinalIgnoreCase)
-                      || reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase))
-                {
-                    var spot = snap?.Spot;
-                    var txt = (spot == null) ? "null" : FmtTW(spot.Effective);
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} pair={snap?.Pair6} spotEff={txt}"
-                    );
-                }
-                // --- Övrigt ---
                 else
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[MarketStore.Changed][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} pair={snap?.Pair6}"
-                    );
+                    _chgOtherCount++;
+                }
+
+                // (Re)starta debounce-timer
+                if (_chgTimer == null)
+                {
+                    _chgTimer = new System.Threading.Timer(ChangedTimerCallback, null, ChangedDebounceMs, System.Threading.Timeout.Infinite);
+                }
+                else
+                {
+                    _chgTimer.Change(ChangedDebounceMs, System.Threading.Timeout.Infinite);
                 }
             }
-
-            // Fire event som tidigare
-            var h = Changed;
-            if (h != null) h(this, new MarketChangedEventArgs(snap, reason));
         }
 
+        /// <summary>
+        /// Timer-callback för batchevent: nollställer räknare, bygger aggregerad reason
+        /// och fire:ar Changed med senaste snapshot. Loggar batch om DebugFlags.StoreBatch=true.
+        /// </summary>
+        private void ChangedTimerCallback(object state)
+        {
+            int rd, rf, spot, other;
+            MarketSnapshot snap;
 
+            lock (_chgGate)
+            {
+                rd = _chgRdCount; _chgRdCount = 0;
+                rf = _chgRfCount; _chgRfCount = 0;
+                spot = _chgSpotCount; _chgSpotCount = 0;
+                other = _chgOtherCount; _chgOtherCount = 0;
 
+                snap = _current;
+            }
 
+            var aggReason = $"Batch:Rd={rd};Rf={rf};Spot={spot};Other={other}";
 
+            if (DebugFlags.StoreBatch)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[MarketStore.Changed(Batch)][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {aggReason} pair={snap?.Pair6}"
+                );
+            }
 
+            var h = Changed;
+            if (h != null)
+                h(this, new MarketChangedEventArgs(snap, aggReason));
+        }
 
+        #endregion
 
     }
 }
