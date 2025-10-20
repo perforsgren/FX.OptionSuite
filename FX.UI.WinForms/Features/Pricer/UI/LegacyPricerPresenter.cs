@@ -274,6 +274,8 @@ namespace FX.UI.WinForms
                 return;
             }
 
+            ApplyUiRatesToStore(legId);
+
             var snap = _view.GetLegSnapshotById(legId);
             if (snap == null)
             {
@@ -1515,6 +1517,64 @@ private void PushForwardUiForLeg(Guid legId)
 
             if (string.IsNullOrEmpty(guidPart)) return false;
             return Guid.TryParse(guidPart, out legId);
+        }
+
+
+
+        /// <summary>
+        /// Läser UI-räntor (RD/RF) för benets kolumn och skriver User-override till MarketStore
+        /// om värden finns. Anropas innan prisning, så att Store.Effective speglar UI.
+        /// Loggar vad som skrivs.
+        /// </summary>
+        private void ApplyUiRatesToStore(Guid legId)
+        {
+            // 1) hitta kolumn-namnet för detta legId via _legStates
+            var state = _legStates.Find(s => s.LegId == legId);
+            if (state == null || string.IsNullOrWhiteSpace(state.Label))
+            {
+                System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] leg={legId} saknar kolumn-label.");
+                return;
+            }
+            string col = state.Label;
+
+            // 2) läs RD/RF från vyn för den kolumnen
+            double? uiRd, uiRf; bool ovRd, ovRf;
+            if (!_view.TryReadRatesForColumn(col, out uiRd, out ovRd, out uiRf, out ovRf))
+            {
+                System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] TryReadRatesForColumn misslyckades för col={col} (leg={legId}).");
+                return;
+            }
+
+            // 3) pair6 att skriva i store
+            var pair6 = NormalizePair6(_view.ReadPair6());
+            if (string.IsNullOrWhiteSpace(pair6)) pair6 = _mktStore.Current?.Pair6 ?? "EURSEK";
+
+            var now = DateTime.UtcNow;
+
+            // 4) skriv RD/RF till store om värden finns (vi låser mid vid enkel-inmatning)
+            if (uiRd.HasValue)
+            {
+                _mktStore.SetRdFromUser(pair6, legId.ToString(),
+                    new TwoWay<double>(uiRd.Value, uiRd.Value),
+                    /*wasMid*/ true,
+                    ViewMode.TwoWay,
+                    now);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Presenter.Rates->Store] pair={pair6} leg={legId} RD={uiRd.Value:F6} src=User vm=TwoWay ov=Mid");
+            }
+
+            if (uiRf.HasValue)
+            {
+                _mktStore.SetRfFromUser(pair6, legId.ToString(),
+                    new TwoWay<double>(uiRf.Value, uiRf.Value),
+                    /*wasMid*/ true,
+                    ViewMode.TwoWay,
+                    now);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Presenter.Rates->Store] pair={pair6} leg={legId} RF={uiRf.Value:F6} src=User vm=TwoWay ov=Mid");
+            }
         }
 
 

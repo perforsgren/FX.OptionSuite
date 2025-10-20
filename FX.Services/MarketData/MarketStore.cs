@@ -637,12 +637,12 @@ namespace FX.Services.MarketData
 
             var aggReason = $"Batch:Rd={rd};Rf={rf};Spot={spot};Other={other}";
 
-            if (DebugFlags.StoreBatch)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[MarketStore.Changed(Batch)][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {aggReason} pair={snap?.Pair6}"
-                );
-            }
+            //if (DebugFlags.StoreBatch)
+            //{
+            //    System.Diagnostics.Debug.WriteLine(
+            //        $"[MarketStore.Changed(Batch)][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {aggReason} pair={snap?.Pair6}"
+            //    );
+            //}
 
             var h = Changed;
             if (h != null)

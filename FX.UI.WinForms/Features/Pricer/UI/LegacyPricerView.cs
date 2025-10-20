@@ -4148,6 +4148,51 @@ namespace FX.UI.WinForms
         #endregion
 
 
+        /// <summary>
+        /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
+        /// relativt feed-baseline. Värden returneras i decimal (0.0123 = 1.23%).
+        /// </summary>
+        public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
+        {
+            rd = null; rf = null; rdOverride = false; rfOverride = false;
+            if (string.IsNullOrWhiteSpace(col)) return false;
+
+            // RD
+            try
+            {
+                int rRd = FindRow(L.Rd);
+                var cRd = _dgv.Rows[rRd].Cells[col];
+                if (cRd.Tag is double rdVal)
+                {
+                    rd = rdVal;
+                    double feed;
+                    if (TryGetFeedDouble(L.Rd, col, out feed))
+                        rdOverride = Math.Abs(feed - rdVal) > 1e-9;
+                    else
+                        rdOverride = true; // ingen baseline → behandla som override
+                }
+            }
+            catch { /* kolumn kan saknas tillfälligt */ }
+
+            // RF
+            try
+            {
+                int rRf = FindRow(L.Rf);
+                var cRf = _dgv.Rows[rRf].Cells[col];
+                if (cRf.Tag is double rfVal)
+                {
+                    rf = rfVal;
+                    double feed;
+                    if (TryGetFeedDouble(L.Rf, col, out feed))
+                        rfOverride = Math.Abs(feed - rfVal) > 1e-9;
+                    else
+                        rfOverride = true;
+                }
+            }
+            catch { /* kolumn kan saknas tillfälligt */ }
+
+            return true;
+        }
 
 
         public override Size GetPreferredSize(Size proposedSize)
@@ -4213,8 +4258,8 @@ namespace FX.UI.WinForms
                 _dgv.Rows[rPts].Cells[col].Value = txt;
             }
 
-            System.Diagnostics.Debug.WriteLine(
-                $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
+            //System.Diagnostics.Debug.WriteLine(
+            //    $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
         }
 
 
@@ -4272,12 +4317,6 @@ namespace FX.UI.WinForms
 
             Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
         }
-
-
-
-
-
-
 
     }
 
