@@ -166,6 +166,11 @@ namespace FX.Services
                     double rd = cmd.RdOverride ?? rdMid;
                     double rf = cmd.RfOverride ?? rfMid;
 
+                    System.Diagnostics.Debug.WriteLine(
+                        "[FxRuntime.UsingRates][T" + Thread.CurrentThread.ManagedThreadId + "] " +
+                        "pair=" + pair6 + " legId=" + legId +
+                        " rdUsed=" + rd.ToString("F6") + " rfUsed=" + rf.ToString("F6"));
+
                     // === 6) Bygg domänens PricingRequest (samma mapping som tidigare) ===
                     var legs = new List<OptionLeg>();
                     if (cmd.Legs != null)

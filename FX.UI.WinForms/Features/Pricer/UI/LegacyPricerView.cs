@@ -519,11 +519,11 @@ namespace FX.UI.WinForms
 
         void SeedDemoValues()
         {
-            Set("Deal", L.Pair, "EURSEK");
+            Set("Deal", L.Pair, "USDSEK");
             Set("Deal", L.Notional, "10 000 000");
             Set("Deal", L.Side, "Buy");
             Set("Deal", L.CallPut, "Call");
-            Set("Deal", L.Strike, "11.0000");
+            Set("Deal", L.Strike, "9.4500");
 
             // Sprid Deal → legs, sedan RD/RF
             CopyDealToLegs(Section.DealDetails, keepDeal: false);
@@ -2299,7 +2299,6 @@ namespace FX.UI.WinForms
             _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremTot));
             RecalcDealPricingAndRiskTotals();
         }
-
 
         // === Aggregates: Deal totals (Pricing & Risk) ===
         private void RecalcDealPricingAndRiskTotals()
@@ -4185,34 +4184,39 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// Visar Forward och Swap Points för ett visst ben.
-        /// Fwd och Pts anges i prisunits (ej pips); du kan justera format om du vill visa pips.
+        /// Visar Forward Rate och Forward Points för ett visst ben (legId).
+        /// Points presenteras som ×1000 (enbart presentation).
         /// </summary>
         public void ShowForwardById(Guid legId, double? fwd, double? pts)
         {
             var col = TryGetLabel(legId);
-            if (string.IsNullOrWhiteSpace(col)) return;
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
 
-            int rFwd = R(L.FwdRate);   // se till att dessa rader finns i layouten
-            int rPts = R(L.FwdPts);
-            if (rFwd < 0 || rPts < 0) return;
+            int rFwd = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+            if (rFwd < 0 && rPts < 0) return;
 
             var ci = System.Globalization.CultureInfo.InvariantCulture;
 
-            var cFwd = _dgv.Rows[rFwd].Cells[col];
-            var cPts = _dgv.Rows[rPts].Cells[col];
+            if (rFwd >= 0)
+                _dgv.Rows[rFwd].Cells[col].Value = (fwd.HasValue ? fwd.Value.ToString("F6", ci) : "");
 
-            cFwd.Value = fwd.HasValue ? fwd.Value.ToString("F6", ci) : "";
-            cPts.Value = pts.HasValue ? pts.Value.ToString("F6", ci) : "";
-
-            _dgv.InvalidateRow(rFwd);
-            _dgv.InvalidateRow(rPts);
+            if (rPts >= 0)
+            {
+                // Skala ×1000 i visningen
+                string txt = "";
+                if (pts.HasValue)
+                {
+                    double scaled = pts.Value * 10000.0;
+                    txt = scaled.ToString("F3", ci);
+                }
+                _dgv.Rows[rPts].Cells[col].Value = txt;
+            }
 
             System.Diagnostics.Debug.WriteLine(
-                $"[View.ShowForward] leg={legId} col={col} " +
-                $"fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} " +
-                $"pts={(pts.HasValue ? pts.Value.ToString("F6", ci) : "-")}");
+                $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
         }
+
 
 
         /// <summary>

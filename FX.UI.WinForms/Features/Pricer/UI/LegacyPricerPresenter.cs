@@ -630,84 +630,89 @@ namespace FX.UI.WinForms
         /// <summary>
         /// Reagerar på ändringar i MarketStore och uppdaterar UI + prissättning.
         /// Regler:
-        /// - Spot-only (även Batch med enbart Spot>0): uppdatera BARA spot i UI + debounce-reprice.
-        /// - Rate-only (Feed/User/Rd/Rf/Override/ViewMode): uppdatera RD/RF i UI + fwd/points + debounce-reprice.
+        /// - Spot-only (även Batch med enbart Spot>0): uppdatera BARA spot i UI + Forward (ej RD/RF) + debounce-reprice.
+        /// - Rate-only (Feed/User/Rd/Rf/Override/ViewMode): uppdatera RD/RF i UI + Forward + debounce-reprice.
         /// - Övrigt: noop.
         /// </summary>
         private void OnMarketChanged(object sender, MarketChangedEventArgs e)
         {
             try
             {
-                var snap = e?.Snapshot;
-                var spotFld = snap?.Spot;
-                bool hasSpot = (spotFld != null);
-                var tw = hasSpot ? spotFld.Effective : new FX.Core.Domain.MarketData.TwoWay<double>(0d, 0d);
+                var reason = e?.Reason ?? string.Empty;
 
-                string reason = e?.Reason ?? string.Empty;
+                var snap = _mktStore.Current;
+                var spotField = snap?.Spot;
+                TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
 
-                // 1) Direkta spot-reasons → rör endast spot i UI
-                if (string.Equals(reason, "FeedSpot", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(reason, "UserSpot", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(reason, "SpotOverride", StringComparison.OrdinalIgnoreCase))
+                // =========== 1) Direkta spot-reasons =============
+                if (IsSpotReason(reason))
                 {
-                    if (hasSpot)
+                    if (eff.HasValue)
                     {
-                        if (spotFld.Source == FX.Core.Domain.MarketData.MarketSource.User)
-                            _view.ShowSpotUserFixed4(tw.Bid, tw.Ask);
-                        else
-                            _view.ShowSpotFeedFixed4(tw.Bid, tw.Ask);
+                        bool isUserSpot =
+                            reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                            (spotField != null && spotField.Source == FX.Core.Domain.MarketData.MarketSource.User);
+
+                        if (isUserSpot) _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
+                        else _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
                     }
 
-                    // Viktigt: rör INTE RD/RF här
+                    // Viktigt: RÖR INTE RD/RF-UI här – men uppdatera Forward (påverkas av spot).
+                    PushForwardUiAllLegs();
                     ScheduleRepriceDebounced();
                     return;
                 }
 
-                // 2) Batch: "Batch:Rd=...;Rf=...;Spot=...;Other=..."
+                // =========== 2) Batch: "Batch:Rd=...;Rf=...;Spot=...;Other=..." ===========
                 if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
                 {
                     int rdCnt = 0, rfCnt = 0, spotCnt = 0;
 
-                    // Robust, inline parsing utan helpers
-                    // Exempel: "Batch:Rd=1;Rf=1;Spot=0;Other=0 pair=EURSEK"
+                    // Robust, inline parsing av Batch-räknarna (utan externa helpers)
                     var after = reason.Substring(reason.IndexOf(':') + 1);
                     var parts = after.Split(new[] { ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
                     foreach (var part in parts)
                     {
                         var kv = part.Split('=');
                         if (kv.Length != 2) continue;
-
                         var key = kv[0].Trim();
                         var valStr = kv[1].Trim();
-                        int val;
-                        if (!int.TryParse(valStr, out val)) continue;
+                        if (!int.TryParse(valStr, out int val)) continue;
 
                         if (key.Equals("Rd", StringComparison.OrdinalIgnoreCase)) rdCnt = val;
                         else if (key.Equals("Rf", StringComparison.OrdinalIgnoreCase)) rfCnt = val;
                         else if (key.Equals("Spot", StringComparison.OrdinalIgnoreCase)) spotCnt = val;
                     }
 
-                    // Endast spot i batch → behandla som spot-only
+                    // Spot-only i batch → behandla som spot-only
                     if (spotCnt > 0 && rdCnt == 0 && rfCnt == 0)
                     {
-                        if (hasSpot)
+                        if (eff.HasValue)
                         {
-                            if (spotFld.Source == FX.Core.Domain.MarketData.MarketSource.User)
-                                _view.ShowSpotUserFixed4(tw.Bid, tw.Ask);
+                            if (spotField.Source == FX.Core.Domain.MarketData.MarketSource.User)
+                                _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
                             else
-                                _view.ShowSpotFeedFixed4(tw.Bid, tw.Ask);
+                                _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
                         }
+
+                        // Endast Forward uppdateras här (RD/RF lämnas orörda)
+                        PushForwardUiAllLegs();
                         ScheduleRepriceDebounced();
                         return;
                     }
 
-                    // Någon rate ändrades → uppdatera rates + forward/points
+                    // Någon rate ändrades → uppdatera RD/RF + forward
                     if (rdCnt > 0 || rfCnt > 0)
                     {
                         PushRatesUiAllLegs();
                         PushForwardUiAllLegs();
-                        ScheduleRepriceDebounced();
+
+                        // (valfritt) cooldown/single-flight-skydd om du redan använder dessa fält
+                        if (!_pricingInFlight &&
+                            (System.DateTime.UtcNow - _lastPriceFinishedUtc) >= _rateWriteCooldown)
+                        {
+                            ScheduleRepriceDebounced();
+                        }
                         return;
                     }
 
@@ -715,29 +720,48 @@ namespace FX.UI.WinForms
                     return;
                 }
 
-                // 3) Rate-only (explicit reasons)
-                if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("UserRd:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("UserRf:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RdViewMode:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RdOverride:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RfViewMode:", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RfOverride:", StringComparison.OrdinalIgnoreCase))
+                // =========== 3) Rate-only (explicit reasons) ===========
+                bool isRateOnly =
+                    reason.StartsWith("FeedRd", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("FeedRf", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRd", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRf", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdViewMode", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfViewMode", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdOverride", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfOverride", StringComparison.OrdinalIgnoreCase);
+
+                if (isRateOnly)
                 {
-                    PushRatesUiAllLegs();
-                    PushForwardUiAllLegs();
+                    // Uppdatera specifikt ben om guid finns i reason, annars alla
+                    Guid gid;
+                    if (TryParseLegGuidFromReason(reason, out gid) && gid != Guid.Empty)
+                    {
+                        PushRatesUiForLeg(gid);
+                        PushForwardUiForLeg(gid);
+                    }
+                    else
+                    {
+                        PushRatesUiAllLegs();
+                        PushForwardUiAllLegs();
+                    }
+
+                    if (_pricingInFlight) return;
+                    if ((System.DateTime.UtcNow - _lastPriceFinishedUtc) < _rateWriteCooldown) return;
+
                     ScheduleRepriceDebounced();
                     return;
                 }
 
-                // 4) Övrigt → noop
+                // =========== 4) Övrigt ===========
+                System.Diagnostics.Debug.WriteLine("[OnMarketChanged] ignored: " + reason);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
         }
+
 
 
 
@@ -1265,85 +1289,111 @@ namespace FX.UI.WinForms
         #endregion
 
 
-        /// <summary>
-        /// Räknar fram Forward och Swap Points för ett ben och visar i UI.
-        /// - Spot: effektiv från MarketStore (ViewMode/Override respekteras).
-        /// - RD/RF: mitt från MarketStore (per legId).
-        /// - Datum: spotDate/settlement från ISpotSetDateService (samma som runtime).
-        /// - T: YearFracMm(spotDate, settlement, ccy) (samma som feedern).
-        /// - Fwd = S * (1 + rd*T_quote) / (1 + rf*T_base),  Pts = Fwd − S.
-        /// </summary>
-        private void PushForwardUiForLeg(Guid legId)
+/// <summary>
+/// Beräknar Forward Rate och Forward Points för ett specifikt ben (legId)
+/// utifrån aktuell spot + rd/rf i MarketStore och benets resolverade expiry i UI,
+/// och pushar till vyn (vyn skalar points ×1000 i presentation).
+/// </summary>
+private void PushForwardUiForLeg(Guid legId)
+{
+    try
+    {
+        // 1) Pair + datum (expiry tas från vyns resolverade ISO)
+        var pair6 = NormalizePair6(_view.ReadPair6()) ?? "EURSEK";
+        var baseCcy = pair6.Substring(0, 3);
+        var quoteCcy = pair6.Substring(3, 3);
+
+        var today = DateTime.Today;
+        var expIso = _view.TryGetResolvedExpiryIsoById(legId); // finns i din vy
+        DateTime expiry = today;
+        if (!string.IsNullOrWhiteSpace(expIso))
+            DateTime.TryParse(expIso, out expiry);
+
+        // SpotDate & Settlement via samma tjänst som i runtime
+        var dates = _spotSvc.Compute(pair6, today, expiry);
+        var spotDate   = dates.SpotDate;
+        var settlement = dates.SettlementDate;
+
+        // 2) Spot effektiv (respektera ViewMode/Override)
+        var snap = _mktStore.Current;
+        if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
         {
-            var snap = _mktStore?.Current;
-            if (snap == null) { _view.ShowForwardById(legId, null, null); return; }
-
-            var pair6 = snap.Pair6;
-            if (string.IsNullOrWhiteSpace(pair6) || pair6.Length != 6) { _view.ShowForwardById(legId, null, null); return; }
-            var baseCcy = pair6.Substring(0, 3);
-            var quoteCcy = pair6.Substring(3, 3);
-
-            // 1) Spot mid (respektera ViewMode/Override)
-            var sf = snap.Spot;
-            var se = sf.Effective;
-            double sBid, sAsk;
-            if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
-            {
-                var mid = 0.5 * (se.Bid + se.Ask);
-                sBid = mid; sAsk = mid;
-            }
-            else
-            {
-                sBid = se.Bid; sAsk = se.Ask;
-            }
-            var S = 0.5 * (sBid + sAsk);
-            if (S <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
-
-            // 2) RD/RF (mid) från store för detta leg
-            var key = legId.ToString();
-            var rdFld = snap.TryGetRd(key);
-            var rfFld = snap.TryGetRf(key);
-            if (rdFld == null || rfFld == null) { _view.ShowForwardById(legId, null, null); return; }
-
-            var rdMid = 0.5 * (rdFld.Effective.Bid + rdFld.Effective.Ask);
-            var rfMid = 0.5 * (rfFld.Effective.Bid + rfFld.Effective.Ask);
-
-            // 3) Datum via samma tjänst som runtime
-            //    Expiry hämtas ur vyns resolverade ISO för detta ben (finns redan i din vy).
-            var today = DateTime.Today;
-            var expIso = _view.TryGetResolvedExpiryIsoById(legId);
-            DateTime expiry = today;
-            if (!string.IsNullOrWhiteSpace(expIso)) DateTime.TryParse(expIso, out expiry);
-
-            var dates = _spotSvc.Compute(pair6, today, expiry);
-            var spotDate = dates.SpotDate;
-            var settlement = dates.SettlementDate;
-
-            // 4) Year fractions enligt MM-konvention (samma som feeder)
-            var Tq = YearFracMm(spotDate, settlement, quoteCcy);
-            var Tb = YearFracMm(spotDate, settlement, baseCcy);
-            if (Tq <= 0.0 && Tb <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
-
-            // 5) Forward & Points
-            var denom = (1.0 + rfMid * Tb);
-            if (denom <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
-
-            var F = S * (1.0 + rdMid * Tq) / denom;
-            var P = F - S;
-
-            _view.ShowForwardById(legId, F, P);
-
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
-            System.Diagnostics.Debug.WriteLine(
-                $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
-                $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
-                $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
-                $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
+            _view.ShowForwardById(legId, null, null);
+            return;
         }
 
+        var sf = snap.Spot;
+        var se = sf.Effective; // TwoWay<double>
+        if (se.Bid <= 0.0 && se.Ask <= 0.0)
+        {
+            _view.ShowForwardById(legId, null, null);
+            return;
+        }
+
+        double spotBid, spotAsk;
+        if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
+        {
+            var mid = 0.5 * (se.Bid + se.Ask);
+            spotBid = mid; spotAsk = mid;
+        }
+        else
+        {
+            spotBid = se.Bid; spotAsk = se.Ask;
+        }
+        double S = 0.5 * (spotBid + spotAsk);
+
+        // 3) rd/rf effektivt för just detta ben (leg-GUID som nyckel)
+        var key = legId.ToString();
+        var rdFld = snap.TryGetRd(key);
+        var rfFld = snap.TryGetRf(key);
+        if (rdFld == null || rfFld == null)
+        {
+            _view.ShowForwardById(legId, null, null);
+            return;
+        }
+
+        var rdMid = 0.5 * (rdFld.Effective.Bid + rdFld.Effective.Ask);
+        var rfMid = 0.5 * (rfFld.Effective.Bid + rfFld.Effective.Ask);
+
+        // 4) Year fractions enligt MM-konvention (samma som feeder)
+        var Tq = YearFracMm(spotDate, settlement, quoteCcy);
+        var Tb = YearFracMm(spotDate, settlement, baseCcy);
+        if (Tq <= 0.0 && Tb <= 0.0)
+        {
+            _view.ShowForwardById(legId, null, null);
+            return;
+        }
+
+        // 5) Forward & Points (MM-approx)
+        var denom = (1.0 + rfMid * Tb);
+        if (denom <= 0.0)
+        {
+            _view.ShowForwardById(legId, null, null);
+            return;
+        }
+
+        var F = S * (1.0 + rdMid * Tq) / denom;
+        var P = F - S;
+
+        _view.ShowForwardById(legId, F, P);
+
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        System.Diagnostics.Debug.WriteLine(
+            $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
+            $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
+            $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
+            $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
+    }
+    catch (Exception ex)
+    {
+        System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushForwardUiForLeg: " + ex.Message);
+    }
+}
+
+
 
         /// <summary>
-        /// Uppdaterar Forward & Swap Points för alla kända ben i UI.
+        /// Kör PushForwardUiForLeg för alla ben.
         /// </summary>
         private void PushForwardUiAllLegs()
         {
