@@ -628,135 +628,118 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// MarketStore → Presenter: något i marknaden ändrades.
-        /// - Spot (Feed/User): uppdatera UI (spot + rates + fwd/pts) och trigga reprice (debounced).
-        /// - RD/RF: uppdatera UI (rates + fwd/pts) och trigga reprice om ej in-flight och utanför cooldown.
-        /// - Batch:
-        ///     * Spot>0  → behandlas som FEED-spot (visa feed + reprice).
-        ///     * Spot=0 & rd/rf>0 → rates + fwd/pts → ev. reprice.
-        /// - Övrigt: loggas men triggar inget.
+        /// Reagerar på ändringar i MarketStore och uppdaterar UI + prissättning.
+        /// Regler:
+        /// - Spot-only (även Batch med enbart Spot>0): uppdatera BARA spot i UI + debounce-reprice.
+        /// - Rate-only (Feed/User/Rd/Rf/Override/ViewMode): uppdatera RD/RF i UI + fwd/points + debounce-reprice.
+        /// - Övrigt: noop.
         /// </summary>
         private void OnMarketChanged(object sender, MarketChangedEventArgs e)
         {
             try
             {
-                var reason = (e != null ? (e.Reason ?? string.Empty) : string.Empty);
+                var snap = e?.Snapshot;
+                var spotFld = snap?.Spot;
+                bool hasSpot = (spotFld != null);
+                var tw = hasSpot ? spotFld.Effective : new FX.Core.Domain.MarketData.TwoWay<double>(0d, 0d);
 
-                var snap = _mktStore.Current;
-                var p6 = (snap != null ? snap.Pair6 : "(n/a)");
-                var spotField = (snap != null ? snap.Spot : null);
-                TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
+                string reason = e?.Reason ?? string.Empty;
 
-                var ci = System.Globalization.CultureInfo.InvariantCulture;
-                var spotText = eff.HasValue
-                    ? eff.Value.Bid.ToString("F6", ci) + "/" + eff.Value.Ask.ToString("F6", ci)
-                    : "N/A";
-
-                System.Diagnostics.Debug.WriteLine(
-                    "[OnMarketChanged][T" + System.Threading.Thread.CurrentThread.ManagedThreadId +
-                    "] reason=" + reason + " pair=" + p6 + " spotEff=" + spotText);
-
-                // 1) Spot-relaterat → UI + reprice
-                if (IsSpotReason(reason))
+                // 1) Direkta spot-reasons → rör endast spot i UI
+                if (string.Equals(reason, "FeedSpot", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(reason, "UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(reason, "SpotViewMode", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(reason, "SpotOverride", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Bestäm källa: User vs Feed
-                    bool isUserSpot =
-                        reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
-                        (spotField != null && spotField.Source == FX.Core.Domain.MarketData.MarketSource.User);
-
-                    if (eff.HasValue)
+                    if (hasSpot)
                     {
-                        if (isUserSpot)
-                        {
-                            // User-spot: visa och MARKERA override (lila)
-                            _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
-                        }
+                        if (spotFld.Source == FX.Core.Domain.MarketData.MarketSource.User)
+                            _view.ShowSpotUserFixed4(tw.Bid, tw.Ask);
                         else
-                        {
-                            // Feed-spot: visa och SLÄCK override
-                            _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                        }
+                            _view.ShowSpotFeedFixed4(tw.Bid, tw.Ask);
                     }
 
-                    // Rates/Fwd i UI och reprice
+                    // Viktigt: rör INTE RD/RF här
+                    ScheduleRepriceDebounced();
+                    return;
+                }
+
+                // 2) Batch: "Batch:Rd=...;Rf=...;Spot=...;Other=..."
+                if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+                {
+                    int rdCnt = 0, rfCnt = 0, spotCnt = 0;
+
+                    // Robust, inline parsing utan helpers
+                    // Exempel: "Batch:Rd=1;Rf=1;Spot=0;Other=0 pair=EURSEK"
+                    var after = reason.Substring(reason.IndexOf(':') + 1);
+                    var parts = after.Split(new[] { ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var part in parts)
+                    {
+                        var kv = part.Split('=');
+                        if (kv.Length != 2) continue;
+
+                        var key = kv[0].Trim();
+                        var valStr = kv[1].Trim();
+                        int val;
+                        if (!int.TryParse(valStr, out val)) continue;
+
+                        if (key.Equals("Rd", StringComparison.OrdinalIgnoreCase)) rdCnt = val;
+                        else if (key.Equals("Rf", StringComparison.OrdinalIgnoreCase)) rfCnt = val;
+                        else if (key.Equals("Spot", StringComparison.OrdinalIgnoreCase)) spotCnt = val;
+                    }
+
+                    // Endast spot i batch → behandla som spot-only
+                    if (spotCnt > 0 && rdCnt == 0 && rfCnt == 0)
+                    {
+                        if (hasSpot)
+                        {
+                            if (spotFld.Source == FX.Core.Domain.MarketData.MarketSource.User)
+                                _view.ShowSpotUserFixed4(tw.Bid, tw.Ask);
+                            else
+                                _view.ShowSpotFeedFixed4(tw.Bid, tw.Ask);
+                        }
+                        ScheduleRepriceDebounced();
+                        return;
+                    }
+
+                    // Någon rate ändrades → uppdatera rates + forward/points
+                    if (rdCnt > 0 || rfCnt > 0)
+                    {
+                        PushRatesUiAllLegs();
+                        PushForwardUiAllLegs();
+                        ScheduleRepriceDebounced();
+                        return;
+                    }
+
+                    // Other-only → inget att göra
+                    return;
+                }
+
+                // 3) Rate-only (explicit reasons)
+                if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRd:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRf:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdViewMode:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RdOverride:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfViewMode:", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("RfOverride:", StringComparison.OrdinalIgnoreCase))
+                {
                     PushRatesUiAllLegs();
                     PushForwardUiAllLegs();
                     ScheduleRepriceDebounced();
                     return;
                 }
 
-                // 2) Batch → om Spot>0: behandla som FEED-spot, annars rate-only
-                if (reason.StartsWith("Batch:", System.StringComparison.OrdinalIgnoreCase))
-                {
-                    int rd = 0, rf = 0, spot = 0, other = 0;
-                    if (TryParseBatchCounts(reason, out rd, out rf, out spot, out other))
-                    {
-                        if (spot > 0)
-                        {
-                            if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                            PushRatesUiAllLegs();
-                            PushForwardUiAllLegs();
-                            ScheduleRepriceDebounced();
-                            return;
-                        }
-
-                        // Rate-only batch (ingen spot men rd/rf finns)
-                        if ((rd + rf) > 0)
-                        {
-                            PushRatesUiAllLegs();
-                            PushForwardUiAllLegs();
-
-                            // Reprice-skydd: undvik dubbletter vid egna writes
-                            if (!_pricingInFlight &&
-                                (System.DateTime.UtcNow - _lastPriceFinishedUtc) >= _rateWriteCooldown)
-                            {
-                                ScheduleRepriceDebounced();
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                // 3) Enstaka RD/RF → UI + ev. reprice
-                bool isRateOnly =
-                    reason.StartsWith("FeedRd", System.StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("FeedRf", System.StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RdOverride", System.StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RfOverride", System.StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RdViewMode", System.StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("RfViewMode", System.StringComparison.OrdinalIgnoreCase);
-
-                if (isRateOnly)
-                {
-                    // UI: uppdatera specifikt ben om guid finns i reason, annars alla
-                    System.Guid gid;
-                    if (TryParseLegGuidFromReason(reason, out gid) && gid != System.Guid.Empty)
-                    {
-                        PushRatesUiForLeg(gid);
-                        PushForwardUiForLeg(gid);
-                    }
-                    else
-                    {
-                        PushRatesUiAllLegs();
-                        PushForwardUiAllLegs();
-                    }
-
-                    // Reprice-skydd: undvik dubbelprisning från våra egna ensure-writes
-                    if (_pricingInFlight) return;
-                    if ((System.DateTime.UtcNow - _lastPriceFinishedUtc) < _rateWriteCooldown) return;
-
-                    ScheduleRepriceDebounced();
-                    return;
-                }
-
-                // 4) Övrigt (vol/other) – ingen auto-prisning här.
-                System.Diagnostics.Debug.WriteLine("[OnMarketChanged] ignored: " + reason);
+                // 4) Övrigt → noop
             }
-            catch (System.Exception ex)
+            catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
         }
+
+
 
         /// <summary>
         /// Parsar Batch-reason "Batch:Rd=1;Rf=1;Spot=0;Other=0 …" till fyra heltal.

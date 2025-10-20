@@ -529,19 +529,6 @@ namespace FX.UI.WinForms
             CopyDealToLegs(Section.DealDetails, keepDeal: false);
             CopyDealToLegs(Section.MktData, keepDeal: false);
 
-            int rRd = FindRow(L.Rd);
-            int rRf = FindRow(L.Rf);
-            foreach (var leg in _legs)
-            {
-                var cRd = _dgv.Rows[rRd].Cells[leg];
-                cRd.Tag = 0.020;
-                cRd.Value = FormatPercent(0.020, 3); // 3 dp
-
-                var cRf = _dgv.Rows[rRf].Cells[leg];
-                cRf.Tag = 0.010;
-                cRf.Value = FormatPercent(0.010, 3); // 3 dp
-            }
-
             // SEED: tvåvägs vol 5.0/6.0 = 0.050/0.060 (3 dp i display)
             int rVol = FindRow(L.Vol);
             if (rVol >= 0)
