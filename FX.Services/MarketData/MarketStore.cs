@@ -373,7 +373,10 @@ namespace FX.Services.MarketData
         }
 
 
-        /// <summary>User → rd. wasMid=true ⇒ lås Mid (bid=ask=mid). ViewMode påverkar visning.</summary>
+        /// <summary>
+        /// User → rd. wasMid=true ⇒ lås Mid (bid=ask=mid). wasMid=false ⇒ lås båda sidor (Override=Both).
+        /// ViewMode påverkar visning. Skriver Source=User och triggar Changed("UserRd:<legId>").
+        /// </summary>
         public void SetRdFromUser(string pair6, string legId, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
@@ -384,11 +387,25 @@ namespace FX.Services.MarketData
             var mid = wasMid ? 0.5 * (tw.Bid + tw.Ask) : (double?)null;
             var val = wasMid ? new TwoWay<double>(mid.Value, mid.Value) : tw;
 
-            _current.RdByLeg[legId] = new MarketField<double>(val, MarketSource.User, viewMode, wasMid ? OverrideMode.Mid : OverrideMode.None, nowUtc, 0, false);
+            // Viktigt: lås båda sidor vid two-way override
+            var ov = wasMid ? OverrideMode.Mid : OverrideMode.Both;
+
+            _current.RdByLeg[legId] = new MarketField<double>(
+                value: val,
+                source: MarketSource.User,
+                viewMode: viewMode,
+                ov: ov,
+                tsUtc: nowUtc,
+                version: 0,
+                stale: false
+            );
+
             RaiseChanged("UserRd:" + legId);
         }
 
-        /// <summary>User → rf. Samma regler som rd.</summary>
+        /// <summary>
+        /// User → rf. Samma regler som rd.
+        /// </summary>
         public void SetRfFromUser(string pair6, string legId, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
@@ -399,7 +416,18 @@ namespace FX.Services.MarketData
             var mid = wasMid ? 0.5 * (tw.Bid + tw.Ask) : (double?)null;
             var val = wasMid ? new TwoWay<double>(mid.Value, mid.Value) : tw;
 
-            _current.RfByLeg[legId] = new MarketField<double>(val, MarketSource.User, viewMode, wasMid ? OverrideMode.Mid : OverrideMode.None, nowUtc, 0, false);
+            var ov = wasMid ? OverrideMode.Mid : OverrideMode.Both;
+
+            _current.RfByLeg[legId] = new MarketField<double>(
+                value: val,
+                source: MarketSource.User,
+                viewMode: viewMode,
+                ov: ov,
+                tsUtc: nowUtc,
+                version: 0,
+                stale: false
+            );
+
             RaiseChanged("UserRf:" + legId);
         }
 

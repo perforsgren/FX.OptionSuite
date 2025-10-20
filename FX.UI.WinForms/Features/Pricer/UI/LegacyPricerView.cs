@@ -4108,56 +4108,56 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// Skriver in Spot från FEED i UI (Deal + ben) med EXAKT 4 decimaler i visning.
-        /// Används endast för feed-uppdateringar så att mid inte råkar bli 5 d.p. vid snitt.
-        /// Påverkar inte prisflödet; presentern/MarketStore triggar prisning.
+        /// Visar spot från FEED (F5) i Deal + alla ben, med exakt 4 d.p. på display.
+        /// Viktigt: använder WriteSpotTwoWayToCell för att:
+        ///  - uppdatera feed-baseline (för jämförelse mot manuella ändringar),
+        ///  - släcka eventuell lila override-färg (MarkOverride(..., false)) för FEED.
+        /// Därmed försvinner lila efter F5 och Deal-kolumnen visar färskt värde.
         /// </summary>
         public void ShowSpotFeedFixed4(double bid, double ask)
         {
-            const int dp = 4;
             int rSpot = FindRow(L.Spot);
             if (rSpot < 0) return;
 
-            // Mid visas med exakt 4 d.p., oavsett inre precision
-            var mid = 0.5 * (bid + ask);
-            string displayMid4 = mid.ToString("F" + dp, CultureInfo.InvariantCulture);
+            // Deal – låt helpern räkna mid och sköta baseline + override off
+            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "Feed");
 
-            // Deal-cell
-            var dealCell = _dgv.Rows[rSpot].Cells["Deal"];
-            dealCell.Value = displayMid4;
-            dealCell.Tag = new SpotCellData
-            {
-                Bid = bid,
-                Mid = mid,
-                Ask = ask,
-                TimeUtc = DateTime.UtcNow,
-                Source = "Feed"
-            };
-
-            // Ben – samma visning och tag
+            // Ben – samma visning, baseline & override-off per kolumn
             for (int i = 0; i < _legs.Length; i++)
             {
                 var lg = _legs[i];
                 if (!_dgv.Columns.Contains(lg)) continue;
-                var cLeg = _dgv.Rows[rSpot].Cells[lg];
 
-                cLeg.Value = displayMid4;
-                cLeg.Tag = new SpotCellData
-                {
-                    Bid = bid,
-                    Mid = mid,
-                    Ask = ask,
-                    TimeUtc = DateTime.UtcNow,
-                    Source = "Feed"
-                };
+                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "Feed");
             }
-
-            // Om du vill färga overrides mot feed-baseline kan du göra det här (valfritt):
-            // MarkOverride(L.Spot, "Deal", false); foreach leg => false
-
-            // Omedelbar omritning
-            InvalidateSpotRow();
         }
+
+
+        /// <summary>
+        /// Visar spot som kommer från USER (manuell input) i Deal + alla ben, med exakt 4 d.p.
+        /// Viktigt: sätter override (lila) PÅ. Baseline lämnas oförändrad så att
+        /// lila-indikeringen kvarstår tills feed tar över (F5) eller användaren nollställer.
+        /// </summary>
+        public void ShowSpotUserFixed4(double bid, double ask)
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0) return;
+
+            // Deal – markera override = true (lila)
+            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "User");
+            MarkOverride(L.Spot, "Deal", true);
+
+            // Ben – samma markering, per kolumn
+            for (int i = 0; i < _legs.Length; i++)
+            {
+                var lg = _legs[i];
+                if (!_dgv.Columns.Contains(lg)) continue;
+
+                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "User");
+                MarkOverride(L.Spot, lg, true);
+            }
+        }
+
 
         #endregion
 

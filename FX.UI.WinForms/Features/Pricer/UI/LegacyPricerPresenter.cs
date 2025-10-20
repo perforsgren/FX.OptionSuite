@@ -479,8 +479,10 @@ namespace FX.UI.WinForms
         #region Spot feed
 
         /// <summary>
-        /// Hämtar spot (TryGetTwoWay) från feed och skriver endast till MarketStore (FeedSpot).
-        /// UI uppdateras därefter via OnMarketChanged (store-driven). Loggar feedvärden om DebugFlags.SpotFeed=true.
+        /// Hämtar spot (TryGetTwoWay) från feed och skriver den till MarketStore.
+        /// Nytt: vid refresh (F5) låser vi först upp ev. User-override på Spot,
+        /// så att feeden faktiskt får slå igenom till Store och därmed UI.
+        /// UI uppdateras därefter via OnMarketChanged (store-driven).
         /// </summary>
         private void RefreshSpotSnapshot()
         {
@@ -493,16 +495,19 @@ namespace FX.UI.WinForms
                 double bid, ask;
                 var ok = _spotFeed.TryGetTwoWay(p6, out bid, out ask);
                 if (!ok) return;
-                    
-                Debug.WriteLine($"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
 
-                // Skriv ENDAST till store; OnMarketChanged tar UI-visningen
-                _mktStore.SetSpotFromFeed(
-                    p6,
-                    new TwoWay<double>(bid, ask),
-                    DateTime.UtcNow,
-                    isStale: false
-                );
+                System.Diagnostics.Debug.WriteLine(
+                    $"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
+
+                // Nytt: lås upp ev. user-override så att feeden inte ignoreras.
+                var now = DateTime.UtcNow;
+                _mktStore.SetSpotOverride(p6, FX.Core.Domain.MarketData.OverrideMode.None, now);
+
+                // Skriv feed-värdet till Store (respekterar nu Override=None).
+                _mktStore.SetSpotFromFeed(p6, new FX.Core.Domain.MarketData.TwoWay<double>(bid, ask), now, isStale: false);
+
+                // Viktigt: vi ritar inte UI här; OnMarketChanged (store → view) gör det redan.
+                // (SetSpotFromFeed höjer Changed("FeedSpot") vilket presenterns OnMarketChanged snappar upp.)
             }
             catch (Exception ex)
             {
@@ -515,6 +520,7 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
 
 
 
@@ -623,11 +629,11 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// MarketStore → Presenter: något i marknaden ändrades.
-        /// - Spot: uppdatera UI (spot + rates + fwd/pts) och trigga reprice (debounced).
+        /// - Spot (Feed/User): uppdatera UI (spot + rates + fwd/pts) och trigga reprice (debounced).
         /// - RD/RF: uppdatera UI (rates + fwd/pts) och trigga reprice om ej in-flight och utanför cooldown.
         /// - Batch:
-        ///     * Spot>0  → spot + rates + fwd/pts → reprice.
-        ///     * Spot=0 & rd/rf>0 → rates + fwd/pts → reprice enligt skydd.
+        ///     * Spot>0  → behandlas som FEED-spot (visa feed + reprice).
+        ///     * Spot=0 & rd/rf>0 → rates + fwd/pts → ev. reprice.
         /// - Övrigt: loggas men triggar inget.
         /// </summary>
         private void OnMarketChanged(object sender, MarketChangedEventArgs e)
@@ -653,14 +659,33 @@ namespace FX.UI.WinForms
                 // 1) Spot-relaterat → UI + reprice
                 if (IsSpotReason(reason))
                 {
-                    if (eff.HasValue) _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                    // Bestäm källa: User vs Feed
+                    bool isUserSpot =
+                        reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                        (spotField != null && spotField.Source == FX.Core.Domain.MarketData.MarketSource.User);
+
+                    if (eff.HasValue)
+                    {
+                        if (isUserSpot)
+                        {
+                            // User-spot: visa och MARKERA override (lila)
+                            _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
+                        }
+                        else
+                        {
+                            // Feed-spot: visa och SLÄCK override
+                            _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                        }
+                    }
+
+                    // Rates/Fwd i UI och reprice
                     PushRatesUiAllLegs();
                     PushForwardUiAllLegs();
                     ScheduleRepriceDebounced();
                     return;
                 }
 
-                // 2) Batch → om Spot>0: UI + reprice, annars rate-only
+                // 2) Batch → om Spot>0: behandla som FEED-spot, annars rate-only
                 if (reason.StartsWith("Batch:", System.StringComparison.OrdinalIgnoreCase))
                 {
                     int rd = 0, rf = 0, spot = 0, other = 0;
@@ -732,12 +757,6 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
         }
-
-
-
-
-
-
 
         /// <summary>
         /// Parsar Batch-reason "Batch:Rd=1;Rf=1;Spot=0;Other=0 …" till fyra heltal.
@@ -1349,6 +1368,15 @@ namespace FX.UI.WinForms
                 PushForwardUiForLeg(_legStates[i].LegId);
         }
 
+        /// <summary>
+        /// Returnerar (wasMid, viewMode) givet hur RD/RF matas in från UI.
+        /// Idag matar vi in ett singeltal ⇒ tolka som Mid-låsning och TwoWay-visning.
+        /// </summary>
+        private (bool wasMid, ViewMode viewMode) InferRateInputModeFromUi()
+        {
+            // Enkelt läge: singeltal i UI ⇒ lås MID, visa TwoWay i gridden.
+            return (wasMid: true, viewMode: ViewMode.TwoWay);
+        }
 
 
 
