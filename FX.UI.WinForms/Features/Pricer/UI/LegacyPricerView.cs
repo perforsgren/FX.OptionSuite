@@ -210,6 +210,11 @@ namespace FX.UI.WinForms
 
         public event EventHandler<RateEditedEventArgs> RateEdited;
 
+        /// <summary>
+        /// Vyn ber Presentern nolla override för ett specifikt benfält (RD/RF) i Store.
+        /// </summary>
+        public event EventHandler<RateClearOverrideRequestedEventArgs> RateClearOverrideRequested;
+
         #endregion
 
         #region === EventArgs
@@ -238,6 +243,16 @@ namespace FX.UI.WinForms
             public string Field { get; set; }       // "Rd" eller "Rf"
             public bool WasMid { get; set; }        // true för single-värde i UI idag
             public double Mid { get; set; }         // decimalt (0.02 = 2%)
+        }
+
+        /// <summary>
+        /// Begär från Presentern att nolla override för ett specifikt benfält (RD eller RF)
+        /// för en angiven UI-kolumn (t.ex. "Vanilla 1"). Används av Delete-hanteringen.
+        /// </summary>
+        public sealed class RateClearOverrideRequestedEventArgs : EventArgs
+        {
+            public string LegColumn { get; set; }  // t.ex. "Vanilla 1" eller "Deal" (hanteras i View)
+            public string Field { get; set; }      // "Rd" eller "Rf"
         }
 
         #endregion
@@ -1363,7 +1378,10 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// Back/Delete startar edit men rensar inte celler; blockerar rensning på Spot/Deal.
+        /// Back/Delete startar i normalfall edit, men:
+        /// - På RD/RF-celler: Delete återställer till SENAST KÄNDA FEED-baseline (lagrad i _feedValue),
+        ///   släcker lila och ber Presentern nolla override för rätt sida. Deal-kolumn → alla ben.
+        /// - Blockerar rensning på Spot/Deal som tidigare.
         /// </summary>
         private void Dgv_KeyDownStartEdit(object sender, KeyEventArgs e)
         {
@@ -1375,27 +1393,63 @@ namespace FX.UI.WinForms
                 string lbl = Convert.ToString(_dgv.Rows[cell.RowIndex].Cells["FIELD"].Value);
                 string colName = _dgv.Columns[cell.ColumnIndex].Name;
 
-                // BEHÅLLT: Blockera Delete/Backspace i Spot/Deal
+                // BEFINTLIGT: Blockera Delete/Backspace i Spot/Deal
                 if (lbl.Equals(L.Spot, StringComparison.OrdinalIgnoreCase) && colName == "Deal")
                 {
                     e.Handled = true;
                     return;
                 }
 
-                // Töm inte celler via Delete/Backspace (även detta uppfyller nya kravet)
-                if (cell.ReadOnly || IsSectionRow(_dgv.Rows[cell.RowIndex]))
+                // NYTT: RD/RF → Delete = återställ till baseline (feed)
+                bool isRd = lbl.Equals(L.Rd, StringComparison.OrdinalIgnoreCase);
+                bool isRf = lbl.Equals(L.Rf, StringComparison.OrdinalIgnoreCase);
+                if (isRd || isRf)
                 {
+                    string field = isRd ? "Rd" : "Rf";
+                    bool isDeal = string.Equals(colName, "Deal", StringComparison.OrdinalIgnoreCase);
+
+                    Action<string> restoreOne = lg =>
+                    {
+                        double feed;
+                        if (!TryGetFeedDouble(isRd ? L.Rd : L.Rf, lg, out feed))
+                            return; // ingen baseline känd → gör inget
+
+                        // UI: skriv baseline i Value/Tag och släck lila
+                        int r = isRd ? R(L.Rd) : R(L.Rf);
+                        var c = _dgv.Rows[r].Cells[lg];
+                        c.Tag = feed; // håll Tag = feed-baseline
+                        c.Value = FormatPercent(feed, 3);
+                        MarkOverride(isRd ? L.Rd : L.Rf, lg, false);
+                        _dgv.InvalidateCell(c.ColumnIndex, r);
+
+                        // Signalera till Presentern att nolla override i Store för just denna sida
+                        RateClearOverrideRequested?.Invoke(this, new RateClearOverrideRequestedEventArgs
+                        {
+                            LegColumn = lg,
+                            Field = field
+                        });
+                    };
+
+                    if (isDeal)
+                    {
+                        for (int i = 0; i < _legs.Length; i++)
+                            restoreOne(_legs[i]);
+                    }
+                    else
+                    {
+                        restoreOne(colName);
+                    }
+
                     e.Handled = true;
                     return;
                 }
 
-                // Starta edit men behåll texten (töm inte); caret sist
+                // Övriga fält: starta edit men rensa inte cellen; caret sist
                 _dgv.BeginEdit(true);
-                if (_dgv.EditingControl is TextBox tb)
+                if (_dgv.EditingControl is TextBox tb1)
                 {
-                    // Behåll befintligt innehåll – rör bara caret
-                    tb.SelectionStart = tb.TextLength;
-                    tb.SelectionLength = 0;
+                    tb1.SelectionStart = tb1.TextLength;
+                    tb1.SelectionLength = 0;
                 }
                 _dgv.InvalidateCell(cell.ColumnIndex, cell.RowIndex);
                 e.Handled = true;
@@ -1404,6 +1458,7 @@ namespace FX.UI.WinForms
 
             // andra tangenter: inget specialfall här
         }
+
 
         // ========= MouseDown: markera "pressed" + blockera att FIELD fäller sektionen =========
         private void Dgv_CellMouseDown_PricingButton(object sender, DataGridViewCellMouseEventArgs e)
@@ -3397,6 +3452,12 @@ namespace FX.UI.WinForms
             public string LegColumn { get; set; }
         }
 
+
+
+        #endregion
+
+        #region === Keyboard handling / Commands ===
+
         /// <summary>
         /// F9: prisa alla ben. F2: gå in i edit-läge och markera hela innehållet i cellen.
         /// </summary>
@@ -3449,6 +3510,8 @@ namespace FX.UI.WinForms
 
             return base.ProcessCmdKey(ref msg, keyData);
         }
+
+
 
         #endregion
 

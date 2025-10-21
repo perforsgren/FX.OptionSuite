@@ -102,10 +102,10 @@ namespace FX.Services
                     var spotDate = dates.SpotDate;
                     var settlement = dates.SettlementDate;
 
-                    // 2) Säkerställ RD/RF i Store för detta ben (hedra ForceRefreshRates)
+                    // 2b) Säkerställ RD/RF för detta ben – hedra ForceRefreshRates (innan läsning)
                     using (var feeder = new FX.Services.MarketData.UsdAnchoredRateFeeder(_marketStore))
                     {
-                        feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, cmd.ForceRefreshRates);
+                        feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, /*forceRefresh:*/ cmd.ForceRefreshRates);
                     }
 
                     // 3) Spot enligt Store (respektera ViewMode/Override)

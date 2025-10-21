@@ -266,8 +266,8 @@ namespace FX.UI.WinForms
         /// Prissätter ett ben via stabil identitet (LegId).
         /// Bygger RequestPrice från UI-snapshot och skickar över bus.
         /// Om <paramref name="forceRefreshRates"/> är true:
-        ///  - Skippar att skriva UI-räntor till Store (vi vill inte reapplicera ev. gamla overrides)
-        ///  - Runtime får ForceRefreshRates=true och hämtar färska RD/RF innan läsning.
+        ///   - Skippar att skriva UI-räntor till Store (vi vill inte reapplicera ev. gamla overrides)
+        ///   - Runtime får ForceRefreshRates=true och hämtar färska RD/RF innan läsning.
         /// </summary>
         private void PriceSingleLeg(Guid legId, bool forceRefreshRates)
         {
@@ -301,7 +301,7 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            // --- Resolve expiry (oförändrat, best effort) ---
+            // --- Resolve expiry (best effort) ---
             var iso = _view.TryGetResolvedExpiryIsoById(legId);
             if (string.IsNullOrWhiteSpace(iso) && !string.IsNullOrWhiteSpace(snap.ExpiryRaw))
             {
@@ -391,9 +391,11 @@ namespace FX.UI.WinForms
         }
             };
 
-            _pricingInFlight = true; // vakt mot dubbel-call
+            // Vakt mot dubbelprisning under pågående call
+            _pricingInFlight = true;
             _bus.Publish(cmd);
         }
+
 
 
 
@@ -538,6 +540,49 @@ namespace FX.UI.WinForms
         #endregion
 
         #region Events
+
+        /// <summary>
+        /// View ber oss nolla override för ett specifikt ben och fält (RD/RF) efter Delete.
+        /// Vi mappar kolumn-label → LegId via _legStates, nollar override i Store och triggar en
+        /// debouncad prisning via ScheduleRepriceDebounced().
+        /// </summary>
+        private void OnRateClearOverrideRequested(object sender, RateClearOverrideRequestedEventArgs e)
+        {
+            try
+            {
+                if (e == null || string.IsNullOrWhiteSpace(e.LegColumn) || string.IsNullOrWhiteSpace(e.Field)) return;
+
+                // Mappa UI-kolumn → LegId (samma princip som OnRateEdited)
+                var ls = _legStates.Find(s => string.Equals(s.Label, e.LegColumn, StringComparison.OrdinalIgnoreCase));
+                if (ls == null) return;
+
+                var legIdStr = ls.LegId.ToString();
+                var pair6 = NormalizePair6(_view.ReadPair6()) ?? _mktStore.Current?.Pair6 ?? "EURSEK";
+                var nowUtc = DateTime.UtcNow;
+
+                if (string.Equals(e.Field, "Rd", StringComparison.OrdinalIgnoreCase))
+                    _mktStore.SetRdOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
+                else if (string.Equals(e.Field, "Rf", StringComparison.OrdinalIgnoreCase))
+                    _mktStore.SetRfOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
+                else
+                    return;
+
+                // Debounce: använd befintlig helper
+                ScheduleRepriceDebounced();
+            }
+            catch (Exception ex)
+            {
+                _bus.Publish(new ErrorOccurred
+                {
+                    Source = "Presenter.OnRateClearOverrideRequested",
+                    Message = ex.Message,
+                    Detail = ex.ToString(),
+                    CorrelationId = Guid.Empty
+                });
+            }
+        }
+
+
 
         /// <summary>
         /// UI → MarketStore: en specifik ränta (RD eller RF) har editerats för ett visst ben.
@@ -1035,11 +1080,10 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// UI: F7 – force refresh av RD/RF för alla ben.
-        /// Steg:
-        /// 1) Nolla RD/RF-override i Store per ben (OverrideMode.None).
-        /// 2) Tryck omedelbart baseline till UI (ShowRatesById) så lila släcks direkt.
-        /// 3) Prisa varje ben med ForceRefreshRates=true (Runtime hämtar nya feed-räntor).
+        /// UI: F7 – Forced rate refresh för alla ben.
+        /// 1) Nolla RD/RF-override i Store för varje ben (så Effective inte blir kvar som User).
+        /// 2) Ingen direkt UI-push här; siffran byts när feed kommer.
+        /// 3) Prisa varje ben med ForceRefreshRates=true – runtime ensure:ar nya RD/RF innan läsning.
         /// </summary>
         private void OnRatesRefreshRequested(object sender, EventArgs e)
         {
@@ -1050,25 +1094,21 @@ namespace FX.UI.WinForms
                 var pair6 = NormalizePair6(_view.ReadPair6()) ?? _mktStore.Current?.Pair6 ?? "EURSEK";
                 var nowUtc = DateTime.UtcNow;
 
-                // 1) Nolla override i Store
+                // 1) Nolla overrides i Store
+                for (int i = 0; i < _legStates.Count; i++)
+                {
+                    var legIdStr = _legStates[i].LegId.ToString();
+                    _mktStore.SetRdOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
+                    _mktStore.SetRfOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
+                    System.Diagnostics.Debug.WriteLine($"[Presenter.F7] Cleared overrides (RD/RF) leg={legIdStr}");
+                }
+
+                // 2) Prisning med ForceRefreshRates=true → nya RD/RF hämtas
                 for (int i = 0; i < _legStates.Count; i++)
                 {
                     var legId = _legStates[i].LegId;
-                    var legKey = legId.ToString();
-
-                    _mktStore.SetRdOverride(pair6, legKey, OverrideMode.None, nowUtc);
-                    _mktStore.SetRfOverride(pair6, legKey, OverrideMode.None, nowUtc);
-
-                    System.Diagnostics.Debug.WriteLine($"[Presenter.F7] Cleared overrides (RD/RF) leg={legKey}");
+                    PriceSingleLeg(legId, /*forceRefreshRates:*/ true);
                 }
-
-                // 2) Omedelbar UI-push av baseline (släcker lila oavsett om feed ändras)
-                for (int i = 0; i < _legStates.Count; i++)
-                    PushRatesUiForLeg(_legStates[i].LegId);
-
-                // 3) Prisning med ForceRefreshRates=true → Runtime säkerställer nya feed-räntor
-                for (int i = 0; i < _legStates.Count; i++)
-                    PriceSingleLeg(_legStates[i].LegId, /*forceRefreshRates:*/ true);
             }
             catch (Exception ex)
             {
@@ -1081,6 +1121,7 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
 
 
 
