@@ -86,9 +86,9 @@ namespace FX.UI.WinForms
             _view.AddLegRequested += OnAddLegRequested; // Lägg till ben (F6)
             _view.RatesRefreshRequested += OnRatesRefreshRequested; //Refresh rates (F7)
             _view.RateEdited += OnRateEdited;
-
-
             _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
+
+            _view.RateClearOverrideRequested += OnRateClearOverrideRequested;
 
             // Initialt ViewMode till Store
             {
@@ -543,16 +543,16 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// View ber oss nolla override för ett specifikt ben och fält (RD/RF) efter Delete.
-        /// Vi mappar kolumn-label → LegId via _legStates, nollar override i Store och triggar en
-        /// debouncad prisning via ScheduleRepriceDebounced().
+        /// Vi mappar kolumn-label → LegId via _legStates, nollar override i Store och triggar
+        /// en debouncad prisning via ScheduleRepriceDebounced().
         /// </summary>
-        private void OnRateClearOverrideRequested(object sender, RateClearOverrideRequestedEventArgs e)
+        private void OnRateClearOverrideRequested(object sender, LegacyPricerView.RateClearOverrideRequestedEventArgs e)
         {
             try
             {
                 if (e == null || string.IsNullOrWhiteSpace(e.LegColumn) || string.IsNullOrWhiteSpace(e.Field)) return;
 
-                // Mappa UI-kolumn → LegId (samma princip som OnRateEdited)
+                // Hitta leg via kolumnnamn (samma princip som i OnRateEdited)
                 var ls = _legStates.Find(s => string.Equals(s.Label, e.LegColumn, StringComparison.OrdinalIgnoreCase));
                 if (ls == null) return;
 
@@ -567,7 +567,7 @@ namespace FX.UI.WinForms
                 else
                     return;
 
-                // Debounce: använd befintlig helper
+                // En debouncad reprice räcker
                 ScheduleRepriceDebounced();
             }
             catch (Exception ex)
@@ -581,6 +581,7 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
 
 
 
