@@ -61,11 +61,11 @@ namespace FX.Services
 
         /// <summary>
         /// Huvudhandler för prisförfrågningar.
-        /// 1) Normaliserar indata och räknar datum (expiry från cmd, spot/settle via ISpotSetDateService).
-        /// 2) Säkerställer RD/RF i MarketStore för aktuellt legId (via orchestrator/feeders).
-        /// 3) Läser effektiv RD/RF från MarketStore och använder deras mid (ignorerar cmd-overrides).
-        /// 4) Läser spot enligt Store (respekterar ViewMode/Override).
-        /// 5) Bygger PricingRequest, kör motorn och publicerar PriceCalculated.
+        /// 1) Normalisera indata och räkna datum (expiry via cmd, spot/settle via ISpotSetDateService).
+        /// 2) Säkerställ RD/RF i MarketStore för aktuellt legId (hedrar ForceRefreshRates).
+        /// 3) Läs spot enligt Store (respektera ViewMode/Override).
+        /// 4) Läs effektiv RD/RF från Store och använd mid.
+        /// 5) Bygg PricingRequest, kör motorn och publicera PriceCalculated.
         /// </summary>
         private async System.Threading.Tasks.Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
         {
@@ -102,7 +102,13 @@ namespace FX.Services
                     var spotDate = dates.SpotDate;
                     var settlement = dates.SettlementDate;
 
-                    // 2) Spot enligt Store (respektera ViewMode/Override)
+                    // 2) Säkerställ RD/RF i Store för detta ben (hedra ForceRefreshRates)
+                    using (var feeder = new FX.Services.MarketData.UsdAnchoredRateFeeder(_marketStore))
+                    {
+                        feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, cmd.ForceRefreshRates);
+                    }
+
+                    // 3) Spot enligt Store (respektera ViewMode/Override)
                     var snap = _marketStore.Current;
                     var spotField = snap.Spot;
                     var spotEff = spotField.Effective;
@@ -118,41 +124,20 @@ namespace FX.Services
                         spotBid = spotEff.Bid; spotAsk = spotEff.Ask;
                     }
 
-                    //System.Diagnostics.Debug.WriteLine(
-                    //    "[FxRuntime.Request][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                    //    "pair=" + pair6 + " legId=" + legId +
-                    //    " spotEff=" + spotEff.Bid.ToString("F6") + "/" + spotEff.Ask.ToString("F6") +
-                    //    " vm=" + spotField.ViewMode + " ov=" + spotField.Override +
-                    //    " exp=" + expiry.ToString("yyyy-MM-dd") +
-                    //    " spotDate=" + spotDate.ToString("yyyy-MM-dd") +
-                    //    " settle=" + settlement.ToString("yyyy-MM-dd"));
-
-                    // 3) Säkerställ RD/RF för just detta leg i Store (cache-first via orchestrator)
-                    var orchestrator = FX.Services.MarketData.OrchestratorFactory.Create(_marketStore);
-                    orchestrator.Build(pair6, legId, today, expiry, spotDate, settlement, useMid: false);
-
-                    // 4) Läs RD/RF ur Store (samma legId) och använd mid
-                    snap = _marketStore.Current;
+                    // 4) RD/RF effektivt för detta ben (efter ensure)
                     var rdFld = snap.TryGetRd(legId);
                     var rfFld = snap.TryGetRf(legId);
                     if (rdFld == null || rfFld == null)
-                        throw new InvalidOperationException("Effektiv RD/RF saknas i MarketStore efter ensure.");
+                        throw new InvalidOperationException("RD/RF saknas i Store efter ensure.");
 
                     var rdEff = rdFld.Effective;
                     var rfEff = rfFld.Effective;
 
-                    // Validera att dessa inte är “seed 0/0”
+                    // Fall-back säkerhet: om 0/0, gör en engångs-retry med force=true (första varvets seed)
                     bool rdZero = Math.Abs(rdEff.Bid) <= 1e-15 && Math.Abs(rdEff.Ask) <= 1e-15;
                     bool rfZero = Math.Abs(rfEff.Bid) <= 1e-15 && Math.Abs(rfEff.Ask) <= 1e-15;
                     if (rdZero || rfZero)
                     {
-                        // En enda retry med forceRefresh för att få bort ev. första-varvet-seed
-                        //System.Diagnostics.Debug.WriteLine(
-                        //    "[FxRuntime.EnsureRates][RETRY ON ZERO][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                        //    "pair=" + pair6 + " legId=" + legId +
-                        //    " rd=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                        //    " rf=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
-
                         using (var feeder = new FX.Services.MarketData.UsdAnchoredRateFeeder(_marketStore))
                         {
                             feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, true);
@@ -185,7 +170,7 @@ namespace FX.Services
                         " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
                         " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
 
-                    // 5) RD/RF att använda i prisningen = alltid mid från Store (ignorera cmd-overrides)
+                    // RD/RF som används i prisningen = mid från Store
                     double rd = 0.5 * (rdEff.Bid + rdEff.Ask);
                     double rf = 0.5 * (rfEff.Bid + rfEff.Ask);
 
@@ -194,7 +179,7 @@ namespace FX.Services
                         "pair=" + pair6 + " legId=" + legId +
                         " rdUsed=" + rd.ToString("F6") + " rfUsed=" + rf.ToString("F6"));
 
-                    // 6) Bygg domänens request
+                    // 5) Bygg domänens request och prisa (oförändrat i övrigt)
                     var legs = new List<OptionLeg>();
                     if (cmd.Legs != null)
                     {
@@ -238,18 +223,14 @@ namespace FX.Services
                         stickyDelta: cmd.StickyDelta
                     );
 
-                    // Vol: procent -> decimal
                     double? bidDec = cmd.VolBidPct.HasValue ? (cmd.VolBidPct.Value / 100.0) : (double?)null;
                     double? askDec = cmd.VolAskPct.HasValue ? (cmd.VolAskPct.Value / 100.0) : (double?)null;
                     domainReq.SetVol(new VolQuote(bidDec, askDec));
 
-                    // 7) Prisning
                     var unit = await _price.PriceAsync(domainReq, _cts.Token).ConfigureAwait(false);
 
-                    string firstSide = ((cmd.Legs != null && cmd.Legs.Count > 0) ? cmd.Legs[0].Side : "BUY");
-                    firstSide = (firstSide ?? "BUY").ToUpperInvariant();
+                    string firstSide = ((cmd.Legs != null && cmd.Legs.Count > 0) ? cmd.Legs[0].Side : "BUY") ?? "BUY";
                     bool isBuy = string.Equals(firstSide, "BUY", StringComparison.OrdinalIgnoreCase);
-
                     double pricePerUnit = isBuy ? unit.PremiumAsk : unit.PremiumBid;
                     string boldSide = (unit.PremiumBid == unit.PremiumAsk) ? "MID" : (isBuy ? "ASK" : "BID");
 
@@ -294,6 +275,7 @@ namespace FX.Services
                 });
             }
         }
+
 
 
 

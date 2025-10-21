@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.Linq;
 using FX.Services;
+using static FX.UI.WinForms.LegacyPricerView;
 
 namespace FX.UI.WinForms
 {
@@ -84,6 +85,8 @@ namespace FX.UI.WinForms
             _view.SpotModeChanged += OnSpotModeChanged;
             _view.AddLegRequested += OnAddLegRequested; // Lägg till ben (F6)
             _view.RatesRefreshRequested += OnRatesRefreshRequested; //Refresh rates (F7)
+            _view.RateEdited += OnRateEdited;
+
 
             _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
 
@@ -223,7 +226,6 @@ namespace FX.UI.WinForms
             }
         }
 
-
         /// <summary>
         /// Laddar helgdagstabell för givna kalenderkoder kopplade till valutaparet (pair6).
         /// Returnerar tom <see cref="DataTable"/> om anslutning eller kalenderlista saknas.
@@ -263,7 +265,9 @@ namespace FX.UI.WinForms
         /// <summary>
         /// Prissätter ett ben via stabil identitet (LegId).
         /// Bygger RequestPrice från UI-snapshot och skickar över bus.
-        /// Kan begära force refresh av RD/RF (F7).
+        /// Om <paramref name="forceRefreshRates"/> är true:
+        ///  - Skippar att skriva UI-räntor till Store (vi vill inte reapplicera ev. gamla overrides)
+        ///  - Runtime får ForceRefreshRates=true och hämtar färska RD/RF innan läsning.
         /// </summary>
         private void PriceSingleLeg(Guid legId, bool forceRefreshRates)
         {
@@ -274,7 +278,15 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            ApplyUiRatesToStore(legId);
+            // Viktigt: vid force refresh ska vi INTE skriva UI->Store (annars riskerar vi re-override).
+            if (!forceRefreshRates)
+            {
+                ApplyUiRatesToStore(legId);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (ForceRefreshRates=true).");
+            }
 
             var snap = _view.GetLegSnapshotById(legId);
             if (snap == null)
@@ -289,7 +301,7 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            // --- (samma expiry-resolve som du redan har) ---
+            // --- Resolve expiry (oförändrat, best effort) ---
             var iso = _view.TryGetResolvedExpiryIsoById(legId);
             if (string.IsNullOrWhiteSpace(iso) && !string.IsNullOrWhiteSpace(snap.ExpiryRaw))
             {
@@ -310,7 +322,7 @@ namespace FX.UI.WinForms
                 catch { /* best effort */ }
             }
 
-            // --- Spot enligt store (samma logik som tidigare) ---
+            // --- Spot enligt store (oförändrat) ---
             var storeSnap = _mktStore.Current;
             var pair6 = NormalizePair6(snap.Pair6) ?? NormalizePair6(storeSnap?.Pair6) ?? NormalizePair6(_view.ReadPair6());
             if (pair6 == null)
@@ -358,13 +370,13 @@ namespace FX.UI.WinForms
                 Pair6 = pair6,
                 SpotBidOverride = sb,
                 SpotAskOverride = sa,
-                RdOverride = snap.Rd,
-                RfOverride = snap.Rf,
+                RdOverride = snap.Rd,   // ignoreras i runtime; Store används
+                RfOverride = snap.Rf,   // ignoreras i runtime; Store används
                 SurfaceId = "default",
                 StickyDelta = false,
                 VolBidPct = volBidPct,
                 VolAskPct = volBidPct.HasValue && volAskPct.HasValue ? volAskPct : null,
-                ForceRefreshRates = forceRefreshRates, // ← NYTT
+                ForceRefreshRates = forceRefreshRates,
                 Legs = new System.Collections.Generic.List<FX.Messages.Commands.RequestPrice.Leg>
         {
             new FX.Messages.Commands.RequestPrice.Leg
@@ -379,10 +391,11 @@ namespace FX.UI.WinForms
         }
             };
 
-            // In-flight vakt för dubbelprisning
-            _pricingInFlight = true;
+            _pricingInFlight = true; // vakt mot dubbel-call
             _bus.Publish(cmd);
         }
+
+
 
         /// <summary>
         /// Bekvämlighetsöverlagring: standard = ingen force refresh.
@@ -391,10 +404,6 @@ namespace FX.UI.WinForms
         {
             PriceSingleLeg(legId, false);
         }
-
-
-
-
 
         /// <summary>Prissätter samtliga ben via stabil identitet (LegId).</summary>
         private void RepriceAllLegs()
@@ -531,6 +540,54 @@ namespace FX.UI.WinForms
         #region Events
 
         /// <summary>
+        /// UI → MarketStore: en specifik ränta (RD eller RF) har editerats för ett visst ben.
+        /// Skriv ENDAST det fältet till Store som User-override. Andra fält lämnas orörda.
+        /// </summary>
+        private void OnRateEdited(object sender, RateEditedEventArgs e)
+        {
+            try
+            {
+                if (e == null) return;
+
+                // 1) Mappa kolumn → LegId (Presentern har _legStates med Label)
+                var ls = _legStates.Find(s => string.Equals(s.Label, e.LegColumn, StringComparison.OrdinalIgnoreCase));
+                if (ls == null) return;
+
+                var legId = ls.LegId.ToString();
+                var pair6 = NormalizePair6(_view.ReadPair6());
+                var now = DateTime.UtcNow;
+
+                // 2) Bygg TwoWay av UI (single → mid)
+                var tw = new TwoWay<double>(e.Mid, e.Mid);
+
+                // 3) Skriv ENDAST det fält som editerats
+                if (string.Equals(e.Field, "Rd", StringComparison.OrdinalIgnoreCase))
+                {
+                    _mktStore.SetRdFromUser(pair6, legId, tw, wasMid: e.WasMid, viewMode: ViewMode.TwoWay, nowUtc: now);
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] pair={pair6} leg={ls.LegId} RD={e.Mid:F6} src=User vm=TwoWay ov={(e.WasMid ? "Mid" : "Both")}");
+                }
+                else if (string.Equals(e.Field, "Rf", StringComparison.OrdinalIgnoreCase))
+                {
+                    _mktStore.SetRfFromUser(pair6, legId, tw, wasMid: e.WasMid, viewMode: ViewMode.TwoWay, nowUtc: now);
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] pair={pair6} leg={ls.LegId} RF={e.Mid:F6} src=User vm=TwoWay ov={(e.WasMid ? "Mid" : "Both")}");
+                }
+
+                // 4) Forward påverkas av rates → uppdatera just detta ben
+                PushForwardUiForLeg(ls.LegId);
+
+                // 5) Reprice debounced
+                ScheduleRepriceDebounced();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnRateEdited: " + ex.Message);
+            }
+        }
+
+
+        /// <summary>
         /// Kör en UI-uppdatering säkert: BeginInvoke om handle finns, annars väntar på HandleCreated och kör där.
         /// Skyddar mot "Invoke/BeginInvoke before handle created".
         /// </summary>
@@ -635,6 +692,12 @@ namespace FX.UI.WinForms
         /// - Spot-only (även Batch med enbart Spot>0): uppdatera BARA spot i UI + Forward (ej RD/RF) + debounce-reprice.
         /// - Rate-only (Feed/User/Rd/Rf/Override/ViewMode): uppdatera RD/RF i UI + Forward + debounce-reprice.
         /// - Övrigt: noop.
+        ///
+        /// - Hanterar "UserRd:<leg>" / "UserRf:<leg>" tidigt som rate-only (user-override):
+        ///   * Läser effektiva RD/RF ur Store (user ligger i Effective),
+        ///   * Pushar UI som override (utan att röra feed-baseline → lila stannar),
+        ///   * Uppdaterar Forward för berört ben,
+        ///   * Debounce-reprice och return.
         /// </summary>
         private void OnMarketChanged(object sender, MarketChangedEventArgs e)
         {
@@ -645,6 +708,52 @@ namespace FX.UI.WinForms
                 var snap = _mktStore.Current;
                 var spotField = snap?.Spot;
                 TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
+
+                // =========== [ADDED – STEP 1] User-override RD/RF (rate-only user) ===========
+                {
+                    bool isUserRd = reason.StartsWith("UserRd:", StringComparison.OrdinalIgnoreCase);
+                    bool isUserRf = reason.StartsWith("UserRf:", StringComparison.OrdinalIgnoreCase);
+                    if (isUserRd || isUserRf)
+                    {
+                        Guid gid;
+                        if (TryParseLegGuidFromReason(reason, out gid) && gid != Guid.Empty)
+                        {
+                            // Läs effektiva RD/RF för benet (user ligger i Effective)
+                            var rdFld = snap?.TryGetRd(gid.ToString());
+                            var rfFld = snap?.TryGetRf(gid.ToString());
+
+                            double? rdMid = null, rfMid = null;
+                            bool staleRd = false, staleRf = false;
+
+                            if (isUserRd && rdFld != null)
+                            {
+                                var re = rdFld.Effective;
+                                rdMid = 0.5 * (re.Bid + re.Ask);
+                                staleRd = rdFld.IsStale;
+                            }
+                            if (isUserRf && rfFld != null)
+                            {
+                                var fe = rfFld.Effective;
+                                rfMid = 0.5 * (fe.Bid + fe.Ask);
+                                staleRf = rfFld.IsStale;
+                            }
+
+                            System.Diagnostics.Debug.WriteLine(
+                                $"[Presenter.UserRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} leg={gid} rd={(rdMid.HasValue ? rdMid.Value.ToString("F6") : "-")} rf={(rfMid.HasValue ? rfMid.Value.ToString("F6") : "-")}");
+
+                            // Visa override i UI (Guid) utan att röra baseline → lila stannar kvar
+                            _view.ShowRatesOverrideById(gid, rdMid, rfMid, staleRd, staleRf);
+
+                            // Forward påverkas av RD/RF → uppdatera för just detta ben
+                            PushForwardUiForLeg(gid);
+
+                            // Reprice debounced (rate-only user)
+                            ScheduleRepriceDebounced();
+                            return;
+                        }
+                    }
+                }
+                // ======= [END ADDED – STEP 1] =======
 
                 // =========== 1) Direkta spot-reasons =============
                 if (IsSpotReason(reason))
@@ -709,7 +818,6 @@ namespace FX.UI.WinForms
                         PushRatesUiAllLegs();
                         PushForwardUiAllLegs();
 
-                        // (valfritt) cooldown/single-flight-skydd om du redan använder dessa fält
                         if (!_pricingInFlight &&
                             (System.DateTime.UtcNow - _lastPriceFinishedUtc) >= _rateWriteCooldown)
                         {
@@ -726,8 +834,8 @@ namespace FX.UI.WinForms
                 bool isRateOnly =
                     reason.StartsWith("FeedRd", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("FeedRf", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("UserRd", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("UserRf", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRd", StringComparison.OrdinalIgnoreCase) ||   // täcks tidigt men kvar för tydlighet
+                    reason.StartsWith("UserRf", StringComparison.OrdinalIgnoreCase) ||   // täcks tidigt men kvar för tydlighet
                     reason.StartsWith("RdViewMode", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("RfViewMode", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("RdOverride", StringComparison.OrdinalIgnoreCase) ||
@@ -735,7 +843,6 @@ namespace FX.UI.WinForms
 
                 if (isRateOnly)
                 {
-                    // Uppdatera specifikt ben om guid finns i reason, annars alla
                     Guid gid;
                     if (TryParseLegGuidFromReason(reason, out gid) && gid != Guid.Empty)
                     {
@@ -763,8 +870,6 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
         }
-
-
 
 
         /// <summary>
@@ -930,9 +1035,11 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// UI: F7 – användaren vill hämta nya RD/RF från källa (force refresh)
-        /// och därefter prissätta alla ben. Vi gör det genom att skicka våra vanliga
-        /// RequestPrice, men med ForceRefreshRates=true.
+        /// UI: F7 – force refresh av RD/RF för alla ben.
+        /// Steg:
+        /// 1) Nolla RD/RF-override i Store per ben (OverrideMode.None).
+        /// 2) Tryck omedelbart baseline till UI (ShowRatesById) så lila släcks direkt.
+        /// 3) Prisa varje ben med ForceRefreshRates=true (Runtime hämtar nya feed-räntor).
         /// </summary>
         private void OnRatesRefreshRequested(object sender, EventArgs e)
         {
@@ -940,12 +1047,28 @@ namespace FX.UI.WinForms
             {
                 System.Diagnostics.Debug.WriteLine("[Presenter.F7] Force refresh rates for all legs…");
 
-                // Reprisa alla ben men med flaggan på
+                var pair6 = NormalizePair6(_view.ReadPair6()) ?? _mktStore.Current?.Pair6 ?? "EURSEK";
+                var nowUtc = DateTime.UtcNow;
+
+                // 1) Nolla override i Store
                 for (int i = 0; i < _legStates.Count; i++)
                 {
                     var legId = _legStates[i].LegId;
-                    PriceSingleLeg(legId, /*forceRefreshRates:*/ true);
+                    var legKey = legId.ToString();
+
+                    _mktStore.SetRdOverride(pair6, legKey, OverrideMode.None, nowUtc);
+                    _mktStore.SetRfOverride(pair6, legKey, OverrideMode.None, nowUtc);
+
+                    System.Diagnostics.Debug.WriteLine($"[Presenter.F7] Cleared overrides (RD/RF) leg={legKey}");
                 }
+
+                // 2) Omedelbar UI-push av baseline (släcker lila oavsett om feed ändras)
+                for (int i = 0; i < _legStates.Count; i++)
+                    PushRatesUiForLeg(_legStates[i].LegId);
+
+                // 3) Prisning med ForceRefreshRates=true → Runtime säkerställer nya feed-räntor
+                for (int i = 0; i < _legStates.Count; i++)
+                    PriceSingleLeg(_legStates[i].LegId, /*forceRefreshRates:*/ true);
             }
             catch (Exception ex)
             {
@@ -958,6 +1081,8 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
+
 
 
 
@@ -1290,107 +1415,206 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region UI pushers
 
-/// <summary>
-/// Beräknar Forward Rate och Forward Points för ett specifikt ben (legId)
-/// utifrån aktuell spot + rd/rf i MarketStore och benets resolverade expiry i UI,
-/// och pushar till vyn (vyn skalar points ×1000 i presentation).
-/// </summary>
-private void PushForwardUiForLeg(Guid legId)
-{
-    try
-    {
-        // 1) Pair + datum (expiry tas från vyns resolverade ISO)
-        var pair6 = NormalizePair6(_view.ReadPair6()) ?? "EURSEK";
-        var baseCcy = pair6.Substring(0, 3);
-        var quoteCcy = pair6.Substring(3, 3);
-
-        var today = DateTime.Today;
-        var expIso = _view.TryGetResolvedExpiryIsoById(legId); // finns i din vy
-        DateTime expiry = today;
-        if (!string.IsNullOrWhiteSpace(expIso))
-            DateTime.TryParse(expIso, out expiry);
-
-        // SpotDate & Settlement via samma tjänst som i runtime
-        var dates = _spotSvc.Compute(pair6, today, expiry);
-        var spotDate   = dates.SpotDate;
-        var settlement = dates.SettlementDate;
-
-        // 2) Spot effektiv (respektera ViewMode/Override)
-        var snap = _mktStore.Current;
-        if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
+        /// <summary>
+        /// UI-push för RD/RF för ett specifikt ben:
+        /// - Om Store har aktiv USER-override på RD och/eller RF → visa partial override (lila) endast för de sidor som är override:ade.
+        /// - Annars → visa feed-baseline (neutral), vilket även släcker lila i vyn (via ShowRatesById).
+        /// - Mid definieras här som (Bid+Ask)/2 från Effective-fältet.
+        /// - Stale-status från Store mappas till tooltip i vyn.
+        /// </summary>
+        private void PushRatesUiForLeg(Guid legId)
         {
-            _view.ShowForwardById(legId, null, null);
-            return;
+            try
+            {
+                var snap = _mktStore.Current;
+                if (snap == null) return;
+
+                var legIdStr = legId.ToString();
+
+                // Hämta RD/RF-fält ur Store
+                var rdFld = snap.TryGetRd(legIdStr);
+                var rfFld = snap.TryGetRf(legIdStr);
+
+                // Effektiva mid-värden (User om override, annars Feed)
+                double? rdMid = null, rfMid = null;
+                bool staleRd = false, staleRf = false;
+
+                if (rdFld != null)
+                {
+                    var e = rdFld.Effective;
+                    rdMid = 0.5 * (e.Bid + e.Ask);
+                    staleRd = rdFld.IsStale;
+                }
+                if (rfFld != null)
+                {
+                    var e = rfFld.Effective;
+                    rfMid = 0.5 * (e.Bid + e.Ask);
+                    staleRf = rfFld.IsStale;
+                }
+
+                // Override-aktiv? (User-låsning)
+                bool rdOverrideActive = rdFld != null &&
+                                        rdFld.Override != OverrideMode.None &&
+                                        rdFld.Source == FX.Core.Domain.MarketData.MarketSource.User;
+
+                bool rfOverrideActive = rfFld != null &&
+                                        rfFld.Override != OverrideMode.None &&
+                                        rfFld.Source == FX.Core.Domain.MarketData.MarketSource.User;
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Presenter.UI.Rates] leg={legId} rd={(rdMid?.ToString("F6") ?? "-")} rf={(rfMid?.ToString("F6") ?? "-")} ovRd={rdOverrideActive} ovRf={rfOverrideActive}");
+
+                // Respektera override i UI-push:
+                // - Om override aktiv: visa override-värden (lila), rör inte baseline.
+                // - Annars: visa feed-baseline (ingen lila).
+                if (rdOverrideActive || rfOverrideActive)
+                {
+                    _view.ShowRatesOverrideById(
+                        legId,
+                        rdOverrideActive ? rdMid : (double?)null,
+                        rfOverrideActive ? rfMid : (double?)null,
+                        staleRd,
+                        staleRf
+                    );
+                }
+                else
+                {
+                    _view.ShowRatesById(
+                        legId,
+                        rdMid,
+                        rfMid,
+                        staleRd,
+                        staleRf
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushRatesUiForLeg: " + ex.Message);
+            }
         }
 
-        var sf = snap.Spot;
-        var se = sf.Effective; // TwoWay<double>
-        if (se.Bid <= 0.0 && se.Ask <= 0.0)
+        /// <summary>
+        /// Uppdaterar RD/RF i UI för alla ben. Respekterar override per ben (se <see cref="PushRatesUiForLeg(Guid)"/>).
+        /// </summary>
+        private void PushRatesUiAllLegs()
         {
-            _view.ShowForwardById(legId, null, null);
-            return;
+            try
+            {
+                for (int i = 0; i < _legStates.Count; i++)
+                    PushRatesUiForLeg(_legStates[i].LegId);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushRatesUiAllLegs: " + ex.Message);
+            }
         }
 
-        double spotBid, spotAsk;
-        if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
+        #endregion
+
+
+        /// <summary>
+        /// Beräknar Forward Rate och Forward Points för ett specifikt ben (legId)
+        /// utifrån aktuell spot + rd/rf i MarketStore och benets resolverade expiry i UI,
+        /// och pushar till vyn (vyn skalar points ×1000 i presentation).
+        /// </summary>
+        private void PushForwardUiForLeg(Guid legId)
         {
-            var mid = 0.5 * (se.Bid + se.Ask);
-            spotBid = mid; spotAsk = mid;
+            try
+            {
+                // 1) Pair + datum (expiry tas från vyns resolverade ISO)
+                var pair6 = NormalizePair6(_view.ReadPair6()) ?? "EURSEK";
+                var baseCcy = pair6.Substring(0, 3);
+                var quoteCcy = pair6.Substring(3, 3);
+
+                var today = DateTime.Today;
+                var expIso = _view.TryGetResolvedExpiryIsoById(legId); // finns i din vy
+                DateTime expiry = today;
+                if (!string.IsNullOrWhiteSpace(expIso))
+                    DateTime.TryParse(expIso, out expiry);
+
+                // SpotDate & Settlement via samma tjänst som i runtime
+                var dates = _spotSvc.Compute(pair6, today, expiry);
+                var spotDate = dates.SpotDate;
+                var settlement = dates.SettlementDate;
+
+                // 2) Spot effektiv (respektera ViewMode/Override)
+                var snap = _mktStore.Current;
+                if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                var sf = snap.Spot;
+                var se = sf.Effective; // TwoWay<double>
+                if (se.Bid <= 0.0 && se.Ask <= 0.0)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                double spotBid, spotAsk;
+                if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
+                {
+                    var mid = 0.5 * (se.Bid + se.Ask);
+                    spotBid = mid; spotAsk = mid;
+                }
+                else
+                {
+                    spotBid = se.Bid; spotAsk = se.Ask;
+                }
+                double S = 0.5 * (spotBid + spotAsk);
+
+                // 3) rd/rf effektivt för just detta ben (leg-GUID som nyckel)
+                var key = legId.ToString();
+                var rdFld = snap.TryGetRd(key);
+                var rfFld = snap.TryGetRf(key);
+                if (rdFld == null || rfFld == null)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                var rdMid = 0.5 * (rdFld.Effective.Bid + rdFld.Effective.Ask);
+                var rfMid = 0.5 * (rfFld.Effective.Bid + rfFld.Effective.Ask);
+
+                // 4) Year fractions enligt MM-konvention (samma som feeder)
+                var Tq = YearFracMm(spotDate, settlement, quoteCcy);
+                var Tb = YearFracMm(spotDate, settlement, baseCcy);
+                if (Tq <= 0.0 && Tb <= 0.0)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                // 5) Forward & Points (MM-approx)
+                var denom = (1.0 + rfMid * Tb);
+                if (denom <= 0.0)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                var F = S * (1.0 + rdMid * Tq) / denom;
+                var P = F - S;
+
+                _view.ShowForwardById(legId, F, P);
+
+                var ci = System.Globalization.CultureInfo.InvariantCulture;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
+                    $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
+                    $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
+                    $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushForwardUiForLeg: " + ex.Message);
+            }
         }
-        else
-        {
-            spotBid = se.Bid; spotAsk = se.Ask;
-        }
-        double S = 0.5 * (spotBid + spotAsk);
-
-        // 3) rd/rf effektivt för just detta ben (leg-GUID som nyckel)
-        var key = legId.ToString();
-        var rdFld = snap.TryGetRd(key);
-        var rfFld = snap.TryGetRf(key);
-        if (rdFld == null || rfFld == null)
-        {
-            _view.ShowForwardById(legId, null, null);
-            return;
-        }
-
-        var rdMid = 0.5 * (rdFld.Effective.Bid + rdFld.Effective.Ask);
-        var rfMid = 0.5 * (rfFld.Effective.Bid + rfFld.Effective.Ask);
-
-        // 4) Year fractions enligt MM-konvention (samma som feeder)
-        var Tq = YearFracMm(spotDate, settlement, quoteCcy);
-        var Tb = YearFracMm(spotDate, settlement, baseCcy);
-        if (Tq <= 0.0 && Tb <= 0.0)
-        {
-            _view.ShowForwardById(legId, null, null);
-            return;
-        }
-
-        // 5) Forward & Points (MM-approx)
-        var denom = (1.0 + rfMid * Tb);
-        if (denom <= 0.0)
-        {
-            _view.ShowForwardById(legId, null, null);
-            return;
-        }
-
-        var F = S * (1.0 + rdMid * Tq) / denom;
-        var P = F - S;
-
-        _view.ShowForwardById(legId, F, P);
-
-        var ci = System.Globalization.CultureInfo.InvariantCulture;
-        System.Diagnostics.Debug.WriteLine(
-            $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
-            $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
-            $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
-            $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
-    }
-    catch (Exception ex)
-    {
-        System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushForwardUiForLeg: " + ex.Message);
-    }
-}
 
 
 
@@ -1411,62 +1635,6 @@ private void PushForwardUiForLeg(Guid legId)
         {
             // Enkelt läge: singeltal i UI ⇒ lås MID, visa TwoWay i gridden.
             return (wasMid: true, viewMode: ViewMode.TwoWay);
-        }
-
-
-
-        /// <summary>
-        /// Läser RD/RF för ett specifikt ben (via legId) ur MarketStore.Current och
-        /// trycker ut till UI (utan att trigga prisning).
-        /// Om data saknas visas tomma celler.
-        /// </summary>
-        private void PushRatesUiForLeg(Guid legId)
-        {
-            var snap = _mktStore?.Current;
-            if (snap == null) return;
-
-            var key = legId.ToString();
-
-            // Hämta MarketField<double> för RD/RF (lagras i store per legId.ToString()).
-            var rdFld = FX.Core.Domain.MarketData.MarketSnapshot.TryGet(snap.RdByLeg, key);
-            var rfFld = FX.Core.Domain.MarketData.MarketSnapshot.TryGet(snap.RfByLeg, key);
-
-            double? rdMid = null, rfMid = null;
-            bool staleRd = false, staleRf = false;
-
-            if (rdFld != null)
-            {
-                var tw = rdFld.Effective; // TwoWay<double> (värdetyp) – kan inte vara null
-                rdMid = 0.5 * (tw.Bid + tw.Ask);
-                staleRd = rdFld.IsStale;  // ← rätt property
-            }
-            if (rfFld != null)
-            {
-                var tw = rfFld.Effective;
-                rfMid = 0.5 * (tw.Bid + tw.Ask);
-                staleRf = rfFld.IsStale;  // ← rätt property
-            }
-
-            System.Diagnostics.Debug.WriteLine(
-                $"[Presenter.UI.Rates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} " +
-                $"rd={(rdMid.HasValue ? rdMid.Value.ToString("F6", System.Globalization.CultureInfo.InvariantCulture) : "-")} " +
-                $"rf={(rfMid.HasValue ? rfMid.Value.ToString("F6", System.Globalization.CultureInfo.InvariantCulture) : "-")} " +
-                $"staleRd={staleRd} staleRf={staleRf}");
-
-            OnUi(() =>
-            {
-                _view.ShowRatesById(legId, rdMid, rfMid, staleRd, staleRf);
-            });
-        }
-
-
-        /// <summary>
-        /// Uppdaterar RD/RF-visningen för alla kända ben i UI (utan reprice).
-        /// </summary>
-        private void PushRatesUiAllLegs()
-        {
-            for (int i = 0; i < _legStates.Count; i++)
-                PushRatesUiForLeg(_legStates[i].LegId);
         }
 
 
@@ -1523,8 +1691,9 @@ private void PushForwardUiForLeg(Guid legId)
 
         /// <summary>
         /// Läser UI-räntor (RD/RF) för benets kolumn och skriver User-override till MarketStore
-        /// om värden finns. Anropas innan prisning, så att Store.Effective speglar UI.
-        /// Loggar vad som skrivs.
+        /// endast för de fält som faktiskt är i override (ovRd/ovRf). Skriver inte “det andra” fältet.
+        /// Skippar skrivning om värdet redan matchar Store.Effective. Loggar vad som händer.
+        /// Anropas före prisning för att säkra att Store speglar UI-override korrekt.
         /// </summary>
         private void ApplyUiRatesToStore(Guid legId)
         {
@@ -1537,7 +1706,7 @@ private void PushForwardUiForLeg(Guid legId)
             }
             string col = state.Label;
 
-            // 2) läs RD/RF från vyn för den kolumnen
+            // 2) läs RD/RF + override-status från vyn för den kolumnen
             double? uiRd, uiRf; bool ovRd, ovRf;
             if (!_view.TryReadRatesForColumn(col, out uiRd, out ovRd, out uiRf, out ovRf))
             {
@@ -1550,34 +1719,95 @@ private void PushForwardUiForLeg(Guid legId)
             if (string.IsNullOrWhiteSpace(pair6)) pair6 = _mktStore.Current?.Pair6 ?? "EURSEK";
 
             var now = DateTime.UtcNow;
+            var legKey = legId.ToString();
 
-            // 4) skriv RD/RF till store om värden finns (vi låser mid vid enkel-inmatning)
-            if (uiRd.HasValue)
+            // Hämta nuvarande fält i Store för jämförelse (undvik onödig writes)
+            var snap = _mktStore.Current;
+            var rdFld = snap?.TryGetRd(legKey);
+            var rfFld = snap?.TryGetRf(legKey);
+
+            // Hjälp: mittvärde ur ett TwoWay
+            double Mid(TwoWay<double> tw) => 0.5 * (tw.Bid + tw.Ask);
+
+            // 4) Skriv ENDAST fält som verkligen är override i UI (ov==true).
+            // RD
+            if (ovRd && uiRd.HasValue)
             {
-                _mktStore.SetRdFromUser(pair6, legId.ToString(),
-                    new TwoWay<double>(uiRd.Value, uiRd.Value),
-                    /*wasMid*/ true,
-                    ViewMode.TwoWay,
-                    now);
+                // Om Store redan har samma effective-mid för RD, skippa skrivning
+                bool sameAsStore = false;
+                if (rdFld != null)
+                {
+                    var eff = rdFld.Effective;
+                    sameAsStore = Math.Abs(Mid(eff) - uiRd.Value) <= 1e-12
+                                  && rdFld.Source == FX.Core.Domain.MarketData.MarketSource.User
+                                  && rdFld.Override != OverrideMode.None;
+                }
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Presenter.Rates->Store] pair={pair6} leg={legId} RD={uiRd.Value:F6} src=User vm=TwoWay ov=Mid");
+                if (!sameAsStore)
+                {
+                    _mktStore.SetRdFromUser(
+                        pair6,
+                        legKey,
+                        new TwoWay<double>(uiRd.Value, uiRd.Value),
+                        /*wasMid*/ true,
+                        ViewMode.TwoWay,
+                        now
+                    );
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] pair={pair6} leg={legId} RD={uiRd.Value:F6} src=User vm=TwoWay ov=Mid");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] RD SKIP (samma override i Store) leg={legId} mid={uiRd.Value:F6}");
+                }
+            }
+            else
+            {
+                // Viktigt: skriv INTE RD om ovRd=false → lämna RD orörd (feed/ev. tidigare state).
+                if (uiRd.HasValue)
+                    System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] RD IGNORE (ovRd=false) leg={legId} ui={uiRd.Value:F6}");
             }
 
-            if (uiRf.HasValue)
+            // RF
+            if (ovRf && uiRf.HasValue)
             {
-                _mktStore.SetRfFromUser(pair6, legId.ToString(),
-                    new TwoWay<double>(uiRf.Value, uiRf.Value),
-                    /*wasMid*/ true,
-                    ViewMode.TwoWay,
-                    now);
+                bool sameAsStore = false;
+                if (rfFld != null)
+                {
+                    var eff = rfFld.Effective;
+                    sameAsStore = Math.Abs(Mid(eff) - uiRf.Value) <= 1e-12
+                                  && rfFld.Source == FX.Core.Domain.MarketData.MarketSource.User
+                                  && rfFld.Override != OverrideMode.None;
+                }
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Presenter.Rates->Store] pair={pair6} leg={legId} RF={uiRf.Value:F6} src=User vm=TwoWay ov=Mid");
+                if (!sameAsStore)
+                {
+                    _mktStore.SetRfFromUser(
+                        pair6,
+                        legKey,
+                        new TwoWay<double>(uiRf.Value, uiRf.Value),
+                        /*wasMid*/ true,
+                        ViewMode.TwoWay,
+                        now
+                    );
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] pair={pair6} leg={legId} RF={uiRf.Value:F6} src=User vm=TwoWay ov=Mid");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Presenter.Rates->Store] RF SKIP (samma override i Store) leg={legId} mid={uiRf.Value:F6}");
+                }
+            }
+            else
+            {
+                if (uiRf.HasValue)
+                    System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] RF IGNORE (ovRf=false) leg={legId} ui={uiRf.Value:F6}");
             }
         }
-
-
 
     }
 }

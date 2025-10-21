@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using FX.Core.Domain.MarketData;
 using static FX.UI.WinForms.LegacyPricerView;
@@ -207,6 +208,8 @@ namespace FX.UI.WinForms
         /// </summary>
         public event EventHandler RatesRefreshRequested;
 
+        public event EventHandler<RateEditedEventArgs> RateEdited;
+
         #endregion
 
         #region === EventArgs
@@ -227,6 +230,14 @@ namespace FX.UI.WinForms
             /// <summary>True om editen gjordes i Deal-kolumnen (push mot alla ben i UI).</summary>
             public bool IsDealLevel { get; set; }
 
+        }
+
+        public sealed class RateEditedEventArgs : EventArgs
+        {
+            public string LegColumn { get; set; }   // t.ex. "Vanilla 1"
+            public string Field { get; set; }       // "Rd" eller "Rf"
+            public bool WasMid { get; set; }        // true för single-värde i UI idag
+            public double Mid { get; set; }         // decimalt (0.02 = 2%)
         }
 
         #endregion
@@ -1066,7 +1077,15 @@ namespace FX.UI.WinForms
                             atFeed = Math.Abs(f - dec) <= 1e-9;
                         MarkOverride(lbl, lg, !atFeed);
 
-                        RaisePriceRequestedForLeg(lg);
+                        RateEdited?.Invoke(this, new RateEditedEventArgs
+                        {
+                            LegColumn = col,                         // använd den kolumn som editerades
+                            Field = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase) ? "Rd" : "Rf",
+                            WasMid = true,                           // UI tar single % idag → mid
+                            Mid = dec
+                        });
+
+                        //RaisePriceRequestedForLeg(lg);
                     }
                     cell.Value = "";
                     _editStart.Remove(Key(lbl, col));
@@ -1090,7 +1109,15 @@ namespace FX.UI.WinForms
                         atFeed = Math.Abs(f - dec) <= 1e-9;
                     MarkOverride(lbl, col, !atFeed);
 
-                    RaisePriceRequestedForLeg(col);
+                    RateEdited?.Invoke(this, new RateEditedEventArgs
+                    {
+                        LegColumn = col,                         // använd den kolumn som editerades
+                        Field = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase) ? "Rd" : "Rf",
+                        WasMid = true,                           // UI tar single % idag → mid
+                        Mid = dec
+                    });
+
+                    //RaisePriceRequestedForLeg(col);
                     _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
                 }
                 return;
@@ -2698,6 +2725,47 @@ namespace FX.UI.WinForms
 
         #region === Market hooks (feed snapshot & apply) ===
 
+        /// <summary>
+        /// Visar user-override för RD/RF för ett specifikt ben (via LegId).
+        /// - Skriver ENDAST displayvärdet (Value) och sätter lila (MarkOverride(..., true)) på de fält som skickas in.
+        /// - Rör INTE feed-baseline (Tag) – baseline används för att kunna avgöra override robust i TryReadRatesForColumn.
+        /// - Stale-flaggor sätts som tooltip per fält.
+        /// - Partial override stöds: skicka null för den sida som INTE ska påverkas (färgas då inte).
+        /// </summary>
+        public void ShowRatesOverrideById(Guid legId, double? rdMid, double? rfMid, bool staleRd, bool staleRf)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            int rRd = R(L.Rd);
+            int rRf = R(L.Rf);
+            if (rRd < 0 || rRf < 0) return; // rd/rf-rader saknas i layouten
+
+            // RD – rör inte Tag (baseline), sätt bara display + lila
+            if (rdMid.HasValue)
+            {
+                var cRd = _dgv.Rows[rRd].Cells[col];
+                cRd.Value = FormatPercent(rdMid.Value, 3);
+                MarkOverride(L.Rd, col, true);
+                cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
+            }
+
+            // RF – rör inte Tag (baseline), sätt bara display + lila
+            if (rfMid.HasValue)
+            {
+                var cRf = _dgv.Rows[rRf].Cells[col];
+                cRf.Value = FormatPercent(rfMid.Value, 3);
+                MarkOverride(L.Rf, col, true);
+                cRf.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
+            }
+
+            _dgv.InvalidateRow(rRd);
+            _dgv.InvalidateRow(rRf);
+        }
+
+
+
+
         // NOTE: MARKET HOOKS
         // Dessa metoder (ApplyMarketSpot/Rate/Vol + SnapshotFeedFromGrid + Set/TryGet feed)
         // är avsedda för riktig marknadsdata senare. När en feed uppdaterar UI:
@@ -3060,6 +3128,50 @@ namespace FX.UI.WinForms
 
         /// <summary>True om cellen är markerad som override.</summary>
         private bool IsOverride(string label, string col) => _overrides.Contains(Key(label, col));
+
+        /// <summary>
+        /// Visar user-override för RD/RF för en specifik kolumn (ben).
+        /// Viktigt: den här metoden uppdaterar inte feed-baseline (Tag) utan bara visningsvärde + lila-markering.
+        /// Används när Store signalerar "UserRd:<leg>" / "UserRf:<leg>".
+        /// </summary>
+        /// <param name="col">Benets kolumnnamn, t.ex. "Vanilla 1".</param>
+        /// <param name="rdMid">RD (decimal, ex 0.0123 = 1.23%), eller null om oförändrat.</param>
+        /// <param name="rfMid">RF (decimal), eller null om oförändrat.</param>
+        /// <param name="staleRd">Stale-flagga för RD (visningshint). Påverkar inte baseline.</param>
+        /// <param name="staleRf">Stale-flagga för RF (visningshint). Påverkar inte baseline.</param>
+        public void ShowRatesOverride(string col, double? rdMid, double? rfMid, bool staleRd, bool staleRf)
+        {
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            // RD
+            if (rdMid.HasValue)
+            {
+                int rRd = FindRow(L.Rd);
+                var c = _dgv.Rows[rRd].Cells[col];
+
+                // Uppdatera endast display – lämna c.Tag (feed-baseline) orörd
+                c.Value = FormatPercent(rdMid.Value, 3);
+                MarkOverride(L.Rd, col, true);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[View.ShowRatesOverride] col={col} RD={rdMid.Value:F6} stale={staleRd}");
+            }
+
+            // RF
+            if (rfMid.HasValue)
+            {
+                int rRf = FindRow(L.Rf);
+                var c = _dgv.Rows[rRf].Cells[col];
+
+                // Uppdatera endast display – lämna c.Tag (feed-baseline) orörd
+                c.Value = FormatPercent(rfMid.Value, 3);
+                MarkOverride(L.Rf, col, true);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[View.ShowRatesOverride] col={col} RF={rfMid.Value:F6} stale={staleRf}");
+            }
+        }
+
 
         #endregion
 
@@ -4150,50 +4262,129 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
-        /// relativt feed-baseline. Värden returneras i decimal (0.0123 = 1.23%).
+        /// relativt FEED-baseline. 
+        /// 
+        /// Viktigt:
+        /// - Aktuellt UI-värde hämtas från cell.Value (det användaren ser/har editerat).
+        /// - FEED-baseline hämtas via TryGetFeedDouble(label, col, out feed).
+        /// - Override sätts ENDAST om |UI - FEED| > tolerans.
+        /// - Saknar vi FEED-baseline just nu -> override = false (kan ej avgöras).
+        /// 
+        /// Returnerar: 
+        ///   rd / rf i DECIMAL (ex: 0.0123 = 1.23%), samt rdOverride / rfOverride.
         /// </summary>
         public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
         {
-            rd = null; rf = null; rdOverride = false; rfOverride = false;
-            if (string.IsNullOrWhiteSpace(col)) return false;
+            rd = null; rf = null;
+            rdOverride = false; rfOverride = false;
 
-            // RD
+            if (string.IsNullOrWhiteSpace(col))
+                return false;
+
+            const double tol = 1e-9;
+
+            // === RD ===
             try
             {
                 int rRd = FindRow(L.Rd);
                 var cRd = _dgv.Rows[rRd].Cells[col];
-                if (cRd.Tag is double rdVal)
+
+                // 1) Läs aktuellt UI-värde (det användaren ser/har skrivit in).
+                if (TryParseCellValueAsDecimal(cRd?.Value, out var rdUi))
+                    rd = rdUi;
+                else if (cRd?.Tag is double rdBaselineFromTag)
+                    rd = rdBaselineFromTag; // fallback om cellen är tom -> returnera baseline som värde
+
+                // 2) Läs FEED-baseline och avgör override.
+                if (TryGetFeedDouble(L.Rd, col, out var rdFeed))
                 {
-                    rd = rdVal;
-                    double feed;
-                    if (TryGetFeedDouble(L.Rd, col, out feed))
-                        rdOverride = Math.Abs(feed - rdVal) > 1e-9;
-                    else
-                        rdOverride = true; // ingen baseline → behandla som override
+                    if (rd.HasValue)
+                        rdOverride = Math.Abs(rd.Value - rdFeed) > tol;
+                    // saknas rd => lämna rdOverride=false
+                }
+                else
+                {
+                    // Ingen FEED-baseline tillgänglig just nu → kan ej avgöra override -> false.
+                    rdOverride = false;
                 }
             }
-            catch { /* kolumn kan saknas tillfälligt */ }
+            catch
+            {
+                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
+            }
 
-            // RF
+            // === RF ===
             try
             {
                 int rRf = FindRow(L.Rf);
                 var cRf = _dgv.Rows[rRf].Cells[col];
-                if (cRf.Tag is double rfVal)
+
+                if (TryParseCellValueAsDecimal(cRf?.Value, out var rfUi))
+                    rf = rfUi;
+                else if (cRf?.Tag is double rfBaselineFromTag)
+                    rf = rfBaselineFromTag; // fallback
+
+                if (TryGetFeedDouble(L.Rf, col, out var rfFeed))
                 {
-                    rf = rfVal;
-                    double feed;
-                    if (TryGetFeedDouble(L.Rf, col, out feed))
-                        rfOverride = Math.Abs(feed - rfVal) > 1e-9;
-                    else
-                        rfOverride = true;
+                    if (rf.HasValue)
+                        rfOverride = Math.Abs(rf.Value - rfFeed) > tol;
+                }
+                else
+                {
+                    rfOverride = false;
                 }
             }
-            catch { /* kolumn kan saknas tillfälligt */ }
+            catch
+            {
+                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
+            }
 
-            return true;
+            // Returnera true om vi lyckades läsa något alls för RD eller RF
+            return rd.HasValue || rf.HasValue;
         }
 
+
+        /// <summary>
+        /// Robust parser av cell.Value till DECIMAL (0.0123 = 1.23%).
+        /// - Hanterar double/decimal direkt.
+        /// - Hanterar strängar med kultur (svenska/invariant).
+        /// - Om procenttecken (%) finns tolkar vi och dividerar med 100.
+        /// - Tar bort whitespace och vanliga symboler.
+        /// </summary>
+        private static bool TryParseCellValueAsDecimal(object value, out double result)
+        {
+            result = 0.0;
+
+            if (value == null)
+                return false;
+
+            // Direkta numeriska typer
+            if (value is double d) { result = d; return true; }
+            if (value is float f) { result = f; return true; }
+            if (value is decimal m) { result = (double)m; return true; }
+
+            // Strängparsing
+            if (value is string s)
+            {
+                var text = s.Trim();
+
+                // Kolla om procent anges
+                var hasPercent = text.Contains("%");
+
+                // Rensa bort %, mellanslag och icke-numeriska tecken utom .,,-+
+                text = Regex.Replace(text, @"[^\d\.,\-+Ee]", "");
+
+                // Försök med CurrentCulture först (svenska), sedan Invariant
+                if (double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out var v) ||
+                    double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                {
+                    result = hasPercent ? v / 100.0 : v;
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         public override Size GetPreferredSize(Size proposedSize)
         {
