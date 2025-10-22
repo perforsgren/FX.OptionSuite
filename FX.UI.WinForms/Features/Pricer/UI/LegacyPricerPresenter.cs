@@ -48,6 +48,8 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        private bool _suppressUiRatesWriteOnce;
+
         #region Constructor / Dispose
 
         /// <summary>
@@ -138,13 +140,14 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Hanterar användarens editering av expiry (Deal eller specifikt ben).
-        /// - Deal: resolve + apply för samtliga ben, invaliddera RD/RF för varje ben och prissätt alla.
-        /// - Ben: resolve + apply för just det benet, invaliddera RD/RF och prissätt bara det.
+        /// - Deal: resolve + apply för samtliga ben, nolla RD/RF-overrides, invaliddera RD/RF och prissätt alla (cache/TTL; ingen force).
+        /// - Ben: resolve + apply för benet, nolla RD/RF-overrides, invaliddera RD/RF och prissätt bara det.
         /// </summary>
         private void OnExpiryEditRequested(object sender, LegacyPricerView.ExpiryEditRequestedEventArgs e)
         {
             var pair6 = (e.Pair6 ?? _view.ReadPair6() ?? "EURSEK").Replace("/", "").ToUpperInvariant();
             var holidays = LoadHolidaysForPair(pair6);
+            var nowUtc = DateTime.UtcNow;
 
             // === Deal → alla ben ===
             if (string.Equals(e.LegColumn, "Deal", StringComparison.OrdinalIgnoreCase))
@@ -162,10 +165,18 @@ namespace FX.UI.WinForms
                         _view.ShowResolvedExpiryById(ls.LegId, r.ExpiryIso, wdEn, rawHint);
                         _view.ShowResolvedSettlementById(ls.LegId, r.SettlementIso);
 
-                        // Invalidera RD/RF för benet → cache-only re-derive vid prisning
-                        _mktStore.InvalidateRatesForLeg(pair6, ls.LegId.ToString(), DateTime.UtcNow);
+                        // 1) Nolla ev. overrides för RD/RF på benet (återgå till baseline)
+                        _mktStore.SetRdOverride(pair6, ls.LegId.ToString(), OverrideMode.None, nowUtc);
+                        _mktStore.SetRfOverride(pair6, ls.LegId.ToString(), OverrideMode.None, nowUtc);
 
-                        PriceSingleLeg(ls.LegId);
+                        // 2) Invaliddera RD/RF → cache-only re-derive vid prisning (ingen force)
+                        _mktStore.InvalidateRatesForLeg(pair6, ls.LegId.ToString(), nowUtc);
+
+                        // 3) Skippa UI→Store i nästföljande prisanrop (engång)
+                        _suppressUiRatesWriteOnce = true;
+
+                        // 4) Prissätt benet (cache/TTL + ingen återinförd override)
+                        PriceSingleLeg(ls.LegId, forceRefreshRates: false);
                     }
                     catch (Exception ex)
                     {
@@ -209,10 +220,18 @@ namespace FX.UI.WinForms
                 _view.ShowResolvedExpiryById(target.LegId, res.ExpiryIso, wd, hint);
                 _view.ShowResolvedSettlementById(target.LegId, res.SettlementIso);
 
-                // Invalidera RD/RF för det här benet → cache-only re-derive vid prisning
-                _mktStore.InvalidateRatesForLeg(pair6, target.LegId.ToString(), DateTime.UtcNow);
+                // 1) Nolla ev. overrides för RD/RF på benet
+                _mktStore.SetRdOverride(pair6, target.LegId.ToString(), OverrideMode.None, nowUtc);
+                _mktStore.SetRfOverride(pair6, target.LegId.ToString(), OverrideMode.None, nowUtc);
 
-                PriceSingleLeg(target.LegId);
+                // 2) Invaliddera RD/RF (cache-only)
+                _mktStore.InvalidateRatesForLeg(pair6, target.LegId.ToString(), nowUtc);
+
+                // 3) Skippa UI→Store i nästföljande prisanrop (engång)
+                _suppressUiRatesWriteOnce = true;
+
+                // 4) Prissätt benet (cache/TTL + ingen återinförd override)
+                PriceSingleLeg(target.LegId, forceRefreshRates: false);
             }
             catch (Exception ex)
             {
@@ -225,6 +244,7 @@ namespace FX.UI.WinForms
                 });
             }
         }
+
 
         /// <summary>
         /// Laddar helgdagstabell för givna kalenderkoder kopplade till valutaparet (pair6).
@@ -268,6 +288,8 @@ namespace FX.UI.WinForms
         /// Om <paramref name="forceRefreshRates"/> är true:
         ///   - Skippar att skriva UI-räntor till Store (vi vill inte reapplicera ev. gamla overrides)
         ///   - Runtime får ForceRefreshRates=true och hämtar färska RD/RF innan läsning.
+        /// NYTT: Om _suppressUiRatesWriteOnce är satt (t.ex. efter expiry-byte) så skippar vi
+        ///       också UI->Store i just det här anropet och nollställer flaggan (ingen force).
         /// </summary>
         private void PriceSingleLeg(Guid legId, bool forceRefreshRates)
         {
@@ -278,14 +300,24 @@ namespace FX.UI.WinForms
                 return;
             }
 
-            // Viktigt: vid force refresh ska vi INTE skriva UI->Store (annars riskerar vi re-override).
-            if (!forceRefreshRates)
+            var skipUiToStore = forceRefreshRates || _suppressUiRatesWriteOnce;
+
+            // Viktigt: vid force refresh eller engångssuppress ska vi INTE skriva UI->Store
+            if (!skipUiToStore)
             {
                 ApplyUiRatesToStore(legId);
             }
             else
             {
-                System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (ForceRefreshRates=true).");
+                if (_suppressUiRatesWriteOnce)
+                {
+                    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (expiry: suppress once).");
+                    _suppressUiRatesWriteOnce = false; // engångsflagga
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (ForceRefreshRates=true).");
+                }
             }
 
             var snap = _view.GetLegSnapshotById(legId);
@@ -391,10 +423,10 @@ namespace FX.UI.WinForms
         }
             };
 
-            // Vakt mot dubbelprisning under pågående call
             _pricingInFlight = true;
             _bus.Publish(cmd);
         }
+
 
 
 
