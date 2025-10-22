@@ -9,8 +9,6 @@ using FX.Core.Domain.MarketData;
 using FX.Services.MarketData;
 using System.Diagnostics;
 using System.Threading;
-using System.Linq;
-using FX.Services;
 using static FX.UI.WinForms.LegacyPricerView;
 
 namespace FX.UI.WinForms
@@ -46,9 +44,9 @@ namespace FX.UI.WinForms
         private DateTime _lastPriceFinishedUtc = DateTime.MinValue; //Tidpunkt då senaste priscall avslutades (för cooldown).
         private static readonly TimeSpan _rateWriteCooldown = TimeSpan.FromMilliseconds(200); // Kort buffert där vi ignorerar FeedRd/Rf efter nyss avslutad priscall. Hindrar “egen-skrivning → omedelbar dubbelprisning”.
 
-        #endregion
-
         private bool _suppressUiRatesWriteOnce;
+
+        #endregion
 
         #region Constructor / Dispose
 
@@ -949,33 +947,6 @@ namespace FX.UI.WinForms
             }
         }
 
-
-        /// <summary>
-        /// Parsar Batch-reason "Batch:Rd=1;Rf=1;Spot=0;Other=0 …" till fyra heltal.
-        /// </summary>
-        private static bool TryParseBatchCounts(string reason, out int rd, out int rf, out int spot, out int other)
-        {
-            rd = rf = spot = other = 0;
-            try
-            {
-                int Read(string key)
-                {
-                    var idx = reason.IndexOf(key, StringComparison.OrdinalIgnoreCase);
-                    if (idx < 0) return 0;
-                    idx += key.Length;
-                    int end = reason.IndexOfAny(new[] { ';', ' ', '\t' }, idx);
-                    string s = (end >= 0 ? reason.Substring(idx, end - idx) : reason.Substring(idx)).Trim();
-                    int val; return int.TryParse(s, out val) ? val : 0;
-                }
-                rd = Read("Rd=");
-                rf = Read("Rf=");
-                spot = Read("Spot=");
-                other = Read("Other=");
-                return true;
-            }
-            catch { return false; }
-        }
-
         /// <summary>
         /// Får normaliserad two-way Spot från vyn (Bid/Ask + WasMid) och skriver den som User till MarketStore.
         /// MarketStore kommer att trigga OnMarketChanged → RepriceAllLegs().
@@ -1155,14 +1126,29 @@ namespace FX.UI.WinForms
             }
         }
 
-
-
-
-
-
         #endregion
 
         #region Helpers
+
+        /// <summary>
+        /// Försöker extrahera legId (Guid) ur en orsakstext med mönster "FeedRd:{guid}" eller "FeedRf:{guid}".
+        /// Returnerar true vid lyckad parse.
+        /// </summary>
+        private static bool TryParseLegGuidFromReason(string reason, out Guid legId)
+        {
+            legId = Guid.Empty;
+            if (string.IsNullOrEmpty(reason)) return false;
+
+            string guidPart = null;
+
+            if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase))
+                guidPart = reason.Substring("FeedRd:".Length).Trim();
+            else if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase))
+                guidPart = reason.Substring("FeedRf:".Length).Trim();
+
+            if (string.IsNullOrEmpty(guidPart)) return false;
+            return Guid.TryParse(guidPart, out legId);
+        }
 
         /// <summary>
         /// Money-market year fraction (samma konvention som i feedern/runtime).
@@ -1278,87 +1264,6 @@ namespace FX.UI.WinForms
         private readonly List<LegState> _legStates = new List<LegState>();
 
         /// <summary>
-        /// Returnerar existerande LegState för en etikett (t.ex. "Vanilla 1") eller
-        /// skapar ett nytt med nytt LegId och registrerar det i _legStates.
-        /// </summary>
-        private LegState EnsureLegStateForLabel(string label)
-        {
-            if (string.IsNullOrWhiteSpace(label))
-                return null;
-
-            var existing = _legStates.Find(ls =>
-                string.Equals(ls.Label, label, StringComparison.OrdinalIgnoreCase));
-
-            if (existing != null) return existing;
-
-            var created = new LegState(Guid.NewGuid(), label);
-            _legStates.Add(created);
-            return created;
-        }
-
-        /// <summary>
-        /// Hittar ett ben via stabilt LegId (GUID). Returnerar null om det saknas.
-        /// </summary>
-        private LegState FindLegStateById(Guid legId)
-        {
-            if (legId == Guid.Empty) return null;
-            return _legStates.Find(ls => ls.LegId == legId);
-        }
-
-        /// <summary>
-        /// Hittar ett ben via nuvarande UI-etikett. Returnerar null om det saknas.
-        /// </summary>
-        private LegState FindLegStateByLabel(string label)
-        {
-            if (string.IsNullOrWhiteSpace(label)) return null;
-            return _legStates.Find(ls => string.Equals(ls.Label, label, StringComparison.OrdinalIgnoreCase));
-        }
-
-        /// <summary>
-        /// Försöker slå upp nuvarande visningsetikett för ett givet <paramref name="legId"/>.
-        /// Returnerar <c>true</c> om benet fanns; annars <c>false</c>.
-        /// </summary>
-        private bool TryGetLabelByLegId(Guid legId, out string label)
-        {
-            label = null;
-            var ls = FindLegStateById(legId);
-            if (ls == null) return false;
-            label = ls.Label;
-            return true;
-        }
-
-        /// <summary>
-        /// Uppdaterar/registrerar en etikett för ett givet <paramref name="legId"/> utan att
-        /// ändra identiteten (används vid renummerering; stabilt id behålls).
-        /// Skapar inget nytt ben om id saknas (returnerar <c>false</c> i så fall).
-        /// </summary>
-        private bool UpdateLabelForLeg(Guid legId, string newLabel)
-        {
-            var ls = FindLegStateById(legId);
-            if (ls == null) return false;
-            ls.Label = newLabel ?? string.Empty;
-            return true;
-        }
-
-        /// <summary>
-        /// Hittar första lediga UI-kolumn (leg) genom att jämföra vy:ns ben-kolumner
-        /// med etiketter som redan används av våra LegState-objekt.
-        /// Returnerar kolumnnamn (t.ex. "Vanilla 2") eller null om inga lediga finns.
-        /// </summary>
-        private string FindFirstFreeUiLegColumn()
-        {
-            var all = _view.GetLegColumns(); // från vyn
-            var used = new HashSet<string>(_legStates.Select(ls => ls.Label),
-                                           StringComparer.OrdinalIgnoreCase);
-
-            foreach (var col in all)
-                if (!used.Contains(col))
-                    return col;
-
-            return null;
-        }
-
-        /// <summary>
         /// Skapar ett nytt ben sist i listan med ett nytt stabilt <see cref="Guid"/> och
         /// etikett "Vanilla N". Säkerställer att UI-kolumnen finns via vyn och binder Id↔label.
         /// </summary>
@@ -1379,8 +1284,6 @@ namespace FX.UI.WinForms
 
             return newId;
         }
-
-
 
         /// <summary>
         /// Klonar ett befintligt ben: skapar ett nytt ben direkt efter källbenet
@@ -1485,11 +1388,9 @@ namespace FX.UI.WinForms
             _view.BindLegIdToLabel(legId, newLabel);
         }
 
-
-
         #endregion
 
-        #region UI pushers
+        #region #region UI sync (Store→UI & UI→Store)
 
         /// <summary>
         /// UI-push för RD/RF för ett specifikt ben:
@@ -1585,9 +1486,6 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushRatesUiAllLegs: " + ex.Message);
             }
         }
-
-        #endregion
-
 
         /// <summary>
         /// Beräknar Forward Rate och Forward Points för ett specifikt ben (legId)
@@ -1690,8 +1588,6 @@ namespace FX.UI.WinForms
             }
         }
 
-
-
         /// <summary>
         /// Kör PushForwardUiForLeg för alla ben.
         /// </summary>
@@ -1700,68 +1596,6 @@ namespace FX.UI.WinForms
             for (int i = 0; i < _legStates.Count; i++)
                 PushForwardUiForLeg(_legStates[i].LegId);
         }
-
-        /// <summary>
-        /// Returnerar (wasMid, viewMode) givet hur RD/RF matas in från UI.
-        /// Idag matar vi in ett singeltal ⇒ tolka som Mid-låsning och TwoWay-visning.
-        /// </summary>
-        private (bool wasMid, ViewMode viewMode) InferRateInputModeFromUi()
-        {
-            // Enkelt läge: singeltal i UI ⇒ lås MID, visa TwoWay i gridden.
-            return (wasMid: true, viewMode: ViewMode.TwoWay);
-        }
-
-
-        /// <summary>
-        /// True om MarketStore-orsaken handlar om RD/RF (Feed/Override/ViewMode) och
-        /// *inte* innehåller spot. Hanterar även batch där endast RD/RF uppdaterats.
-        /// </summary>
-        private static bool IsRateOnlyReason(string reason)
-        {
-            if (string.IsNullOrEmpty(reason)) return false;
-
-            // Direkta rate-signaler
-            if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase)) return true;
-            if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase)) return true;
-            if (reason.StartsWith("RdOverride", StringComparison.OrdinalIgnoreCase)) return true;
-            if (reason.StartsWith("RfOverride", StringComparison.OrdinalIgnoreCase)) return true;
-            if (reason.StartsWith("RdViewMode", StringComparison.OrdinalIgnoreCase)) return true;
-            if (reason.StartsWith("RfViewMode", StringComparison.OrdinalIgnoreCase)) return true;
-
-            // Batch: "Batch:Rd=1;Rf=1;Spot=0;Other=0"
-            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
-            {
-                var s = reason.ToUpperInvariant();
-                var hasRd = s.Contains("RD=") && !s.Contains("RD=0");
-                var hasRf = s.Contains("RF=") && !s.Contains("RF=0");
-                var hasSpot = s.Contains("SPOT=") && !s.Contains("SPOT=0");
-                return (hasRd || hasRf) && !hasSpot;
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// Försöker extrahera legId (Guid) ur en orsakstext med mönster "FeedRd:{guid}" eller "FeedRf:{guid}".
-        /// Returnerar true vid lyckad parse.
-        /// </summary>
-        private static bool TryParseLegGuidFromReason(string reason, out Guid legId)
-        {
-            legId = Guid.Empty;
-            if (string.IsNullOrEmpty(reason)) return false;
-
-            string guidPart = null;
-
-            if (reason.StartsWith("FeedRd:", StringComparison.OrdinalIgnoreCase))
-                guidPart = reason.Substring("FeedRd:".Length).Trim();
-            else if (reason.StartsWith("FeedRf:", StringComparison.OrdinalIgnoreCase))
-                guidPart = reason.Substring("FeedRf:".Length).Trim();
-
-            if (string.IsNullOrEmpty(guidPart)) return false;
-            return Guid.TryParse(guidPart, out legId);
-        }
-
-
 
         /// <summary>
         /// Läser UI-räntor (RD/RF) för benets kolumn och skriver User-override till MarketStore
@@ -1882,6 +1716,8 @@ namespace FX.UI.WinForms
                     System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] RF IGNORE (ovRf=false) leg={legId} ui={uiRf.Value:F6}");
             }
         }
+
+        #endregion
 
     }
 }

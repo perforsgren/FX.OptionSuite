@@ -9,7 +9,6 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using FX.Core.Domain.MarketData;
-using static FX.UI.WinForms.LegacyPricerView;
 
 namespace FX.UI.WinForms
 {
@@ -150,6 +149,8 @@ namespace FX.UI.WinForms
         // Feed-baslinje per cell (logiskt värde: double eller VolCellData)
         private readonly Dictionary<string, object> _feedValue = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
+        // Intern cache för tvåvägs-premie per cell (label|col)
+        private readonly Dictionary<string, PremiumCellData> _twoWayPremCache = new Dictionary<string, PremiumCellData>(StringComparer.Ordinal);
 
         private enum PricingCurrency { Quote, Base } // default: Quote
         private PricingCurrency _pricingCurrency = PricingCurrency.Quote;
@@ -214,11 +215,11 @@ namespace FX.UI.WinForms
         /// Vyn ber Presentern nolla override för ett specifikt benfält (RD/RF) i Store.
         /// </summary>
         public event EventHandler<RateClearOverrideRequestedEventArgs> RateClearOverrideRequested;
-        
+
 
         #endregion
 
-        #region === EventArgs
+        #region === EventArgs (UI→Presenter)
 
         /// <summary>Event-data när användaren editerat Spot i gridet.</summary>
         public sealed class SpotEditedEventArgs : EventArgs
@@ -1433,67 +1434,6 @@ namespace FX.UI.WinForms
             // Andra tangenter: inget specialfall här
         }
 
-
-        /// <summary>
-        /// KeyDown på DGV:
-        /// - Backspace: starta edit och markera allt (om cellen inte är readonly/sektion).
-        /// - Delete: låt RD/RF i benkolumn bubbla upp till ProcessCmdKey (som hanterar baseline-återställning),
-        ///           men gör Delete stumt för alla andra fall (handled+suppressed).
-        /// - Spot/Deal-blockering bibehållen för Delete/Back om så önskas via readonly.
-        /// </summary>
-        private void Dgv_KeyDownStartEditOLD(object sender, KeyEventArgs e)
-        {
-            var cell = _dgv.CurrentCell;
-            if (cell == null) return;
-
-            // --- Backspace: gå in i edit-läge och markera hela innehållet (icke-readonly) ---
-            if (e.KeyCode == Keys.Back)
-            {
-                if (!cell.ReadOnly && !IsSectionRow(_dgv.Rows[cell.RowIndex]))
-                {
-                    _dgv.BeginEdit(true);
-                    if (_dgv.EditingControl is TextBox tb)
-                    {
-                        tb.SelectionStart = 0;
-                        tb.SelectionLength = tb.TextLength;
-                    }
-                    _dgv.InvalidateCell(cell.ColumnIndex, cell.RowIndex);
-                }
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                return;
-            }
-
-            // --- Delete: stumt överallt utom RD/RF i benkolumn (de fall ska ProcessCmdKey ta) ---
-            if (e.KeyCode == Keys.Delete)
-            {
-                string lbl = Convert.ToString(_dgv.Rows[cell.RowIndex].Cells["FIELD"].Value);
-                string colName = _dgv.Columns[cell.ColumnIndex].Name;
-
-                bool isLegCol = !string.Equals(colName, "Deal", StringComparison.OrdinalIgnoreCase);
-                bool isRd = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase);
-                bool isRf = string.Equals(lbl, L.Rf, StringComparison.OrdinalIgnoreCase);
-
-                if (isLegCol && (isRd || isRf))
-                {
-                    // Låt ProcessCmdKey hantera Delete → baseline-återställning + nolla override i Store
-                    return; // inte handled
-                }
-
-                // Alla andra: Delete stumt
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                return;
-            }
-
-            // Övriga tangenter: inget specialfall här
-        }
-
-
-
-
-
-
         // ========= MouseDown: markera "pressed" + blockera att FIELD fäller sektionen =========
         private void Dgv_CellMouseDown_PricingButton(object sender, DataGridViewCellMouseEventArgs e)
         {
@@ -2111,6 +2051,76 @@ namespace FX.UI.WinForms
             return path;
         }
 
+        // True om (row,col) är Pricing-rubriken OCH e.Location ligger inuti chipet
+        private bool IsInsidePricingHeaderButton(DataGridViewCellMouseEventArgs e)
+        {
+            if (e.RowIndex != _pricingHeaderRow) return false;
+            if (e.ColumnIndex != _dgv.Columns["FIELD"].Index) return false;
+
+            // _pricingBtnRect är "lokal" rect vi satte i CellPainting (relativt cellens 0,0)
+            if (_pricingBtnRect.IsEmpty) return false;
+
+            // e.Location är också lokal i cellen → direkt jämförelse
+            return _pricingBtnRect.Contains(e.Location);
+        }
+
+        // Bara en bekväm invalidation för chipet
+        private void InvalidatePricingHeaderCell()
+        {
+            if (_pricingHeaderRow >= 0)
+                _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, _pricingHeaderRow);
+        }
+
+        private void InvalidateSpotModeButton()
+        {
+            int r = R(L.Spot);
+            if (r >= 0)
+                _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, r);
+        }
+
+        private bool IsInsideMktHeaderButton(DataGridViewCellMouseEventArgs e)
+        {
+            if (_mktHeaderRow < 0) return false;
+            if (e.RowIndex != _mktHeaderRow) return false;
+            if (!_dgv.Columns.Contains("FIELD")) return false;
+            if (_mktBtnRect == Rectangle.Empty) return false;
+
+            // Cellens display-rect (absolut)
+            var cellRect = _dgv.GetCellDisplayRectangle(_dgv.Columns["FIELD"].Index, e.RowIndex, true);
+            if (cellRect.Width <= 0 || cellRect.Height <= 0) return false;
+
+            // Knappens absoluta rect = cellens abs + lokal knapp-rect
+            var btnAbs = new Rectangle(cellRect.X + _mktBtnRect.X, cellRect.Y + _mktBtnRect.Y, _mktBtnRect.Width, _mktBtnRect.Height);
+            var pt = _dgv.PointToClient(Cursor.Position);
+            return btnAbs.Contains(pt);
+        }
+
+        #endregion
+
+        #region === Geometry (glyph hit test) ===
+
+        /// <summary>Beräknar lokal rektangel för glyph-pilen i en cell.</summary>
+        private static Rectangle GetGlyphRectLocal(Rectangle cellBounds)
+        {
+            int x = cellBounds.Width - (GlyphRightPadding + GlyphWidth / 2);
+            int y = (cellBounds.Height - GlyphHeight) / 2 + 1;
+            return new Rectangle(x - 2, y - 2, GlyphWidth + 4, GlyphHeight + 4);
+        }
+
+        /// <summary>True om kolumnnamnet motsvarar ett ben.</summary>
+        private bool IsLegColumn(string colName) => Array.IndexOf(_legs, colName) >= 0;
+
+        /// <summary>True om raden är en sektionsrad (ej Deal Details).</summary>
+        private static bool IsSectionRow(DataGridViewRow row)
+        {
+            if (row == null) return false;
+            if (row.Tag is Section s && s == Section.DealDetails) return false;
+            var txt = Convert.ToString(row.Cells["FIELD"].Value);
+            if (string.IsNullOrEmpty(txt)) return false;
+            txt = txt.TrimStart();
+            return txt.StartsWith("▾") || txt.StartsWith("▸");
+        }
+
         #endregion
 
         #region === Collapse & Toggles ===
@@ -2243,6 +2253,473 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region === Notional + formatting helpers ===
+
+        // Formatter skapas on-demand utifrån pair och vald display-ccy
+        private PricingFormatter CreateFormatter()
+        {
+            var pair6 = ReadPair6();
+            var quote = (pair6 != null && pair6.Length >= 6) ? pair6.Substring(3, 3).ToUpperInvariant() : "SEK";
+            var ffCcy = (_displayCcy == DisplayCcy.Quote)
+                ? PricingFormatter.DisplayCcy.Quote
+                : PricingFormatter.DisplayCcy.Base;
+            return new PricingFormatter(quote, ffCcy);
+        }
+        /// <summary>Parsar notional med suffix (k/m/bn) och returnerar värde + precision.</summary>
+        private static bool TryParseNotional(string raw, out double value, out int decimals, out bool allZero)
+        {
+            value = 0.0; decimals = 0; allZero = false;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+
+            string s = raw.Trim().Replace(" ", "").Replace("\u00A0", "");
+            s = s.Replace(',', '.');
+
+            double factor = 1.0;
+            if (s.Length > 0)
+            {
+                char last = s[s.Length - 1];
+                char c = char.ToLowerInvariant(last);
+                if (char.IsLetter(c))
+                {
+                    s = s.Substring(0, s.Length - 1);
+                    if (c == 'k') factor = 1_000d;
+                    else if (c == 'm') factor = 1_000_000d;
+                    else if (c == 'b' || c == 'y') factor = 1_000_000_000d;
+                    else return false;
+                }
+            }
+
+            int dot = s.IndexOf('.');
+            if (dot >= 0 && dot < s.Length - 1)
+            {
+                string dec = s.Substring(dot + 1);
+                decimals = dec.Length;
+                allZero = IsAllZero(dec);
+            }
+
+            double core;
+            if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out core))
+                return false;
+
+            value = core * factor;
+            return true;
+        }
+
+        private static string FormatFixed(double v, int decimals)
+        {
+            return v.ToString("F" + decimals, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>True om alla tecken i strängen är '0' och strängen ej tom.</summary>
+        private static bool IsAllZero(string t)
+        {
+            for (int i = 0; i < t.Length; i++)
+                if (t[i] != '0') return false;
+            return t.Length > 0;
+        }
+
+        /// <summary>
+        /// Formaterar notional: om det skalade värdet är heltal → 0 d.p.,
+        /// annars behåll minsta nödvändiga d.p. baserat på input.
+        /// </summary>
+        private static string FormatNotional(double value, int decimalsFromInput, bool allZeroFromInput)
+        {
+            int d = IsEffectivelyInteger(value) ? 0
+                    : (allZeroFromInput ? 0 : Math.Max(0, decimalsFromInput));
+
+            string text = value.ToString("N" + d, CultureInfo.InvariantCulture);
+            return text.Replace(",", " ");
+        }
+
+        /// <summary>Formattering med mellanslag som tusentalsavskiljare.</summary>
+        private static string FmtSpaces(double v, int decimals = 6)
+        {
+            var s = v.ToString("N" + decimals, CultureInfo.InvariantCulture);
+            return s.Replace(",", " ");
+        }
+
+        /// <summary>Side→"Buy"/"Sell".</summary>
+        private static bool TryCanonicalizeSide(string raw, out string canon)
+        {
+            canon = null;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            var s = raw.Trim().ToLowerInvariant();
+            if (s == "b" || s == "buy" || s == "köp") { canon = "Buy"; return true; }
+            if (s == "s" || s == "sell" || s == "sälj") { canon = "Sell"; return true; }
+            return false;
+        }
+
+        /// <summary>Payoff→"Call"/"Put".</summary>
+        private static bool TryCanonicalizePayoff(string raw, out string canon)
+        {
+            canon = null;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            var s = raw.Trim().ToLowerInvariant();
+            if (s == "c" || s == "call") { canon = "Call"; return true; }
+            if (s == "p" || s == "put") { canon = "Put"; return true; }
+            return false;
+        }
+
+        /// <summary>+1 för Buy, −1 för Sell, default +1.</summary>
+        private int SideSign(string col)
+        {
+            var s = Convert.ToString(_dgv.Rows[R(L.Side)].Cells[col].Value ?? "");
+            if (s.IndexOf("SELL", StringComparison.OrdinalIgnoreCase) >= 0) return -1;
+            if (s.IndexOf("BUY", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
+            return 1;
+        }
+
+        /// <summary>Spot: minst N decimaler, men behåll fler om användaren skrev fler.</summary>
+        private static string FormatSpotWithMinDecimals(string raw, double numeric, int minDecimals)
+        {
+            int userDecs = CountDecimalsInRaw(raw);
+            int decs = Math.Max(minDecimals, userDecs);
+            string fmt = "0." + new string('0', decs);
+            return numeric.ToString(fmt, CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Räknar antal decimaler i råtext (hanterar ',' '.' och mellanslag).</summary>
+        private static int CountDecimalsInRaw(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return 0;
+            string s = raw.Trim().Replace(" ", "").Replace("\u00A0", "").Replace(',', '.');
+            int i = s.IndexOf('.');
+            if (i < 0 || i == s.Length - 1) return 0;
+            return Math.Max(0, s.Length - 1 - i);
+        }
+
+        /// <summary>Robust heltalskontroll för double.</summary>
+        private static bool IsEffectivelyInteger(double v)
+        {
+            return Math.Abs(v - Math.Round(v)) < 1e-9;
+        }
+
+        /// <summary>Double-jämförelse med epsilon.</summary>
+        private static bool Eq(double a, double b, double eps = 1e-9) => Math.Abs(a - b) <= eps;
+
+        /// <summary>Jämförelse av vol-par med epsilon.</summary>
+        private static bool Eq(VolCellData a, VolCellData b, double eps = 1e-9)
+        {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+            return Eq(a.Bid, b.Bid, eps) && Eq(a.Ask, b.Ask, eps);
+        }
+
+        /// <summary>Vol-input: ”5” ⇒ mid; ”5/6” eller ”5 6” ⇒ bid/ask (procent).</summary>
+        private static bool TryParseVolInput(string raw, out double bid, out double ask, out bool isPair)
+        {
+            bid = ask = 0; isPair = false;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+
+            string s = raw.Trim().Replace("\u00A0", " ");
+            s = s.Replace(',', '.').ToLowerInvariant();
+
+            string[] tokens;
+            if (s.Contains("/"))
+            {
+                tokens = s.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            else
+            {
+                tokens = System.Text.RegularExpressions.Regex
+                         .Split(s, "\\s+")
+                         .Where(t => !string.IsNullOrWhiteSpace(t))
+                         .ToArray();
+            }
+
+            if (tokens.Length == 1)
+            {
+                if (!TryParsePercentToDecimal(tokens[0], out double mid)) return false;
+                bid = ask = mid; isPair = false; return true;
+            }
+            else if (tokens.Length == 2)
+            {
+                if (!TryParsePercentToDecimal(tokens[0], out double b)) return false;
+                if (!TryParsePercentToDecimal(tokens[1], out double a)) return false;
+                bid = b; ask = a; isPair = true; return true;
+            }
+            return false;
+        }
+
+        /// <summary>Formaterar tvåvägsvol som ”bid / ask”.</summary>
+        private static string FormatPercentPair(double bidDec, double askDec, int decimals = 2)
+        {
+            return FormatPercent(bidDec, decimals) + " / " + FormatPercent(askDec, decimals);
+        }
+
+        /// <summary>Klonar vol-objekt.</summary>
+        private static VolCellData CloneVol(VolCellData v)
+        {
+            return v == null ? null : new VolCellData { Bid = v.Bid, Ask = v.Ask };
+        }
+
+        #endregion
+
+        #region === Vol & vol spread
+
+        /// <summary>
+        /// Recalc Vol Spread (Ask - Bid) för alla legs. Visar 3 dp och sparar decimal i Tag.
+        /// </summary>
+        private void RecalcVolSpreadForAllLegs()
+        {
+            int rVol = FindRow(L.Vol);
+            int rSpr = FindRow(L.VolSprd);
+            if (rVol < 0 || rSpr < 0) return;
+
+            foreach (var leg in _legs)
+            {
+                var cVol = _dgv.Rows[rVol].Cells[leg];
+                double bid = 0.0, ask = 0.0;
+
+                if (cVol.Tag is VolCellData vd)
+                {
+                    bid = vd.Bid;
+                    ask = vd.Ask > 0.0 ? vd.Ask : vd.Bid;
+                }
+                else
+                {
+                    // fallback: parse display (”5/6”, ”5 6” eller ”5”)
+                    double b, a; bool isPair;
+                    if (TryParseVolInput(Convert.ToString(cVol.Value ?? ""), out b, out a, out isPair))
+                    { bid = b; ask = isPair ? a : b; }
+                    else
+                    { bid = ask = 0.0; }
+                }
+
+                double spr = Math.Max(0.0, ask - bid);
+                var cSpr = _dgv.Rows[rSpr].Cells[leg];
+                cSpr.Tag = spr;                     // decimal (t.ex. 0.010)
+                cSpr.Value = FormatPercent(spr, 3); // ”1.000%”
+            }
+        }
+
+
+        /// <summary>Skriver Vol (bid/ask) till cell + Tag och normaliserar visning till 3 dp.</summary>
+        private void WriteVolFromBidAsk(string col, double bid, double ask)
+        {
+            int rVol = FindRow(L.Vol);
+            if (rVol < 0) return;
+            var cVol = _dgv.Rows[rVol].Cells[col];
+
+            if (ask < bid) { var t = bid; bid = ask; ask = t; } // säkerställ ask ≥ bid
+            cVol.Tag = new VolCellData { Bid = bid, Ask = ask };
+            cVol.Value = (Math.Abs(ask - bid) < 1e-12)
+                ? FormatPercent(bid, 3)                // singel (mid) visning "x.xxx%"
+                : FormatPercentPair(bid, ask, 3);      // tvåvägs "x.xxx% / y.yyy%"
+        }
+
+        /// <summary>Returnerar (bid, ask, mid) för en kolumn (leg) från Vol-cellen.</summary>
+        private (double bid, double ask, double mid) ReadVolTriplet(string col)
+        {
+            int rVol = FindRow(L.Vol);
+            if (rVol < 0) return (0, 0, 0);
+            var cVol = _dgv.Rows[rVol].Cells[col];
+
+            double bid, ask; bool twoWay;
+            if (cVol.Tag is VolCellData vd)
+            {
+                bid = vd.Bid; ask = (vd.Ask > 0.0 ? vd.Ask : vd.Bid);
+                twoWay = (vd.Ask > 0.0 && vd.Ask != vd.Bid);
+            }
+            else
+            {
+                if (!TryParseVolInput(Convert.ToString(cVol.Value ?? ""), out bid, out ask, out twoWay))
+                    bid = ask = 0.0;
+                if (!twoWay) ask = bid;
+            }
+            double mid = 0.5 * (bid + ask);
+            return (bid, ask, mid);
+        }
+
+        /// <summary>
+        /// Applicera en Vol spread (decimal) från Deal till alla legs:
+        /// bid_leg = mid_leg − spr/2, ask_leg = mid_leg + spr/2.
+        /// Skriver Vol (3 dp) och uppdaterar legs Vol spread (3 dp).
+        /// </summary>
+        private void ApplyVolSpreadFromDealToLegs(double spr)
+        {
+            if (spr < 0) spr = 0.0;
+            double half = 0.5 * spr;
+
+            foreach (var leg in _legs)
+            {
+                var (b, a, mid) = ReadVolTriplet(leg);
+                double nbid = Math.Max(0.0, mid - half);
+                double nask = mid + half;
+
+                WriteVolFromBidAsk(leg, nbid, nask);
+                MarkOverride(L.Vol, leg, true); // användarstyrt från Deal spridning
+            }
+
+            // skriv samtidigt Vol spread (3 dp) per leg
+            RecalcVolSpreadForAllLegs();
+        }
+
+        #endregion
+
+        #region === Spot ===
+
+        // Invalidera hela Spot-raden (Deal + alla ben)
+        private void InvalidateSpotRow()
+        {
+            int r = R(L.Spot);
+            if (r >= 0) _dgv.InvalidateRow(r);
+        }
+
+        /// <summary>
+        /// Ser till att Spot-celler (Deal + alla ben) har SpotCellData i Tag.
+        /// Om Tag saknas byggs den från visad mid (Value) med bid=ask=mid.
+        /// </summary>
+        private void EnsureSpotSnapshotsForAll()
+        {
+            int rSpot = R(L.Spot);
+            if (rSpot < 0) return;
+
+            void ensure(string col)
+            {
+                var cell = _dgv.Rows[rSpot].Cells[col];
+
+                // --- Viktigt: skriv aldrig över befintligt tvåvägs-Tag ---
+                if (cell.Tag is SpotCellData) return;
+
+                // Skapa minsta möjliga snapshot (mid/mid) från visat värde om Tag saknas
+                double mid;
+                if (!TryParseCellNumber(cell.Value, out mid) || mid <= 0.0) return;
+
+                cell.Tag = new SpotCellData
+                {
+                    Bid = mid,
+                    Mid = mid,
+                    Ask = mid,
+                    TimeUtc = DateTime.UtcNow,
+                    Source = "Derived"
+                };
+            }
+
+            ensure("Deal");
+            for (int i = 0; i < _legs.Length; i++)
+                ensure(_legs[i]);
+        }
+
+        /// <summary>
+        /// Visar spot från FEED (F5) i Deal + alla ben, med exakt 4 d.p. på display.
+        /// Viktigt: använder WriteSpotTwoWayToCell för att:
+        ///  - uppdatera feed-baseline (för jämförelse mot manuella ändringar),
+        ///  - släcka eventuell lila override-färg (MarkOverride(..., false)) för FEED.
+        /// Därmed försvinner lila efter F5 och Deal-kolumnen visar färskt värde.
+        /// </summary>
+        public void ShowSpotFeedFixed4(double bid, double ask)
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0) return;
+
+            // Deal – låt helpern räkna mid och sköta baseline + override off
+            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "Feed");
+
+            // Ben – samma visning, baseline & override-off per kolumn
+            for (int i = 0; i < _legs.Length; i++)
+            {
+                var lg = _legs[i];
+                if (!_dgv.Columns.Contains(lg)) continue;
+
+                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "Feed");
+            }
+        }
+
+
+        /// <summary>
+        /// Visar spot som kommer från USER (manuell input) i Deal + alla ben, med exakt 4 d.p.
+        /// Viktigt: sätter override (lila) PÅ. Baseline lämnas oförändrad så att
+        /// lila-indikeringen kvarstår tills feed tar över (F5) eller användaren nollställer.
+        /// </summary>
+        public void ShowSpotUserFixed4(double bid, double ask)
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0) return;
+
+            // Deal – markera override = true (lila)
+            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "User");
+            MarkOverride(L.Spot, "Deal", true);
+
+            // Ben – samma markering, per kolumn
+            for (int i = 0; i < _legs.Length; i++)
+            {
+                var lg = _legs[i];
+                if (!_dgv.Columns.Contains(lg)) continue;
+
+                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "User");
+                MarkOverride(L.Spot, lg, true);
+            }
+        }
+
+        /// <summary>
+        /// Returnerar hur många decimaler som UI *visar* för Spot i Deal-kolumnen.
+        /// - Minst 4.
+        /// - Om användaren skrev fler än 4, returneras det högsta antalet d.p. som syns.
+        /// Robust mot både "mid"-visning och "bid/ask"-visning.
+        /// </summary>
+        public int GetSpotUiDecimals()
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0) return 4;
+
+            var val = Convert.ToString(_dgv.Rows[rSpot].Cells["Deal"].Value ?? "");
+            if (string.IsNullOrWhiteSpace(val))
+            {
+                // Deal kan vara tom vid push till legs – ta första leg som finns
+                foreach (var lg in _legs)
+                {
+                    if (!_dgv.Columns.Contains(lg)) continue;
+                    var s = Convert.ToString(_dgv.Rows[rSpot].Cells[lg].Value ?? "");
+                    var d = CountDecimalsInSpotDisplay(s);
+                    if (d > 0) return Math.Max(4, d);
+                }
+                return 4;
+            }
+
+            var decs = CountDecimalsInSpotDisplay(val);
+            return Math.Max(4, decs);
+        }
+
+        /// <summary>
+        /// Räknar decimaler i en spot-displaysträng. Stödjer "x.y" och "x.y/z.w".
+        /// Komma tolkas som decimalpunkt.
+        /// </summary>
+        private static int CountDecimalsInSpotDisplay(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return 0;
+            s = s.Trim().Replace(',', '.');
+
+            // Two-way?
+            var sep = s.IndexOf('/');
+            if (sep >= 0)
+            {
+                var left = s.Substring(0, sep).Trim();
+                var right = s.Substring(sep + 1).Trim();
+                return Math.Max(DecimalsOfNumber(left), DecimalsOfNumber(right));
+            }
+
+            // Mid
+            return DecimalsOfNumber(s);
+        }
+
+        private static int DecimalsOfNumber(string num)
+        {
+            if (string.IsNullOrWhiteSpace(num)) return 0;
+            var p = num.IndexOf('.');
+            if (p < 0) return 0;
+            int count = 0;
+            for (int i = p + 1; i < num.Length; i++)
+            {
+                var c = num[i];
+                if (c >= '0' && c <= '9') count++;
+                else break; // sluta vid första icke-siffra
+            }
+            return count;
+        }
+
+        #endregion
+
         #region === Data helpers (find/set/copy) ===
 
         /// <summary>Returnerar radindex för ett givet radnamn (icke-sektionsrad), annars -1.</summary>
@@ -2300,33 +2777,194 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region === Geometry (glyph hit test) ===
-
-        /// <summary>Beräknar lokal rektangel för glyph-pilen i en cell.</summary>
-        private static Rectangle GetGlyphRectLocal(Rectangle cellBounds)
-        {
-            int x = cellBounds.Width - (GlyphRightPadding + GlyphWidth / 2);
-            int y = (cellBounds.Height - GlyphHeight) / 2 + 1;
-            return new Rectangle(x - 2, y - 2, GlyphWidth + 4, GlyphHeight + 4);
-        }
-
-        /// <summary>True om kolumnnamnet motsvarar ett ben.</summary>
-        private bool IsLegColumn(string colName) => Array.IndexOf(_legs, colName) >= 0;
-
-        /// <summary>True om raden är en sektionsrad (ej Deal Details).</summary>
-        private static bool IsSectionRow(DataGridViewRow row)
-        {
-            if (row == null) return false;
-            if (row.Tag is Section s && s == Section.DealDetails) return false;
-            var txt = Convert.ToString(row.Cells["FIELD"].Value);
-            if (string.IsNullOrEmpty(txt)) return false;
-            txt = txt.TrimStart();
-            return txt.StartsWith("▾") || txt.StartsWith("▸");
-        }
-
-        #endregion
-
         #region === UI API used by Presenter ===
+
+        // === VYN: mata in tvåvägs per-unit från presentern ===
+        public void ShowTwoWayPremiumFromPerUnit(string legCol, double pricePerUnitBid, double pricePerUnitAsk)
+        {
+            // Cacha per-unit tvåväg (overlay, 6 d.p.)
+            _twoWayPremCache[PremKey(L.PremUnit, legCol)] = new PremiumCellData
+            {
+                Bid = pricePerUnitBid,
+                Ask = pricePerUnitAsk,
+                Decimals = 6
+            };
+
+            // Bygg även tvåvägs TOTAL i nuvarande visningsvaluta så overlayn är rätt direkt
+            double N = ReadNotional(legCol);
+            double S = ReadSpot(legCol);
+            int sg = SideSign(legCol);
+
+            double totBidQuote = pricePerUnitBid * N * sg;
+            double totAskQuote = pricePerUnitAsk * N * sg;
+
+            bool showQuote = (_pricingCurrency == PricingCurrency.Quote);
+            double totBidDisp = showQuote ? totBidQuote : (S != 0.0 ? totBidQuote / S : 0.0);
+            double totAskDisp = showQuote ? totAskQuote : (S != 0.0 ? totAskQuote / S : 0.0);
+
+            _twoWayPremCache[PremKey(L.PremTot, legCol)] = new PremiumCellData
+            {
+                Bid = totBidDisp,
+                Ask = totAskDisp,
+                Decimals = 2
+            };
+
+            // Rita om premiumraderna för benet
+            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremUnit));
+            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremTot));
+        }
+
+        /// <summary>
+        /// Visar RD/RF från FEED för ett specifikt ben (via LegId) som "baseline":
+        /// - Sätter både Tag (logiskt decimalvärde) och Value (formaterad text) för RD/RF.
+        /// - Lagrar baseline i _feedValue via SetFeedValue(...) så TryGetFeedDouble fungerar robust
+        ///   (viktigt för Delete-reset och för override-jämförelser).
+        /// - Släcker lila (MarkOverride(..., false)) för båda sidor.
+        /// - Sätter ev. stale-hint i tooltip.
+        /// </summary>
+        public void ShowRatesById(Guid legId, double? rdDec, double? rfDec, bool staleRd, bool staleRf)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            int rRd = R(L.Rd);
+            int rRf = R(L.Rf);
+            if (rRd < 0 || rRf < 0) return; // RD/RF-rader saknas i layouten
+
+            // RD (baseline -> Tag/Value + cache i _feedValue)
+            var cRd = _dgv.Rows[rRd].Cells[col];
+            if (rdDec.HasValue)
+            {
+                cRd.Tag = rdDec.Value;                       // feed-baseline som decimal
+                cRd.Value = FormatPercent(rdDec.Value, 3);   // visning
+                SetFeedValue(L.Rd, col, rdDec.Value);        // <-- viktigt: baseline-cache för Delete/TryGetFeedDouble
+            }
+            else
+            {
+                cRd.Tag = null;
+                cRd.Value = "";
+                // valfritt: ta bort ur _feedValue om du vill, annars lämna kvar senaste baseline
+                // _feedValue.Remove(Key(L.Rd, col));
+            }
+            MarkOverride(L.Rd, col, false);
+
+            // RF (baseline -> Tag/Value + cache i _feedValue)
+            var cRf = _dgv.Rows[rRf].Cells[col];
+            if (rfDec.HasValue)
+            {
+                cRf.Tag = rfDec.Value;
+                cRf.Value = FormatPercent(rfDec.Value, 3);
+                SetFeedValue(L.Rf, col, rfDec.Value);        // <-- viktigt
+            }
+            else
+            {
+                cRf.Tag = null;
+                cRf.Value = "";
+                // _feedValue.Remove(Key(L.Rf, col));
+            }
+            MarkOverride(L.Rf, col, false);
+
+            // (valfritt) stale-hint
+            cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
+            cRf.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
+
+            _dgv.InvalidateRow(rRd);
+            _dgv.InvalidateRow(rRf);
+
+            Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
+        }
+
+        // === Helper: re-rendera ett ben med befintliga Tag-värden och aktiv valuta ===
+        private void RenderLegPricing(string legCol)
+        {
+            // 1) Mid per unit från Tag (fallback 0.0)
+            double pricePerUnitMid = 0.0;
+            var cellPU = _dgv.Rows[R(L.PremUnit)].Cells[legCol];
+            if (cellPU?.Tag is double dmid) pricePerUnitMid = dmid;
+
+            // 2) Tvåvägs per-unit till overlay (fallback mid/mid)
+            double puBid = pricePerUnitMid, puAsk = pricePerUnitMid;
+            PremiumCellData puPd;
+            if (_twoWayPremCache.TryGetValue(PremKey(L.PremUnit, legCol), out puPd) && puPd != null)
+            {
+                puBid = puPd.Bid;
+                puAsk = puPd.Ask;
+            }
+
+            // 3) Inputs för totals
+            double N = ReadNotional(legCol);
+            double S = ReadSpot(legCol);
+            int sg = SideSign(legCol);
+
+            // 4) Skriv tillbaka tvåvägs per-unit i overlay-cachen (6 dp)
+            _twoWayPremCache[PremKey(L.PremUnit, legCol)] = new PremiumCellData
+            {
+                Bid = puBid,
+                Ask = puAsk,
+                Decimals = 6
+            };
+
+            // 5) Hämta rundade totals från Tag (lagras av ShowLegResult)
+            var cellTot = _dgv.Rows[R(L.PremTot)].Cells[legCol];
+            double totQuoteRounded = 0.0, totBaseRounded = 0.0;
+
+            var tag = cellTot?.Tag;
+            if (tag is ValueTuple<double, double> vt)
+            {
+                totQuoteRounded = vt.Item1;
+                totBaseRounded = vt.Item2;
+            }
+            else if (tag is Tuple<double, double> t)
+            {
+                totQuoteRounded = t.Item1;
+                totBaseRounded = t.Item2;
+            }
+            else
+            {
+                // Fallback om tuple saknas: räkna enkel total från mid
+                double midTotQuote = pricePerUnitMid * N * sg;
+                totQuoteRounded = midTotQuote;
+                totBaseRounded = (S != 0.0 ? midTotQuote / S : 0.0);
+            }
+
+            // 6) Visa total i aktiv valuta (text i cellen) – FmtSpaces med 2 d.p.
+            bool showQuote = (_pricingCurrency == PricingCurrency.Quote);
+            double displayTotal = showQuote ? totQuoteRounded : totBaseRounded;
+            _dgv.Rows[R(L.PremTot)].Cells[legCol].Value = FmtSpaces(displayTotal, 2);
+
+            // 7) TVÅVÄGS OVERLAY FÖR TOTAL: använd PricingFormatter för avrundning istället för rå konvertering
+            var pair6 = ReadPair6();
+            var quote = (pair6 != null && pair6.Length >= 6)
+                ? pair6.Substring(3, 3).ToUpperInvariant()
+                : "SEK";
+            var disp = (_pricingCurrency == PricingCurrency.Quote)
+                ? PricingFormatter.DisplayCcy.Quote
+                : PricingFormatter.DisplayCcy.Base;
+
+            var fmt = new PricingFormatter(quote, disp);  // samma som i rebuild  :contentReference[oaicite:7]{index=7}
+
+            var vm = fmt.Build(
+                leg: legCol,
+                perUnitBid: puBid,
+                perUnitAsk: puAsk,
+                notional: N,
+                spot: S,
+                sideSign: sg,
+                deltaUnit: 0.0, vegaUnit: 0.0, gammaUnit: 0.0, thetaUnit: 0.0,
+                boldAsk: false
+            ); // ger PremTotalBid/Ask med formatterns avrundning  :contentReference[oaicite:8]{index=8}
+
+            _twoWayPremCache[PremKey(L.PremTot, legCol)] = new PremiumCellData
+            {
+                Bid = vm.PremTotalBid,
+                Ask = vm.PremTotalAsk,
+                Decimals = vm.PremTotalDecimals
+            };
+
+            // 8) Invalidera just de två premie-cellerna
+            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremUnit));
+            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremTot));
+        }
 
         /// <summary>Visar resultatrader för ett ben (premier/greker) och lagrar nyckeltal i Tag.</summary>
         public void ShowLegResult(string legCol, double pricePerUnitMid,
@@ -2812,7 +3450,268 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region === LegId ↔ UI-kolumn ===
+
+        /// <summary>
+        /// Visar Forward Rate och Forward Points för ett visst ben (legId).
+        /// Points presenteras som ×1000 (enbart presentation).
+        /// </summary>
+        public void ShowForwardById(Guid legId, double? fwd, double? pts)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
+
+            int rFwd = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+            if (rFwd < 0 && rPts < 0) return;
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+            if (rFwd >= 0)
+                _dgv.Rows[rFwd].Cells[col].Value = (fwd.HasValue ? fwd.Value.ToString("F6", ci) : "");
+
+            if (rPts >= 0)
+            {
+                // Skala ×1000 i visningen
+                string txt = "";
+                if (pts.HasValue)
+                {
+                    double scaled = pts.Value * 10000.0;
+                    txt = scaled.ToString("F3", ci);
+                }
+                _dgv.Rows[rPts].Cells[col].Value = txt;
+            }
+
+            //System.Diagnostics.Debug.WriteLine(
+            //    $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
+        }
+
+        // === NEW: LegId → label-karta i vyn ===
+        private readonly Dictionary<Guid, string> _legIdToLabel = new Dictionary<Guid, string>();
+
+        /// <summary>
+        /// Registrerar kopplingen mellan ett stabilt LegId och en UI-etikett (t.ex. "Vanilla 2").
+        /// Säkerställer att kolumnen för etiketten finns (skapas vid behov) innan bindningen.
+        /// </summary>
+        public void BindLegIdToLabel(Guid legId, string label)
+        {
+            if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
+
+            // Se till att UI-kolumnen finns
+            EnsureLegColumnExists(label);
+
+            // Registrera mappningen
+            _legIdToLabel[legId] = label;
+        }
+
+        /// <summary>
+        /// Binder ett stabilt <paramref name="legId"/> till en UI-kolumn/etikett <paramref name="label"/> och
+        /// säkerställer att kolumnen finns. Om <paramref name="seedFromLabel"/> anges och finns,
+        /// seedas värden (Value/Tag) från den kolumnen i stället för default.
+        /// </summary>
+        public void BindLegIdToLabel(Guid legId, string label, string seedFromLabel)
+        {
+            if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
+            EnsureLegColumnExists(label, seedFromLabel);
+            _legIdToLabel[legId] = label;
+        }
+
+
+
+        /// <summary>Slår upp UI-etiketten för ett LegId. Returnerar null om okänt.</summary>
+        private string TryGetLabel(Guid legId)
+        {
+            if (_legIdToLabel.TryGetValue(legId, out var label))
+                return label;
+            return null;
+        }
+
+
+
+        /// <summary>Uppdaterar tvåväg per-unit för ett specifikt ben via LegId.</summary>
+        public void ShowTwoWayPremiumFromPerUnitById(Guid legId, double bid, double ask)
+        {
+            var label = TryGetLabel(legId);
+            if (label == null) return;
+            ShowTwoWayPremiumFromPerUnit(label, bid, ask); // befintlig label-metod
+        }
+
+        /// <summary>Uppdaterar mid + greker för ett specifikt ben via LegId.</summary>
+        public void ShowLegResultById(Guid legId, double mid, double delta, double vega, double gamma, double theta)
+        {
+            var label = TryGetLabel(legId);
+            if (label == null) return;
+            ShowLegResult(label, mid, delta, vega, gamma, theta); // befintlig label-metod
+        }
+
+        /// <summary>Returnerar redan-resolved Expiry ISO för ett ben (om det finns), via LegId.</summary>
+        public string TryGetResolvedExpiryIsoById(Guid legId)
+        {
+            var label = TryGetLabel(legId);
+            return label == null ? null : TryGetResolvedExpiryIso(label); // befintlig label-metod
+        }
+
+        /// <summary>Visar resolved expiry (ISO + weekday + hint) för ett ben via LegId.</summary>
+        public void ShowResolvedExpiryById(Guid legId, string expiryIso, string weekdayEn, string hint = null)
+        {
+            var label = TryGetLabel(legId);
+            if (label == null) return;
+            ShowResolvedExpiry(label, expiryIso, weekdayEn, hint); // befintlig label-metod
+        }
+
+        /// <summary>Visar resolved settlement-datum för ett ben via LegId.</summary>
+        public void ShowResolvedSettlementById(Guid legId, string settlementIso)
+        {
+            var label = TryGetLabel(legId);
+            if (label == null) return;
+            ShowResolvedSettlement(label, settlementIso); // befintlig label-metod
+        }
+
+        /// <summary>
+        /// Hämtar presenter-snapshot för ett specifikt ben via LegId
+        /// genom att slå upp UI-etiketten och filtrera befintliga snapshots.
+        /// </summary>
+        public LegSnapshot GetLegSnapshotById(Guid legId)
+        {
+            var label = TryGetLabel(legId);
+            if (label == null) return null;
+
+            var all = GetLegSnapshotsForPresenter();           // befintlig metod som returnerar alla
+            return Array.Find(all, s => string.Equals(s.Leg,   // filtrera på kolumn/label
+                                  label, StringComparison.OrdinalIgnoreCase));
+        }
+
+        #endregion
+
         #region === Market hooks (feed snapshot & apply) ===
+
+        /// <summary>
+        /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
+        /// relativt FEED-baseline. 
+        /// 
+        /// Viktigt:
+        /// - Aktuellt UI-värde hämtas från cell.Value (det användaren ser/har editerat).
+        /// - FEED-baseline hämtas via TryGetFeedDouble(label, col, out feed).
+        /// - Override sätts ENDAST om |UI - FEED| > tolerans.
+        /// - Saknar vi FEED-baseline just nu -> override = false (kan ej avgöras).
+        /// 
+        /// Returnerar: 
+        ///   rd / rf i DECIMAL (ex: 0.0123 = 1.23%), samt rdOverride / rfOverride.
+        /// </summary>
+        public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
+        {
+            rd = null; rf = null;
+            rdOverride = false; rfOverride = false;
+
+            if (string.IsNullOrWhiteSpace(col))
+                return false;
+
+            const double tol = 1e-9;
+
+            // === RD ===
+            try
+            {
+                int rRd = FindRow(L.Rd);
+                var cRd = _dgv.Rows[rRd].Cells[col];
+
+                // 1) Läs aktuellt UI-värde (det användaren ser/har skrivit in).
+                if (TryParseCellValueAsDecimal(cRd?.Value, out var rdUi))
+                    rd = rdUi;
+                else if (cRd?.Tag is double rdBaselineFromTag)
+                    rd = rdBaselineFromTag; // fallback om cellen är tom -> returnera baseline som värde
+
+                // 2) Läs FEED-baseline och avgör override.
+                if (TryGetFeedDouble(L.Rd, col, out var rdFeed))
+                {
+                    if (rd.HasValue)
+                        rdOverride = Math.Abs(rd.Value - rdFeed) > tol;
+                    // saknas rd => lämna rdOverride=false
+                }
+                else
+                {
+                    // Ingen FEED-baseline tillgänglig just nu → kan ej avgöra override -> false.
+                    rdOverride = false;
+                }
+            }
+            catch
+            {
+                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
+            }
+
+            // === RF ===
+            try
+            {
+                int rRf = FindRow(L.Rf);
+                var cRf = _dgv.Rows[rRf].Cells[col];
+
+                if (TryParseCellValueAsDecimal(cRf?.Value, out var rfUi))
+                    rf = rfUi;
+                else if (cRf?.Tag is double rfBaselineFromTag)
+                    rf = rfBaselineFromTag; // fallback
+
+                if (TryGetFeedDouble(L.Rf, col, out var rfFeed))
+                {
+                    if (rf.HasValue)
+                        rfOverride = Math.Abs(rf.Value - rfFeed) > tol;
+                }
+                else
+                {
+                    rfOverride = false;
+                }
+            }
+            catch
+            {
+                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
+            }
+
+            // Returnera true om vi lyckades läsa något alls för RD eller RF
+            return rd.HasValue || rf.HasValue;
+        }
+
+
+        /// <summary>
+        /// Robust parser av cell.Value till DECIMAL (0.0123 = 1.23%).
+        /// - Hanterar double/decimal direkt.
+        /// - Hanterar strängar med kultur (svenska/invariant).
+        /// - Om procenttecken (%) finns tolkar vi och dividerar med 100.
+        /// - Tar bort whitespace och vanliga symboler.
+        /// </summary>
+        private static bool TryParseCellValueAsDecimal(object value, out double result)
+        {
+            result = 0.0;
+
+            if (value == null)
+                return false;
+
+            // Direkta numeriska typer
+            if (value is double d) { result = d; return true; }
+            if (value is float f) { result = f; return true; }
+            if (value is decimal m) { result = (double)m; return true; }
+
+            // Strängparsing
+            if (value is string s)
+            {
+                var text = s.Trim();
+
+                // Kolla om procent anges
+                var hasPercent = text.Contains("%");
+
+                // Rensa bort %, mellanslag och icke-numeriska tecken utom .,,-+
+                text = Regex.Replace(text, @"[^\d\.,\-+Ee]", "");
+
+                // Försök med CurrentCulture först (svenska), sedan Invariant
+                if (double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out var v) ||
+                    double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                {
+                    result = hasPercent ? v / 100.0 : v;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+
 
         /// <summary>
         /// Visar user-override för RD/RF för ett specifikt ben (via LegId).
@@ -2850,58 +3749,6 @@ namespace FX.UI.WinForms
 
             _dgv.InvalidateRow(rRd);
             _dgv.InvalidateRow(rRf);
-        }
-
-
-
-
-        // NOTE: MARKET HOOKS
-        // Dessa metoder (ApplyMarketSpot/Rate/Vol + SnapshotFeedFromGrid + Set/TryGet feed)
-        // är avsedda för riktig marknadsdata senare. När en feed uppdaterar UI:
-        //  - Skriv normaliserat displayvärde (min 4 d.p. för Spot, 3 d.p. för rd/rf, 2 d.p. för Vol).
-        //  - Uppdatera feed-baseline (_feedValue) så manuella overrides kan jämföras korrekt.
-        //  - Släck override-färgen (MarkOverride(..., false)) – UI visar att värdet inte är manuellt.
-        //  - Låt Presentern avgöra när pricing ska triggas (vi kallar inte RaisePriceRequested här).
-
-        /// <summary>MARKET HOOK: feed-uppdatering med singel MID för Spot (Deal + ben).</summary>
-        public void ApplyMarketSpot(double mid)
-        {
-            int rSpot = R(L.Spot);
-            if (rSpot < 0) return;
-
-            if (mid <= 0.0) return;
-
-            // Skriv till Deal (bid=ask=mid) som "Feed"
-            WriteSpotTwoWayToCell("Deal", mid, mid, mid, "Feed");
-
-            // Skriv till alla ben (samma snapshot)
-            for (int i = 0; i < _legs.Length; i++)
-                WriteSpotTwoWayToCell(_legs[i], mid, mid, mid, "Feed");
-
-            // Viktigt: feed-uppdatering ska inte ändra UI-läge (MID/FULL/LIVE)
-            // men radens visning ska uppdateras direkt:
-            _dgv.InvalidateRow(rSpot);
-        }
-
-        /// <summary>MARKETS: tvåvägs-spot till Deal (och ev. spegla till ben om du vill).</summary>
-        public void ApplyMarketSpotTwoWayForDeal(double bid, double ask, bool pushToLegs = true)
-        {
-            int rSpot = R(L.Spot);
-            if (rSpot < 0) return;
-
-            if (bid <= 0.0 || ask <= 0.0) return;
-            if (ask < bid) { var t = bid; bid = ask; ask = t; }
-            double mid = 0.5 * (bid + ask);
-
-            // Deal
-            WriteSpotTwoWayToCell("Deal", bid, mid, ask, "Feed");
-
-            // (valfritt) Skjut ut samma snapshot till alla ben
-            if (pushToLegs)
-                for (int i = 0; i < _legs.Length; i++)
-                    WriteSpotTwoWayToCell(_legs[i], bid, mid, ask, "Feed");
-
-            _dgv.InvalidateRow(rSpot);
         }
 
         // single writer för tvåvägs-spot till en kolumn (Deal eller ben)
@@ -2950,89 +3797,6 @@ namespace FX.UI.WinForms
             MarkOverride(L.Spot, col, false);
 
             // 4) Invalidera just denna cell
-            _dgv.InvalidateCell(_dgv.Columns[col].Index, r);
-        }
-
-        /// <summary>
-        /// Sätter SpotCellData i Deal + alla ben till bid=ask=mid (behåller tid/källa).
-        /// Om Tag saknas byggs snapshot från visad mid.
-        /// </summary>
-        private void CollapseSpotSnapshotsToMidForAll()
-        {
-            int rSpot = R(L.Spot);
-            if (rSpot < 0) return;
-
-            void collapse(string col)
-            {
-                var cell = _dgv.Rows[rSpot].Cells[col];
-                double mid = 0.0;
-                if (cell.Tag is SpotCellData sd)
-                {
-                    mid = (sd.Mid != 0.0) ? sd.Mid : 0.5 * (sd.Bid + sd.Ask);
-                    cell.Tag = new SpotCellData
-                    {
-                        Bid = mid,
-                        Mid = mid,
-                        Ask = mid,
-                        TimeUtc = sd.TimeUtc,
-                        Source = sd.Source
-                    };
-                }
-                else
-                {
-                    if (!TryParseCellNumber(cell.Value, out mid) || mid <= 0.0) return;
-                    cell.Tag = new SpotCellData
-                    {
-                        Bid = mid,
-                        Mid = mid,
-                        Ask = mid,
-                        TimeUtc = DateTime.UtcNow,
-                        Source = "Feed"
-                    };
-                }
-
-                string raw = mid.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                cell.Value = FormatSpotWithMinDecimals(raw, mid, 4);
-                _dgv.InvalidateCell(_dgv.Columns[col].Index, rSpot);
-            }
-
-            collapse("Deal");
-            for (int i = 0; i < _legs.Length; i++)
-                collapse(_legs[i]);
-        }
-
-
-
-
-
-
-        /// <summary>MARKET HOOK: Sann feed-uppdatering för ränta (rd/rf) per kolumn.</summary>
-        public void ApplyMarketRate(string labelRdOrRf, string col, double dec)
-        {
-            // label = L.Rd eller L.Rf, col = "Leg1"/"Leg2"/... eller "Deal" om du vill
-            int r = R(labelRdOrRf); if (r < 0) return;
-            var c = _dgv.Rows[r].Cells[col];
-            c.Tag = dec;
-            c.Value = FormatPercent(dec, 3);
-
-            SetFeedValue(labelRdOrRf, col, dec);
-            MarkOverride(labelRdOrRf, col, false);
-            _dgv.InvalidateCell(_dgv.Columns[col].Index, r);
-        }
-
-        /// <summary>MARKET HOOK: Sann feed-uppdatering för vol (bid/ask) per kolumn.</summary>
-        public void ApplyMarketVol(string col, double bidDec, double askDec)
-        {
-            int r = R(L.Vol); if (r < 0) return;
-            var c = _dgv.Rows[r].Cells[col];
-            var v = new VolCellData { Bid = bidDec, Ask = askDec };
-            c.Tag = v;
-            c.Value = (Math.Abs(bidDec - askDec) < 1e-12)
-                        ? FormatPercent(bidDec, 2)
-                        : (FormatPercent(bidDec, 2) + " / " + FormatPercent(askDec, 2));
-
-            SetFeedValue(L.Vol, col, v);
-            MarkOverride(L.Vol, col, false);
             _dgv.InvalidateCell(_dgv.Columns[col].Index, r);
         }
 
@@ -3115,20 +3879,6 @@ namespace FX.UI.WinForms
             _dgv.Invalidate();
         }
 
-        /// <summary>Sätter cellvärde + ev. Tag och släcker override-färg (används av Apply*).</summary>
-        public void ApplyMarketValue(string label, string col, string display, object tag = null)
-        {
-            int r = FindRow(label);
-            if (r < 0) return;
-
-            var cell = _dgv.Rows[r].Cells[col];
-            cell.Value = display;
-            if (tag != null) cell.Tag = tag;
-
-            MarkOverride(label, col, false); // återställ färg
-            _dgv.InvalidateCell(_dgv.Columns[col].Index, r);
-        }
-
         /// <summary>Sätter feed-baseline (kopierar VolCellData för säkerhets skull).</summary>
         private void SetFeedValue(string label, string col, object logical)
         {
@@ -3145,17 +3895,6 @@ namespace FX.UI.WinForms
                 d = (double)o; return true;
             }
             d = 0; return false;
-        }
-
-        /// <summary>Försöker hämta feed-baseline som VolCellData.</summary>
-        private bool TryGetFeedVol(string label, string col, out VolCellData v)
-        {
-            object o;
-            if (_feedValue.TryGetValue(Key(label, col), out o) && o is VolCellData)
-            {
-                v = CloneVol((VolCellData)o); return true;
-            }
-            v = null; return false;
         }
 
         /// <summary>Snapshot: sparar ursprunglig textfärg per cell för korrekt override on/off.</summary>
@@ -3264,354 +4003,7 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region === Notional + formatting helpers ===
-
-        /// <summary>Parsar notional med suffix (k/m/bn) och returnerar värde + precision.</summary>
-        private static bool TryParseNotional(string raw, out double value, out int decimals, out bool allZero)
-        {
-            value = 0.0; decimals = 0; allZero = false;
-            if (string.IsNullOrWhiteSpace(raw)) return false;
-
-            string s = raw.Trim().Replace(" ", "").Replace("\u00A0", "");
-            s = s.Replace(',', '.');
-
-            double factor = 1.0;
-            if (s.Length > 0)
-            {
-                char last = s[s.Length - 1];
-                char c = char.ToLowerInvariant(last);
-                if (char.IsLetter(c))
-                {
-                    s = s.Substring(0, s.Length - 1);
-                    if (c == 'k') factor = 1_000d;
-                    else if (c == 'm') factor = 1_000_000d;
-                    else if (c == 'b' || c == 'y') factor = 1_000_000_000d;
-                    else return false;
-                }
-            }
-
-            int dot = s.IndexOf('.');
-            if (dot >= 0 && dot < s.Length - 1)
-            {
-                string dec = s.Substring(dot + 1);
-                decimals = dec.Length;
-                allZero = IsAllZero(dec);
-            }
-
-            double core;
-            if (!double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out core))
-                return false;
-
-            value = core * factor;
-            return true;
-        }
-
-        private static string FormatFixed(double v, int decimals)
-        {
-            return v.ToString("F" + decimals, System.Globalization.CultureInfo.InvariantCulture);
-        }
-
-        /// <summary>True om alla tecken i strängen är '0' och strängen ej tom.</summary>
-        private static bool IsAllZero(string t)
-        {
-            for (int i = 0; i < t.Length; i++)
-                if (t[i] != '0') return false;
-            return t.Length > 0;
-        }
-
-        /// <summary>
-        /// Formaterar notional: om det skalade värdet är heltal → 0 d.p.,
-        /// annars behåll minsta nödvändiga d.p. baserat på input.
-        /// </summary>
-        private static string FormatNotional(double value, int decimalsFromInput, bool allZeroFromInput)
-        {
-            int d = IsEffectivelyInteger(value) ? 0
-                    : (allZeroFromInput ? 0 : Math.Max(0, decimalsFromInput));
-
-            string text = value.ToString("N" + d, CultureInfo.InvariantCulture);
-            return text.Replace(",", " ");
-        }
-
-        /// <summary>Formattering med mellanslag som tusentalsavskiljare.</summary>
-        private static string FmtSpaces(double v, int decimals = 6)
-        {
-            var s = v.ToString("N" + decimals, CultureInfo.InvariantCulture);
-            return s.Replace(",", " ");
-        }
-
-        /// <summary>Side→"Buy"/"Sell".</summary>
-        private static bool TryCanonicalizeSide(string raw, out string canon)
-        {
-            canon = null;
-            if (string.IsNullOrWhiteSpace(raw)) return false;
-            var s = raw.Trim().ToLowerInvariant();
-            if (s == "b" || s == "buy" || s == "köp") { canon = "Buy"; return true; }
-            if (s == "s" || s == "sell" || s == "sälj") { canon = "Sell"; return true; }
-            return false;
-        }
-
-        /// <summary>Payoff→"Call"/"Put".</summary>
-        private static bool TryCanonicalizePayoff(string raw, out string canon)
-        {
-            canon = null;
-            if (string.IsNullOrWhiteSpace(raw)) return false;
-            var s = raw.Trim().ToLowerInvariant();
-            if (s == "c" || s == "call") { canon = "Call"; return true; }
-            if (s == "p" || s == "put") { canon = "Put"; return true; }
-            return false;
-        }
-
-        /// <summary>+1 för Buy, −1 för Sell, default +1.</summary>
-        private int SideSign(string col)
-        {
-            var s = Convert.ToString(_dgv.Rows[R(L.Side)].Cells[col].Value ?? "");
-            if (s.IndexOf("SELL", StringComparison.OrdinalIgnoreCase) >= 0) return -1;
-            if (s.IndexOf("BUY", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
-            return 1;
-        }
-
-        /// <summary>Spot: minst N decimaler, men behåll fler om användaren skrev fler.</summary>
-        private static string FormatSpotWithMinDecimals(string raw, double numeric, int minDecimals)
-        {
-            int userDecs = CountDecimalsInRaw(raw);
-            int decs = Math.Max(minDecimals, userDecs);
-            string fmt = "0." + new string('0', decs);
-            return numeric.ToString(fmt, CultureInfo.InvariantCulture);
-        }
-
-        /// <summary>Räknar antal decimaler i råtext (hanterar ',' '.' och mellanslag).</summary>
-        private static int CountDecimalsInRaw(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return 0;
-            string s = raw.Trim().Replace(" ", "").Replace("\u00A0", "").Replace(',', '.');
-            int i = s.IndexOf('.');
-            if (i < 0 || i == s.Length - 1) return 0;
-            return Math.Max(0, s.Length - 1 - i);
-        }
-
-        /// <summary>Robust heltalskontroll för double.</summary>
-        private static bool IsEffectivelyInteger(double v)
-        {
-            return Math.Abs(v - Math.Round(v)) < 1e-9;
-        }
-
-        /// <summary>Double-jämförelse med epsilon.</summary>
-        private static bool Eq(double a, double b, double eps = 1e-9) => Math.Abs(a - b) <= eps;
-
-        /// <summary>Jämförelse av vol-par med epsilon.</summary>
-        private static bool Eq(VolCellData a, VolCellData b, double eps = 1e-9)
-        {
-            if (a == null && b == null) return true;
-            if (a == null || b == null) return false;
-            return Eq(a.Bid, b.Bid, eps) && Eq(a.Ask, b.Ask, eps);
-        }
-
-        /// <summary>Vol-input: ”5” ⇒ mid; ”5/6” eller ”5 6” ⇒ bid/ask (procent).</summary>
-        private static bool TryParseVolInput(string raw, out double bid, out double ask, out bool isPair)
-        {
-            bid = ask = 0; isPair = false;
-            if (string.IsNullOrWhiteSpace(raw)) return false;
-
-            string s = raw.Trim().Replace("\u00A0", " ");
-            s = s.Replace(',', '.').ToLowerInvariant();
-
-            string[] tokens;
-            if (s.Contains("/"))
-            {
-                tokens = s.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
-            }
-            else
-            {
-                tokens = System.Text.RegularExpressions.Regex
-                         .Split(s, "\\s+")
-                         .Where(t => !string.IsNullOrWhiteSpace(t))
-                         .ToArray();
-            }
-
-            if (tokens.Length == 1)
-            {
-                if (!TryParsePercentToDecimal(tokens[0], out double mid)) return false;
-                bid = ask = mid; isPair = false; return true;
-            }
-            else if (tokens.Length == 2)
-            {
-                if (!TryParsePercentToDecimal(tokens[0], out double b)) return false;
-                if (!TryParsePercentToDecimal(tokens[1], out double a)) return false;
-                bid = b; ask = a; isPair = true; return true;
-            }
-            return false;
-        }
-
-        /// <summary>Formaterar tvåvägsvol som ”bid / ask”.</summary>
-        private static string FormatPercentPair(double bidDec, double askDec, int decimals = 2)
-        {
-            return FormatPercent(bidDec, decimals) + " / " + FormatPercent(askDec, decimals);
-        }
-
-        /// <summary>Klonar vol-objekt.</summary>
-        private static VolCellData CloneVol(VolCellData v)
-        {
-            return v == null ? null : new VolCellData { Bid = v.Bid, Ask = v.Ask };
-        }
-
-        #endregion
-
-        #region === Event args & key handling ===
-
-        /// <summary>Args till prissättningen.</summary>
-        public sealed class PriceRequestUiArgs : EventArgs
-        {
-            public string Pair6;
-            public double? Spot;
-            public double? Rd;
-            public double? Rf;
-            public string Side;
-            public string Type;
-            public string Strike;
-            public string ExpiryRaw;
-            public double Notional;
-
-            /// <summary>Om satt (icke tom), prisa endast detta ben; annars prisa alla.</summary>
-            public Guid LegId { get; set; }            // NEW
-
-            /// <summary>Bakåtkompatibel legacy-etikett (om din UI fortfarande skickar label).</summary>
-            public string TargetLeg { get; set; }      // befintlig
-        }
-
-        /// <summary>Args för att låta presenter lösa/validera expiry.</summary>
-        public sealed class ExpiryEditRequestedEventArgs : EventArgs
-        {
-            public string Pair6 { get; set; }
-            public string Raw { get; set; }
-            public string LegColumn { get; set; }
-        }
-
-
-
-        #endregion
-
         #region === Keyboard handling / Commands ===
-
-        /// <summary>
-        /// Tangentkommandon i gridden:
-        /// - F2: starta edit och markera allt
-        /// - F5: spot refresh
-        /// - F6: add leg
-        /// - F7: force refresh rates
-        /// - F9: reprice alla ben
-        /// - Delete: stumt överallt UTOM RD/RF i benkolumn – där återställs till senaste baseline (feed/Tag) och override nollas i Store.
-        /// </summary>
-        protected bool ProcessCmdKeyOLD(ref Message msg, Keys keyData)
-        {
-            // F2: in i edit mode + markera allt innehåll
-            if (keyData == Keys.F2)
-            {
-                var cell = _dgv.CurrentCell;
-                if (cell != null && !cell.ReadOnly && !IsSectionRow(_dgv.Rows[cell.RowIndex]))
-                {
-                    _dgv.BeginEdit(true);
-                    if (_dgv.EditingControl is TextBox tb)
-                    {
-                        tb.SelectionStart = 0;
-                        tb.SelectionLength = tb.TextLength;
-                    }
-                    return true;
-                }
-                return false; // ej editerbar → låt bas hantera
-            }
-
-            if (keyData == Keys.F5)
-            {
-                SpotRefreshRequested?.Invoke(this, EventArgs.Empty);
-                return true;
-            }
-
-            if (keyData == Keys.F6)
-            {
-                AddLegRequested?.Invoke(this, EventArgs.Empty);
-                return true;
-            }
-
-            if (keyData == Keys.F7)
-            {
-                RatesRefreshRequested?.Invoke(this, EventArgs.Empty);
-                return true;
-            }
-
-            // F9: reprice alla ben
-            if (keyData == Keys.F9)
-            {
-                PriceRequested?.Invoke(this, new PriceRequestUiArgs { TargetLeg = null });
-                return true;
-            }
-
-            // Delete → endast RD/RF i benkolumn: återställ till baseline och nolla override i Store.
-            if (keyData == Keys.Delete)
-            {
-                var cell = _dgv?.CurrentCell;
-                if (cell == null) return base.ProcessCmdKey(ref msg, keyData);
-
-                string lbl = Convert.ToString(_dgv.Rows[cell.RowIndex].Cells["FIELD"].Value ?? "");
-                string col = _dgv.Columns[cell.ColumnIndex].Name;
-
-                // endast legs (inte "Deal") och endast RD/RF-rader
-                bool isLegCol = !string.Equals(col, "Deal", StringComparison.OrdinalIgnoreCase);
-                bool isRd = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase);
-                bool isRf = string.Equals(lbl, L.Rf, StringComparison.OrdinalIgnoreCase);
-                if (!(isLegCol && (isRd || isRf)))
-                {
-                    // Delete ska vara stumt i alla andra fall
-                    return true;
-                }
-
-                string field = isRd ? "Rd" : "Rf";
-
-                // --- Hämta baseline: först _feedValue, annars Tag (senast kända feed som vi sparat) ---
-                bool haveBaseline = false;
-                double feed = 0.0;
-
-                if (!haveBaseline && TryGetFeedDouble(isRd ? L.Rd : L.Rf, col, out var f1))
-                {
-                    feed = f1; haveBaseline = true;
-                }
-                if (!haveBaseline)
-                {
-                    int rProbe = isRd ? R(L.Rd) : R(L.Rf);
-                    if (rProbe >= 0)
-                    {
-                        var cProbe = _dgv.Rows[rProbe].Cells[col];
-                        if (cProbe.Tag is double tagVal)
-                        {
-                            feed = tagVal; haveBaseline = true;
-                        }
-                    }
-                }
-
-                // Om vi har en baseline kan vi återställa UI direkt (värde + släck lila)
-                if (haveBaseline)
-                {
-                    int r = isRd ? R(L.Rd) : R(L.Rf);
-                    var c = _dgv.Rows[r].Cells[col];
-
-                    c.Tag = feed;                       // baseline in i Tag
-                    c.Value = FormatPercent(feed, 3);   // 3 d.p.
-                    MarkOverride(isRd ? L.Rd : L.Rf, col, false);
-                    _dgv.InvalidateCell(c.ColumnIndex, r);
-                }
-
-                // Signalera till Presentern att nolla override i Store för just denna sida
-                RateClearOverrideRequested?.Invoke(this, new RateClearOverrideRequestedEventArgs
-                {
-                    LegColumn = col,
-                    Field = field
-                });
-
-                // Presenter schemalägger debouncad reprice (ScheduleRepriceDebounced)
-                return true;
-            }
-
-            return base.ProcessCmdKey(ref msg, keyData);
-        }
 
         /// <summary>
         /// Tangentkommandon i gridden:
@@ -3739,6 +4131,40 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region === Event args & key handling ===
+
+        /// <summary>Args till prissättningen.</summary>
+        public sealed class PriceRequestUiArgs : EventArgs
+        {
+            public string Pair6;
+            public double? Spot;
+            public double? Rd;
+            public double? Rf;
+            public string Side;
+            public string Type;
+            public string Strike;
+            public string ExpiryRaw;
+            public double Notional;
+
+            /// <summary>Om satt (icke tom), prisa endast detta ben; annars prisa alla.</summary>
+            public Guid LegId { get; set; }            // NEW
+
+            /// <summary>Bakåtkompatibel legacy-etikett (om din UI fortfarande skickar label).</summary>
+            public string TargetLeg { get; set; }      // befintlig
+        }
+
+        /// <summary>Args för att låta presenter lösa/validera expiry.</summary>
+        public sealed class ExpiryEditRequestedEventArgs : EventArgs
+        {
+            public string Pair6 { get; set; }
+            public string Raw { get; set; }
+            public string LegColumn { get; set; }
+        }
+
+
+
+        #endregion
+
         #region === GDI helper ===
 
         private static class SmoothingScope
@@ -3761,6 +4187,73 @@ namespace FX.UI.WinForms
         #endregion
 
         #region === Helpers ===
+
+        // Nyckel för cache
+        private static string PremKey(string label, string col) => label + "|" + col;
+
+        private static string NormalizePremLabel(string lbl)
+        {
+            if (string.IsNullOrWhiteSpace(lbl)) return "";
+            lbl = lbl.Trim();
+            // Hantera "Premium total (SEK/EUR/…)" som "Premium total (Quote)"
+            if (lbl.StartsWith("Premium total", StringComparison.OrdinalIgnoreCase))
+                return L.PremTot;
+            return lbl;
+        }
+
+        private void RebuildTwoWayTotalsCacheForCurrentCurrency()
+        {
+            // Här vill vi använda samma avrundningsregler som initial render:
+            //  - Quote: runda pips (1 d.p.) -> per-unit -> total
+            //  - Base : runda %   (4 d.p.)  -> total
+            // och lägga in resultatet i overlay-cachen för "Premium total".
+            var pair6 = ReadPair6();
+            var quote = (pair6 != null && pair6.Length >= 6)
+                ? pair6.Substring(3, 3).ToUpperInvariant()
+                : "SEK";
+            var disp = (_pricingCurrency == PricingCurrency.Quote)
+                ? PricingFormatter.DisplayCcy.Quote
+                : PricingFormatter.DisplayCcy.Base;
+
+            var fmt = new PricingFormatter(quote, disp); // befintlig formatter (ingen ny helper)  :contentReference[oaicite:2]{index=2}
+
+            foreach (var leg in _legs)
+            {
+                // Hämta per-unit tvåväg ur befintlig cache (fallback mid/mid=0)
+                if (!_twoWayPremCache.TryGetValue(PremKey(L.PremUnit, leg), out var perUnit) || perUnit == null)
+                {
+                    _twoWayPremCache.Remove(PremKey(L.PremTot, leg));
+                    continue;
+                }
+
+                double puBid = perUnit.Bid;
+                double puAsk = perUnit.Ask;
+
+                // Inputs
+                double N = ReadNotional(leg);
+                double S = ReadSpot(leg);
+                int sg = SideSign(leg);
+
+                // Kör formattern med BID/ASK så vi får totaler enligt avrundningsreglerna
+                var vm = fmt.Build(
+                    leg: leg,
+                    perUnitBid: puBid,
+                    perUnitAsk: puAsk,
+                    notional: N,
+                    spot: S,
+                    sideSign: sg,
+                    deltaUnit: 0.0, vegaUnit: 0.0, gammaUnit: 0.0, thetaUnit: 0.0,
+                    boldAsk: false
+                ); // totals: vm.PremTotalBid/Ask avrundade korrekt  :contentReference[oaicite:3]{index=3}
+
+                _twoWayPremCache[PremKey(L.PremTot, leg)] = new PremiumCellData
+                {
+                    Bid = vm.PremTotalBid,
+                    Ask = vm.PremTotalAsk,
+                    Decimals = vm.PremTotalDecimals
+                };
+            }
+        }
 
         /// <summary>
         /// Säkerställer att en UI-kolumn med namn <paramref name="label"/> finns.
@@ -3891,922 +4384,7 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region === Vol & vol spread
-
-        /// <summary>
-        /// Recalc Vol Spread (Ask - Bid) för alla legs. Visar 3 dp och sparar decimal i Tag.
-        /// </summary>
-        private void RecalcVolSpreadForAllLegs()
-        {
-            int rVol = FindRow(L.Vol);
-            int rSpr = FindRow(L.VolSprd);
-            if (rVol < 0 || rSpr < 0) return;
-
-            foreach (var leg in _legs)
-            {
-                var cVol = _dgv.Rows[rVol].Cells[leg];
-                double bid = 0.0, ask = 0.0;
-
-                if (cVol.Tag is VolCellData vd)
-                {
-                    bid = vd.Bid;
-                    ask = vd.Ask > 0.0 ? vd.Ask : vd.Bid;
-                }
-                else
-                {
-                    // fallback: parse display (”5/6”, ”5 6” eller ”5”)
-                    double b, a; bool isPair;
-                    if (TryParseVolInput(Convert.ToString(cVol.Value ?? ""), out b, out a, out isPair))
-                    { bid = b; ask = isPair ? a : b; }
-                    else
-                    { bid = ask = 0.0; }
-                }
-
-                double spr = Math.Max(0.0, ask - bid);
-                var cSpr = _dgv.Rows[rSpr].Cells[leg];
-                cSpr.Tag = spr;                     // decimal (t.ex. 0.010)
-                cSpr.Value = FormatPercent(spr, 3); // ”1.000%”
-            }
-        }
-
-
-        /// <summary>Skriver Vol (bid/ask) till cell + Tag och normaliserar visning till 3 dp.</summary>
-        private void WriteVolFromBidAsk(string col, double bid, double ask)
-        {
-            int rVol = FindRow(L.Vol);
-            if (rVol < 0) return;
-            var cVol = _dgv.Rows[rVol].Cells[col];
-
-            if (ask < bid) { var t = bid; bid = ask; ask = t; } // säkerställ ask ≥ bid
-            cVol.Tag = new VolCellData { Bid = bid, Ask = ask };
-            cVol.Value = (Math.Abs(ask - bid) < 1e-12)
-                ? FormatPercent(bid, 3)                // singel (mid) visning "x.xxx%"
-                : FormatPercentPair(bid, ask, 3);      // tvåvägs "x.xxx% / y.yyy%"
-        }
-
-        /// <summary>Returnerar (bid, ask, mid) för en kolumn (leg) från Vol-cellen.</summary>
-        private (double bid, double ask, double mid) ReadVolTriplet(string col)
-        {
-            int rVol = FindRow(L.Vol);
-            if (rVol < 0) return (0, 0, 0);
-            var cVol = _dgv.Rows[rVol].Cells[col];
-
-            double bid, ask; bool twoWay;
-            if (cVol.Tag is VolCellData vd)
-            {
-                bid = vd.Bid; ask = (vd.Ask > 0.0 ? vd.Ask : vd.Bid);
-                twoWay = (vd.Ask > 0.0 && vd.Ask != vd.Bid);
-            }
-            else
-            {
-                if (!TryParseVolInput(Convert.ToString(cVol.Value ?? ""), out bid, out ask, out twoWay))
-                    bid = ask = 0.0;
-                if (!twoWay) ask = bid;
-            }
-            double mid = 0.5 * (bid + ask);
-            return (bid, ask, mid);
-        }
-
-        /// <summary>
-        /// Applicera en Vol spread (decimal) från Deal till alla legs:
-        /// bid_leg = mid_leg − spr/2, ask_leg = mid_leg + spr/2.
-        /// Skriver Vol (3 dp) och uppdaterar legs Vol spread (3 dp).
-        /// </summary>
-        private void ApplyVolSpreadFromDealToLegs(double spr)
-        {
-            if (spr < 0) spr = 0.0;
-            double half = 0.5 * spr;
-
-            foreach (var leg in _legs)
-            {
-                var (b, a, mid) = ReadVolTriplet(leg);
-                double nbid = Math.Max(0.0, mid - half);
-                double nask = mid + half;
-
-                WriteVolFromBidAsk(leg, nbid, nask);
-                MarkOverride(L.Vol, leg, true); // användarstyrt från Deal spridning
-            }
-
-            // skriv samtidigt Vol spread (3 dp) per leg
-            RecalcVolSpreadForAllLegs();
-        }
-
-        #endregion
-
-        #region === LegId ↔ UI-kolumn ===
-
-        // === NEW: LegId → label-karta i vyn ===
-        private readonly Dictionary<Guid, string> _legIdToLabel = new Dictionary<Guid, string>();
-
-        /// <summary>
-        /// Registrerar kopplingen mellan ett stabilt LegId och en UI-etikett (t.ex. "Vanilla 2").
-        /// Säkerställer att kolumnen för etiketten finns (skapas vid behov) innan bindningen.
-        /// </summary>
-        public void BindLegIdToLabel(Guid legId, string label)
-        {
-            if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
-
-            // Se till att UI-kolumnen finns
-            EnsureLegColumnExists(label);
-
-            // Registrera mappningen
-            _legIdToLabel[legId] = label;
-        }
-
-        /// <summary>
-        /// Binder ett stabilt <paramref name="legId"/> till en UI-kolumn/etikett <paramref name="label"/> och
-        /// säkerställer att kolumnen finns. Om <paramref name="seedFromLabel"/> anges och finns,
-        /// seedas värden (Value/Tag) från den kolumnen i stället för default.
-        /// </summary>
-        public void BindLegIdToLabel(Guid legId, string label, string seedFromLabel)
-        {
-            if (legId == Guid.Empty || string.IsNullOrWhiteSpace(label)) return;
-            EnsureLegColumnExists(label, seedFromLabel);
-            _legIdToLabel[legId] = label;
-        }
-
-
-
-        /// <summary>Slår upp UI-etiketten för ett LegId. Returnerar null om okänt.</summary>
-        private string TryGetLabel(Guid legId)
-        {
-            if (_legIdToLabel.TryGetValue(legId, out var label))
-                return label;
-            return null;
-        }
-
-
-
-        /// <summary>Uppdaterar tvåväg per-unit för ett specifikt ben via LegId.</summary>
-        public void ShowTwoWayPremiumFromPerUnitById(Guid legId, double bid, double ask)
-        {
-            var label = TryGetLabel(legId);
-            if (label == null) return;
-            ShowTwoWayPremiumFromPerUnit(label, bid, ask); // befintlig label-metod
-        }
-
-        /// <summary>Uppdaterar mid + greker för ett specifikt ben via LegId.</summary>
-        public void ShowLegResultById(Guid legId, double mid, double delta, double vega, double gamma, double theta)
-        {
-            var label = TryGetLabel(legId);
-            if (label == null) return;
-            ShowLegResult(label, mid, delta, vega, gamma, theta); // befintlig label-metod
-        }
-
-        /// <summary>Returnerar redan-resolved Expiry ISO för ett ben (om det finns), via LegId.</summary>
-        public string TryGetResolvedExpiryIsoById(Guid legId)
-        {
-            var label = TryGetLabel(legId);
-            return label == null ? null : TryGetResolvedExpiryIso(label); // befintlig label-metod
-        }
-
-        /// <summary>Visar resolved expiry (ISO + weekday + hint) för ett ben via LegId.</summary>
-        public void ShowResolvedExpiryById(Guid legId, string expiryIso, string weekdayEn, string hint = null)
-        {
-            var label = TryGetLabel(legId);
-            if (label == null) return;
-            ShowResolvedExpiry(label, expiryIso, weekdayEn, hint); // befintlig label-metod
-        }
-
-        /// <summary>Visar resolved settlement-datum för ett ben via LegId.</summary>
-        public void ShowResolvedSettlementById(Guid legId, string settlementIso)
-        {
-            var label = TryGetLabel(legId);
-            if (label == null) return;
-            ShowResolvedSettlement(label, settlementIso); // befintlig label-metod
-        }
-
-        /// <summary>
-        /// Hämtar presenter-snapshot för ett specifikt ben via LegId
-        /// genom att slå upp UI-etiketten och filtrera befintliga snapshots.
-        /// </summary>
-        public LegSnapshot GetLegSnapshotById(Guid legId)
-        {
-            var label = TryGetLabel(legId);
-            if (label == null) return null;
-
-            var all = GetLegSnapshotsForPresenter();           // befintlig metod som returnerar alla
-            return Array.Find(all, s => string.Equals(s.Leg,   // filtrera på kolumn/label
-                                  label, StringComparison.OrdinalIgnoreCase));
-        }
-
-        #endregion
-
-
-        /// <summary>
-        /// Programmatisk trigger för att lägga till ett nytt ben (motsvarar F6).
-        /// </summary>
-        public void TriggerAddLeg() => AddLegRequested?.Invoke(this, EventArgs.Empty);
-
-
-        // Formatter skapas on-demand utifrån pair och vald display-ccy
-        private PricingFormatter CreateFormatter()
-        {
-            var pair6 = ReadPair6();
-            var quote = (pair6 != null && pair6.Length >= 6) ? pair6.Substring(3, 3).ToUpperInvariant() : "SEK";
-            var ffCcy = (_displayCcy == DisplayCcy.Quote)
-                ? PricingFormatter.DisplayCcy.Quote
-                : PricingFormatter.DisplayCcy.Base;
-            return new PricingFormatter(quote, ffCcy);
-        }
-
-        // Intern cache för tvåvägs-premie per cell (label|col)
-        private readonly Dictionary<string, PremiumCellData> _twoWayPremCache = new Dictionary<string, PremiumCellData>(StringComparer.Ordinal);
-
-        // Nyckel för cache
-        private static string PremKey(string label, string col) => label + "|" + col;
-
-        private static string NormalizePremLabel(string lbl)
-        {
-            if (string.IsNullOrWhiteSpace(lbl)) return "";
-            lbl = lbl.Trim();
-            // Hantera "Premium total (SEK/EUR/…)" som "Premium total (Quote)"
-            if (lbl.StartsWith("Premium total", StringComparison.OrdinalIgnoreCase))
-                return L.PremTot;
-            return lbl;
-        }
-
-        private void RebuildTwoWayTotalsCacheForCurrentCurrency()
-        {
-            // Här vill vi använda samma avrundningsregler som initial render:
-            //  - Quote: runda pips (1 d.p.) -> per-unit -> total
-            //  - Base : runda %   (4 d.p.)  -> total
-            // och lägga in resultatet i overlay-cachen för "Premium total".
-            var pair6 = ReadPair6();
-            var quote = (pair6 != null && pair6.Length >= 6)
-                ? pair6.Substring(3, 3).ToUpperInvariant()
-                : "SEK";
-            var disp = (_pricingCurrency == PricingCurrency.Quote)
-                ? PricingFormatter.DisplayCcy.Quote
-                : PricingFormatter.DisplayCcy.Base;
-
-            var fmt = new PricingFormatter(quote, disp); // befintlig formatter (ingen ny helper)  :contentReference[oaicite:2]{index=2}
-
-            foreach (var leg in _legs)
-            {
-                // Hämta per-unit tvåväg ur befintlig cache (fallback mid/mid=0)
-                if (!_twoWayPremCache.TryGetValue(PremKey(L.PremUnit, leg), out var perUnit) || perUnit == null)
-                {
-                    _twoWayPremCache.Remove(PremKey(L.PremTot, leg));
-                    continue;
-                }
-
-                double puBid = perUnit.Bid;
-                double puAsk = perUnit.Ask;
-
-                // Inputs
-                double N = ReadNotional(leg);
-                double S = ReadSpot(leg);
-                int sg = SideSign(leg);
-
-                // Kör formattern med BID/ASK så vi får totaler enligt avrundningsreglerna
-                var vm = fmt.Build(
-                    leg: leg,
-                    perUnitBid: puBid,
-                    perUnitAsk: puAsk,
-                    notional: N,
-                    spot: S,
-                    sideSign: sg,
-                    deltaUnit: 0.0, vegaUnit: 0.0, gammaUnit: 0.0, thetaUnit: 0.0,
-                    boldAsk: false
-                ); // totals: vm.PremTotalBid/Ask avrundade korrekt  :contentReference[oaicite:3]{index=3}
-
-                _twoWayPremCache[PremKey(L.PremTot, leg)] = new PremiumCellData
-                {
-                    Bid = vm.PremTotalBid,
-                    Ask = vm.PremTotalAsk,
-                    Decimals = vm.PremTotalDecimals
-                };
-            }
-        }
-
-        // === Helper: re-rendera ett ben med befintliga Tag-värden och aktiv valuta ===
-        private void RenderLegPricing(string legCol)
-        {
-            // 1) Mid per unit från Tag (fallback 0.0)
-            double pricePerUnitMid = 0.0;
-            var cellPU = _dgv.Rows[R(L.PremUnit)].Cells[legCol];
-            if (cellPU?.Tag is double dmid) pricePerUnitMid = dmid;
-
-            // 2) Tvåvägs per-unit till overlay (fallback mid/mid)
-            double puBid = pricePerUnitMid, puAsk = pricePerUnitMid;
-            PremiumCellData puPd;
-            if (_twoWayPremCache.TryGetValue(PremKey(L.PremUnit, legCol), out puPd) && puPd != null)
-            {
-                puBid = puPd.Bid;
-                puAsk = puPd.Ask;
-            }
-
-            // 3) Inputs för totals
-            double N = ReadNotional(legCol);
-            double S = ReadSpot(legCol);
-            int sg = SideSign(legCol);
-
-            // 4) Skriv tillbaka tvåvägs per-unit i overlay-cachen (6 dp)
-            _twoWayPremCache[PremKey(L.PremUnit, legCol)] = new PremiumCellData
-            {
-                Bid = puBid,
-                Ask = puAsk,
-                Decimals = 6
-            };
-
-            // 5) Hämta rundade totals från Tag (lagras av ShowLegResult)
-            var cellTot = _dgv.Rows[R(L.PremTot)].Cells[legCol];
-            double totQuoteRounded = 0.0, totBaseRounded = 0.0;
-
-            var tag = cellTot?.Tag;
-            if (tag is ValueTuple<double, double> vt)
-            {
-                totQuoteRounded = vt.Item1;
-                totBaseRounded = vt.Item2;
-            }
-            else if (tag is Tuple<double, double> t)
-            {
-                totQuoteRounded = t.Item1;
-                totBaseRounded = t.Item2;
-            }
-            else
-            {
-                // Fallback om tuple saknas: räkna enkel total från mid
-                double midTotQuote = pricePerUnitMid * N * sg;
-                totQuoteRounded = midTotQuote;
-                totBaseRounded = (S != 0.0 ? midTotQuote / S : 0.0);
-            }
-
-            // 6) Visa total i aktiv valuta (text i cellen) – FmtSpaces med 2 d.p.
-            bool showQuote = (_pricingCurrency == PricingCurrency.Quote);
-            double displayTotal = showQuote ? totQuoteRounded : totBaseRounded;
-            _dgv.Rows[R(L.PremTot)].Cells[legCol].Value = FmtSpaces(displayTotal, 2);
-
-            // 7) TVÅVÄGS OVERLAY FÖR TOTAL: använd PricingFormatter för avrundning istället för rå konvertering
-            var pair6 = ReadPair6();
-            var quote = (pair6 != null && pair6.Length >= 6)
-                ? pair6.Substring(3, 3).ToUpperInvariant()
-                : "SEK";
-            var disp = (_pricingCurrency == PricingCurrency.Quote)
-                ? PricingFormatter.DisplayCcy.Quote
-                : PricingFormatter.DisplayCcy.Base;
-
-            var fmt = new PricingFormatter(quote, disp);  // samma som i rebuild  :contentReference[oaicite:7]{index=7}
-
-            var vm = fmt.Build(
-                leg: legCol,
-                perUnitBid: puBid,
-                perUnitAsk: puAsk,
-                notional: N,
-                spot: S,
-                sideSign: sg,
-                deltaUnit: 0.0, vegaUnit: 0.0, gammaUnit: 0.0, thetaUnit: 0.0,
-                boldAsk: false
-            ); // ger PremTotalBid/Ask med formatterns avrundning  :contentReference[oaicite:8]{index=8}
-
-            _twoWayPremCache[PremKey(L.PremTot, legCol)] = new PremiumCellData
-            {
-                Bid = vm.PremTotalBid,
-                Ask = vm.PremTotalAsk,
-                Decimals = vm.PremTotalDecimals
-            };
-
-            // 8) Invalidera just de två premie-cellerna
-            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremUnit));
-            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremTot));
-        }
-
-        // === VYN: mata in tvåvägs per-unit från presentern ===
-        public void ShowTwoWayPremiumFromPerUnit(string legCol, double pricePerUnitBid, double pricePerUnitAsk)
-        {
-            // Cacha per-unit tvåväg (overlay, 6 d.p.)
-            _twoWayPremCache[PremKey(L.PremUnit, legCol)] = new PremiumCellData
-            {
-                Bid = pricePerUnitBid,
-                Ask = pricePerUnitAsk,
-                Decimals = 6
-            };
-
-            // Bygg även tvåvägs TOTAL i nuvarande visningsvaluta så overlayn är rätt direkt
-            double N = ReadNotional(legCol);
-            double S = ReadSpot(legCol);
-            int sg = SideSign(legCol);
-
-            double totBidQuote = pricePerUnitBid * N * sg;
-            double totAskQuote = pricePerUnitAsk * N * sg;
-
-            bool showQuote = (_pricingCurrency == PricingCurrency.Quote);
-            double totBidDisp = showQuote ? totBidQuote : (S != 0.0 ? totBidQuote / S : 0.0);
-            double totAskDisp = showQuote ? totAskQuote : (S != 0.0 ? totAskQuote / S : 0.0);
-
-            _twoWayPremCache[PremKey(L.PremTot, legCol)] = new PremiumCellData
-            {
-                Bid = totBidDisp,
-                Ask = totAskDisp,
-                Decimals = 2
-            };
-
-            // Rita om premiumraderna för benet
-            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremUnit));
-            _dgv.InvalidateCell(_dgv.Columns[legCol].Index, R(L.PremTot));
-        }
-
-        // True om (row,col) är Pricing-rubriken OCH e.Location ligger inuti chipet
-        private bool IsInsidePricingHeaderButton(DataGridViewCellMouseEventArgs e)
-        {
-            if (e.RowIndex != _pricingHeaderRow) return false;
-            if (e.ColumnIndex != _dgv.Columns["FIELD"].Index) return false;
-
-            // _pricingBtnRect är "lokal" rect vi satte i CellPainting (relativt cellens 0,0)
-            if (_pricingBtnRect.IsEmpty) return false;
-
-            // e.Location är också lokal i cellen → direkt jämförelse
-            return _pricingBtnRect.Contains(e.Location);
-        }
-
-        // Bara en bekväm invalidation för chipet
-        private void InvalidatePricingHeaderCell()
-        {
-            if (_pricingHeaderRow >= 0)
-                _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, _pricingHeaderRow);
-        }
-
-        // === HELPERS: använder din rad-lookup R(Spot) och FIELD-kolumnen ===
-        private Rectangle GetMktDataFieldCellRect()
-        {
-            // Rad = "Spot Rate" via din befintliga metod R(...)
-            int row = R(L.Spot);
-            if (row < 0) return Rectangle.Empty;
-
-            // Kolumn = "FIELD" (ändra namnet om din kolumn heter något annat)
-            int col = _dgv.Columns.Contains("FIELD") ? _dgv.Columns["FIELD"].Index : -1;
-            if (col < 0) return Rectangle.Empty;
-
-            return _dgv.GetCellDisplayRectangle(col, row, true);
-        }
-
-        private void InvalidateSpotModeButton()
-        {
-            int r = R(L.Spot);
-            if (r >= 0)
-                _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, r);
-        }
-
-        private bool IsInsideMktDataFieldCell(Point clientPt)
-        {
-            var rc = GetMktDataFieldCellRect();
-            return !rc.IsEmpty && rc.Contains(clientPt);
-        }
-
-
-
-        /// <summary>
-        /// Returnerar hur många decimaler som UI *visar* för Spot i Deal-kolumnen.
-        /// - Minst 4.
-        /// - Om användaren skrev fler än 4, returneras det högsta antalet d.p. som syns.
-        /// Robust mot både "mid"-visning och "bid/ask"-visning.
-        /// </summary>
-        public int GetSpotUiDecimals()
-        {
-            int rSpot = FindRow(L.Spot);
-            if (rSpot < 0) return 4;
-
-            var val = Convert.ToString(_dgv.Rows[rSpot].Cells["Deal"].Value ?? "");
-            if (string.IsNullOrWhiteSpace(val))
-            {
-                // Deal kan vara tom vid push till legs – ta första leg som finns
-                foreach (var lg in _legs)
-                {
-                    if (!_dgv.Columns.Contains(lg)) continue;
-                    var s = Convert.ToString(_dgv.Rows[rSpot].Cells[lg].Value ?? "");
-                    var d = CountDecimalsInSpotDisplay(s);
-                    if (d > 0) return Math.Max(4, d);
-                }
-                return 4;
-            }
-
-            var decs = CountDecimalsInSpotDisplay(val);
-            return Math.Max(4, decs);
-        }
-
-        /// <summary>
-        /// Räknar decimaler i en spot-displaysträng. Stödjer "x.y" och "x.y/z.w".
-        /// Komma tolkas som decimalpunkt.
-        /// </summary>
-        private static int CountDecimalsInSpotDisplay(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return 0;
-            s = s.Trim().Replace(',', '.');
-
-            // Two-way?
-            var sep = s.IndexOf('/');
-            if (sep >= 0)
-            {
-                var left = s.Substring(0, sep).Trim();
-                var right = s.Substring(sep + 1).Trim();
-                return Math.Max(DecimalsOfNumber(left), DecimalsOfNumber(right));
-            }
-
-            // Mid
-            return DecimalsOfNumber(s);
-        }
-
-        private static int DecimalsOfNumber(string num)
-        {
-            if (string.IsNullOrWhiteSpace(num)) return 0;
-            var p = num.IndexOf('.');
-            if (p < 0) return 0;
-            int count = 0;
-            for (int i = p + 1; i < num.Length; i++)
-            {
-                var c = num[i];
-                if (c >= '0' && c <= '9') count++;
-                else break; // sluta vid första icke-siffra
-            }
-            return count;
-        }
-
-
-        // Om du senare ritar en mindre "chip" i cellen, uppdatera denna
-        private bool IsInsideMktDataButton(Point clientPt) => IsInsideMktDataFieldCell(clientPt);
-
-
-        private bool IsInsideMktHeaderButton(DataGridViewCellMouseEventArgs e)
-        {
-            if (_mktHeaderRow < 0) return false;
-            if (e.RowIndex != _mktHeaderRow) return false;
-            if (!_dgv.Columns.Contains("FIELD")) return false;
-            if (_mktBtnRect == Rectangle.Empty) return false;
-
-            // Cellens display-rect (absolut)
-            var cellRect = _dgv.GetCellDisplayRectangle(_dgv.Columns["FIELD"].Index, e.RowIndex, true);
-            if (cellRect.Width <= 0 || cellRect.Height <= 0) return false;
-
-            // Knappens absoluta rect = cellens abs + lokal knapp-rect
-            var btnAbs = new Rectangle(cellRect.X + _mktBtnRect.X, cellRect.Y + _mktBtnRect.Y, _mktBtnRect.Width, _mktBtnRect.Height);
-            var pt = _dgv.PointToClient(Cursor.Position);
-            return btnAbs.Contains(pt);
-        }
-
-
-
-        #region === Spot ===
-
-
-
-        // Invalidera hela Spot-raden (Deal + alla ben)
-        private void InvalidateSpotRow()
-        {
-            int r = R(L.Spot);
-            if (r >= 0) _dgv.InvalidateRow(r);
-        }
-
-        /// <summary>
-        /// Ser till att Spot-celler (Deal + alla ben) har SpotCellData i Tag.
-        /// Om Tag saknas byggs den från visad mid (Value) med bid=ask=mid.
-        /// </summary>
-        private void EnsureSpotSnapshotsForAll()
-        {
-            int rSpot = R(L.Spot);
-            if (rSpot < 0) return;
-
-            void ensure(string col)
-            {
-                var cell = _dgv.Rows[rSpot].Cells[col];
-
-                // --- Viktigt: skriv aldrig över befintligt tvåvägs-Tag ---
-                if (cell.Tag is SpotCellData) return;
-
-                // Skapa minsta möjliga snapshot (mid/mid) från visat värde om Tag saknas
-                double mid;
-                if (!TryParseCellNumber(cell.Value, out mid) || mid <= 0.0) return;
-
-                cell.Tag = new SpotCellData
-                {
-                    Bid = mid,
-                    Mid = mid,
-                    Ask = mid,
-                    TimeUtc = DateTime.UtcNow,
-                    Source = "Derived"
-                };
-            }
-
-            ensure("Deal");
-            for (int i = 0; i < _legs.Length; i++)
-                ensure(_legs[i]);
-        }
-
-        /// <summary>
-        /// Visar spot från FEED (F5) i Deal + alla ben, med exakt 4 d.p. på display.
-        /// Viktigt: använder WriteSpotTwoWayToCell för att:
-        ///  - uppdatera feed-baseline (för jämförelse mot manuella ändringar),
-        ///  - släcka eventuell lila override-färg (MarkOverride(..., false)) för FEED.
-        /// Därmed försvinner lila efter F5 och Deal-kolumnen visar färskt värde.
-        /// </summary>
-        public void ShowSpotFeedFixed4(double bid, double ask)
-        {
-            int rSpot = FindRow(L.Spot);
-            if (rSpot < 0) return;
-
-            // Deal – låt helpern räkna mid och sköta baseline + override off
-            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "Feed");
-
-            // Ben – samma visning, baseline & override-off per kolumn
-            for (int i = 0; i < _legs.Length; i++)
-            {
-                var lg = _legs[i];
-                if (!_dgv.Columns.Contains(lg)) continue;
-
-                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "Feed");
-            }
-        }
-
-
-        /// <summary>
-        /// Visar spot som kommer från USER (manuell input) i Deal + alla ben, med exakt 4 d.p.
-        /// Viktigt: sätter override (lila) PÅ. Baseline lämnas oförändrad så att
-        /// lila-indikeringen kvarstår tills feed tar över (F5) eller användaren nollställer.
-        /// </summary>
-        public void ShowSpotUserFixed4(double bid, double ask)
-        {
-            int rSpot = FindRow(L.Spot);
-            if (rSpot < 0) return;
-
-            // Deal – markera override = true (lila)
-            WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "User");
-            MarkOverride(L.Spot, "Deal", true);
-
-            // Ben – samma markering, per kolumn
-            for (int i = 0; i < _legs.Length; i++)
-            {
-                var lg = _legs[i];
-                if (!_dgv.Columns.Contains(lg)) continue;
-
-                WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "User");
-                MarkOverride(L.Spot, lg, true);
-            }
-        }
-
-
-        #endregion
-
-
-        /// <summary>
-        /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
-        /// relativt FEED-baseline. 
-        /// 
-        /// Viktigt:
-        /// - Aktuellt UI-värde hämtas från cell.Value (det användaren ser/har editerat).
-        /// - FEED-baseline hämtas via TryGetFeedDouble(label, col, out feed).
-        /// - Override sätts ENDAST om |UI - FEED| > tolerans.
-        /// - Saknar vi FEED-baseline just nu -> override = false (kan ej avgöras).
-        /// 
-        /// Returnerar: 
-        ///   rd / rf i DECIMAL (ex: 0.0123 = 1.23%), samt rdOverride / rfOverride.
-        /// </summary>
-        public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
-        {
-            rd = null; rf = null;
-            rdOverride = false; rfOverride = false;
-
-            if (string.IsNullOrWhiteSpace(col))
-                return false;
-
-            const double tol = 1e-9;
-
-            // === RD ===
-            try
-            {
-                int rRd = FindRow(L.Rd);
-                var cRd = _dgv.Rows[rRd].Cells[col];
-
-                // 1) Läs aktuellt UI-värde (det användaren ser/har skrivit in).
-                if (TryParseCellValueAsDecimal(cRd?.Value, out var rdUi))
-                    rd = rdUi;
-                else if (cRd?.Tag is double rdBaselineFromTag)
-                    rd = rdBaselineFromTag; // fallback om cellen är tom -> returnera baseline som värde
-
-                // 2) Läs FEED-baseline och avgör override.
-                if (TryGetFeedDouble(L.Rd, col, out var rdFeed))
-                {
-                    if (rd.HasValue)
-                        rdOverride = Math.Abs(rd.Value - rdFeed) > tol;
-                    // saknas rd => lämna rdOverride=false
-                }
-                else
-                {
-                    // Ingen FEED-baseline tillgänglig just nu → kan ej avgöra override -> false.
-                    rdOverride = false;
-                }
-            }
-            catch
-            {
-                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
-            }
-
-            // === RF ===
-            try
-            {
-                int rRf = FindRow(L.Rf);
-                var cRf = _dgv.Rows[rRf].Cells[col];
-
-                if (TryParseCellValueAsDecimal(cRf?.Value, out var rfUi))
-                    rf = rfUi;
-                else if (cRf?.Tag is double rfBaselineFromTag)
-                    rf = rfBaselineFromTag; // fallback
-
-                if (TryGetFeedDouble(L.Rf, col, out var rfFeed))
-                {
-                    if (rf.HasValue)
-                        rfOverride = Math.Abs(rf.Value - rfFeed) > tol;
-                }
-                else
-                {
-                    rfOverride = false;
-                }
-            }
-            catch
-            {
-                // kolumn/row kan saknas tillfälligt (vid layout), behåll defaults
-            }
-
-            // Returnera true om vi lyckades läsa något alls för RD eller RF
-            return rd.HasValue || rf.HasValue;
-        }
-
-
-        /// <summary>
-        /// Robust parser av cell.Value till DECIMAL (0.0123 = 1.23%).
-        /// - Hanterar double/decimal direkt.
-        /// - Hanterar strängar med kultur (svenska/invariant).
-        /// - Om procenttecken (%) finns tolkar vi och dividerar med 100.
-        /// - Tar bort whitespace och vanliga symboler.
-        /// </summary>
-        private static bool TryParseCellValueAsDecimal(object value, out double result)
-        {
-            result = 0.0;
-
-            if (value == null)
-                return false;
-
-            // Direkta numeriska typer
-            if (value is double d) { result = d; return true; }
-            if (value is float f) { result = f; return true; }
-            if (value is decimal m) { result = (double)m; return true; }
-
-            // Strängparsing
-            if (value is string s)
-            {
-                var text = s.Trim();
-
-                // Kolla om procent anges
-                var hasPercent = text.Contains("%");
-
-                // Rensa bort %, mellanslag och icke-numeriska tecken utom .,,-+
-                text = Regex.Replace(text, @"[^\d\.,\-+Ee]", "");
-
-                // Försök med CurrentCulture först (svenska), sedan Invariant
-                if (double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out var v) ||
-                    double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
-                {
-                    result = hasPercent ? v / 100.0 : v;
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        public override Size GetPreferredSize(Size proposedSize)
-        {
-            try
-            {
-                int w = _dgv.RowHeadersWidth + 2;
-                foreach (DataGridViewColumn c in _dgv.Columns)
-                    if (c.Visible) w += c.Width;
-
-                int h = _dgv.ColumnHeadersHeight + 2;
-                foreach (DataGridViewRow r in _dgv.Rows)
-                    if (r.Visible) h += r.Height;
-
-                // Ta höjd för scrollbars om de behövs
-                if (_dgv.DisplayedRowCount(false) < _dgv.RowCount)
-                    w += SystemInformation.VerticalScrollBarWidth;
-                if (_dgv.DisplayedColumnCount(false) < _dgv.ColumnCount)
-                    h += SystemInformation.HorizontalScrollBarHeight;
-
-                // Rimliga gränser (justera vid behov)
-                var min = new Size(1200, 600);
-                var max = new Size(1700, 1050);
-
-                w = Math.Min(Math.Max(w, min.Width), max.Width);
-                h = Math.Min(Math.Max(h, min.Height), max.Height);
-
-                return new Size(w, h);
-            }
-            catch
-            {
-                return new Size(1000, 600);
-            }
-        }
-
-        /// <summary>
-        /// Visar Forward Rate och Forward Points för ett visst ben (legId).
-        /// Points presenteras som ×1000 (enbart presentation).
-        /// </summary>
-        public void ShowForwardById(Guid legId, double? fwd, double? pts)
-        {
-            var col = TryGetLabel(legId);
-            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
-
-            int rFwd = FindRow(L.FwdRate);
-            int rPts = FindRow(L.FwdPts);
-            if (rFwd < 0 && rPts < 0) return;
-
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
-
-            if (rFwd >= 0)
-                _dgv.Rows[rFwd].Cells[col].Value = (fwd.HasValue ? fwd.Value.ToString("F6", ci) : "");
-
-            if (rPts >= 0)
-            {
-                // Skala ×1000 i visningen
-                string txt = "";
-                if (pts.HasValue)
-                {
-                    double scaled = pts.Value * 10000.0;
-                    txt = scaled.ToString("F3", ci);
-                }
-                _dgv.Rows[rPts].Cells[col].Value = txt;
-            }
-
-            //System.Diagnostics.Debug.WriteLine(
-            //    $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
-        }
-
-
-        /// <summary>
-        /// Visar RD/RF från FEED för ett specifikt ben (via LegId) som "baseline":
-        /// - Sätter både Tag (logiskt decimalvärde) och Value (formaterad text) för RD/RF.
-        /// - Lagrar baseline i _feedValue via SetFeedValue(...) så TryGetFeedDouble fungerar robust
-        ///   (viktigt för Delete-reset och för override-jämförelser).
-        /// - Släcker lila (MarkOverride(..., false)) för båda sidor.
-        /// - Sätter ev. stale-hint i tooltip.
-        /// </summary>
-        public void ShowRatesById(Guid legId, double? rdDec, double? rfDec, bool staleRd, bool staleRf)
-        {
-            var col = TryGetLabel(legId);
-            if (string.IsNullOrWhiteSpace(col)) return;
-
-            int rRd = R(L.Rd);
-            int rRf = R(L.Rf);
-            if (rRd < 0 || rRf < 0) return; // RD/RF-rader saknas i layouten
-
-            // RD (baseline -> Tag/Value + cache i _feedValue)
-            var cRd = _dgv.Rows[rRd].Cells[col];
-            if (rdDec.HasValue)
-            {
-                cRd.Tag = rdDec.Value;                       // feed-baseline som decimal
-                cRd.Value = FormatPercent(rdDec.Value, 3);   // visning
-                SetFeedValue(L.Rd, col, rdDec.Value);        // <-- viktigt: baseline-cache för Delete/TryGetFeedDouble
-            }
-            else
-            {
-                cRd.Tag = null;
-                cRd.Value = "";
-                // valfritt: ta bort ur _feedValue om du vill, annars lämna kvar senaste baseline
-                // _feedValue.Remove(Key(L.Rd, col));
-            }
-            MarkOverride(L.Rd, col, false);
-
-            // RF (baseline -> Tag/Value + cache i _feedValue)
-            var cRf = _dgv.Rows[rRf].Cells[col];
-            if (rfDec.HasValue)
-            {
-                cRf.Tag = rfDec.Value;
-                cRf.Value = FormatPercent(rfDec.Value, 3);
-                SetFeedValue(L.Rf, col, rfDec.Value);        // <-- viktigt
-            }
-            else
-            {
-                cRf.Tag = null;
-                cRf.Value = "";
-                // _feedValue.Remove(Key(L.Rf, col));
-            }
-            MarkOverride(L.Rf, col, false);
-
-            // (valfritt) stale-hint
-            cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
-            cRf.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
-
-            _dgv.InvalidateRow(rRd);
-            _dgv.InvalidateRow(rRf);
-
-            Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
-        }
-
-
     }
-
-
-
-
 
     #region Cell Data Classes
 
