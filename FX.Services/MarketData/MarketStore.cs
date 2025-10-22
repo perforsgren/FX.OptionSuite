@@ -226,15 +226,26 @@ namespace FX.Services.MarketData
         #region RD & RF
 
         /// <summary>
-        /// Skriver rd (domestic rate) från feed för angivet ben. Idempotent mot Effective-värden
-        /// (ingen ändring/Changed om värdet inte ändrats, med liten EPS-tolerans).
-        /// Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// Skriver rd (domestic rate) från feed för angivet ben.
+        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
+        ///   så att Store:s baseline exakt matchar UI:s precision.
+        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
+        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
         /// </summary>
         public void SetRdFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
-            var tw = NormalizeMonotone(value);
+
+            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---
+            const int DEC = 5;
+            var vq = new TwoWay<double>(
+                bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
+                ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
+            );
+
+            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
+            var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
 
@@ -299,16 +310,28 @@ namespace FX.Services.MarketData
             RaiseChanged("FeedRd:" + legId);
         }
 
+
         /// <summary>
-        /// Skriver rf (foreign rate) från feed för angivet ben. Idempotent mot Effective-värden
-        /// (ingen ändring/Changed om oförändrat). Respekterar Override-läge.
-        /// Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// Skriver rf (foreign rate) från feed för angivet ben.
+        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
+        ///   så att Store:s baseline exakt matchar UI:s precision.
+        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
+        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
         /// </summary>
         public void SetRfFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
-            var tw = NormalizeMonotone(value);
+
+            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---
+            const int DEC = 5;
+            var vq = new TwoWay<double>(
+                bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
+                ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
+            );
+
+            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
+            var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
 
@@ -349,6 +372,7 @@ namespace FX.Services.MarketData
 
                 case OverrideMode.Mid:
                 case OverrideMode.Both:
+                    // Låst – ingen feedpåverkan
                     return;
 
                 case OverrideMode.None:
@@ -373,9 +397,11 @@ namespace FX.Services.MarketData
         }
 
 
+
         /// <summary>
         /// User → rd. wasMid=true ⇒ lås Mid (bid=ask=mid). wasMid=false ⇒ lås båda sidor (Override=Both).
         /// ViewMode påverkar visning. Skriver Source=User och triggar Changed("UserRd:<legId>").
+        /// NYTT: Kvantisera alltid till UI-precision (5 d.p. i decimal) innan lagring så Store == UI.
         /// </summary>
         public void SetRdFromUser(string pair6, string legId, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
         {
@@ -383,12 +409,28 @@ namespace FX.Services.MarketData
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
             EnsureSnapshotPair(p6);
 
-            var tw = NormalizeMonotone(value);
-            var mid = wasMid ? 0.5 * (tw.Bid + tw.Ask) : (double?)null;
-            var val = wasMid ? new TwoWay<double>(mid.Value, mid.Value) : tw;
+            const int DEC = 5;
 
-            // Viktigt: lås båda sidor vid two-way override
+            // Kvantisera först till UI-precision
+            var vq = new TwoWay<double>(
+                Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
+                Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
+            );
+
+            TwoWay<double> val;
             var ov = wasMid ? OverrideMode.Mid : OverrideMode.Both;
+
+            if (wasMid)
+            {
+                // Lås mid (kvantiserad)
+                var midQ = Math.Round(0.5 * (vq.Bid + vq.Ask), DEC, MidpointRounding.AwayFromZero);
+                val = new TwoWay<double>(midQ, midQ);
+            }
+            else
+            {
+                // Two-way: säkerställ monotoni efter kvantisering
+                val = NormalizeMonotone(vq);
+            }
 
             _current.RdByLeg[legId] = new MarketField<double>(
                 value: val,
@@ -403,8 +445,10 @@ namespace FX.Services.MarketData
             RaiseChanged("UserRd:" + legId);
         }
 
+
         /// <summary>
         /// User → rf. Samma regler som rd.
+        /// NYTT: Kvantisera alltid till UI-precision (5 d.p. i decimal) innan lagring så Store == UI.
         /// </summary>
         public void SetRfFromUser(string pair6, string legId, TwoWay<double> value, bool wasMid, ViewMode viewMode, DateTime nowUtc)
         {
@@ -412,11 +456,28 @@ namespace FX.Services.MarketData
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
             EnsureSnapshotPair(p6);
 
-            var tw = NormalizeMonotone(value);
-            var mid = wasMid ? 0.5 * (tw.Bid + tw.Ask) : (double?)null;
-            var val = wasMid ? new TwoWay<double>(mid.Value, mid.Value) : tw;
+            const int DEC = 5;
 
+            // Kvantisera först till UI-precision
+            var vq = new TwoWay<double>(
+                Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
+                Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
+            );
+
+            TwoWay<double> val;
             var ov = wasMid ? OverrideMode.Mid : OverrideMode.Both;
+
+            if (wasMid)
+            {
+                // Lås mid (kvantiserad)
+                var midQ = Math.Round(0.5 * (vq.Bid + vq.Ask), DEC, MidpointRounding.AwayFromZero);
+                val = new TwoWay<double>(midQ, midQ);
+            }
+            else
+            {
+                // Two-way: säkerställ monotoni efter kvantisering
+                val = NormalizeMonotone(vq);
+            }
 
             _current.RfByLeg[legId] = new MarketField<double>(
                 value: val,
@@ -430,6 +491,7 @@ namespace FX.Services.MarketData
 
             RaiseChanged("UserRf:" + legId);
         }
+
 
 
         public void SetRdViewMode(string pair6, string legId, ViewMode viewMode, DateTime nowUtc)

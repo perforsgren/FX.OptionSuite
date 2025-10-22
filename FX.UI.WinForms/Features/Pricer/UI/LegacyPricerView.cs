@@ -1378,6 +1378,62 @@ namespace FX.UI.WinForms
             e.Handled = true;
         }
 
+
+        /// <summary>
+        /// KeyDown i gridden:
+        /// - Backspace: starta edit och markera allt (om inte readonly/sektion).
+        /// - Delete: stumt överallt utom på RD/RF i benkolumn – där bubbla upp till ProcessCmdKey
+        ///   (den gör baseline-återställningen). Vi undertrycker Delete för alla andra fall.
+        /// </summary>
+        private void Dgv_KeyDownStartEdit(object sender, KeyEventArgs e)
+        {
+            var cell = _dgv.CurrentCell;
+            if (cell == null) return;
+
+            // --- Backspace: gå in i edit-läge och markera allt (icke-readonly) ---
+            if (e.KeyCode == Keys.Back)
+            {
+                if (!cell.ReadOnly && !IsSectionRow(_dgv.Rows[cell.RowIndex]))
+                {
+                    _dgv.BeginEdit(true);
+                    if (_dgv.EditingControl is TextBox tb)
+                    {
+                        tb.SelectionStart = 0;
+                        tb.SelectionLength = tb.TextLength;
+                    }
+                    _dgv.InvalidateCell(cell.ColumnIndex, cell.RowIndex);
+                }
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+
+            // --- Delete: låt RD/RF i benkolumn bubbla upp; annars stumt ---
+            if (e.KeyCode == Keys.Delete)
+            {
+                string lbl = Convert.ToString(_dgv.Rows[cell.RowIndex].Cells["FIELD"].Value);
+                string colName = _dgv.Columns[cell.ColumnIndex].Name;
+
+                bool isLegCol = !string.Equals(colName, "Deal", StringComparison.OrdinalIgnoreCase);
+                bool isRd = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase);
+                bool isRf = string.Equals(lbl, L.Rf, StringComparison.OrdinalIgnoreCase);
+
+                if (isLegCol && (isRd || isRf))
+                {
+                    // Viktigt: gör inget här – ProcessCmdKey tar Delete och återställer EN sida.
+                    return; // inte handled → låt ProcessCmdKey köra
+                }
+
+                // Alla andra fall: Delete ska vara stumt
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+
+            // Andra tangenter: inget specialfall här
+        }
+
+
         /// <summary>
         /// KeyDown på DGV:
         /// - Backspace: starta edit och markera allt (om cellen inte är readonly/sektion).
@@ -1385,7 +1441,7 @@ namespace FX.UI.WinForms
         ///           men gör Delete stumt för alla andra fall (handled+suppressed).
         /// - Spot/Deal-blockering bibehållen för Delete/Back om så önskas via readonly.
         /// </summary>
-        private void Dgv_KeyDownStartEdit(object sender, KeyEventArgs e)
+        private void Dgv_KeyDownStartEditOLD(object sender, KeyEventArgs e)
         {
             var cell = _dgv.CurrentCell;
             if (cell == null) return;
@@ -3445,7 +3501,7 @@ namespace FX.UI.WinForms
         /// - F9: reprice alla ben
         /// - Delete: stumt överallt UTOM RD/RF i benkolumn – där återställs till senaste baseline (feed/Tag) och override nollas i Store.
         /// </summary>
-        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        protected bool ProcessCmdKeyOLD(ref Message msg, Keys keyData)
         {
             // F2: in i edit mode + markera allt innehåll
             if (keyData == Keys.F2)
@@ -3557,10 +3613,129 @@ namespace FX.UI.WinForms
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
+        /// <summary>
+        /// Tangentkommandon i gridden:
+        /// - F2: starta edit och markera allt
+        /// - F5: spot refresh
+        /// - F6: add leg
+        /// - F7: force refresh rates
+        /// - F9: reprice alla ben
+        /// - Delete: stumt överallt UTOM RD/RF i benkolumn – där återställs endast den sidan
+        ///   till senaste baseline (feed/Tag) och override nollas i Store (Presenter).
+        ///   Övriga fält (inkl. Deal-kolumn) påverkas inte av Delete här.
+        /// </summary>
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            // F2: in i edit mode + markera allt innehåll
+            if (keyData == Keys.F2)
+            {
+                var cell = _dgv.CurrentCell;
+                if (cell != null && !cell.ReadOnly && !IsSectionRow(_dgv.Rows[cell.RowIndex]))
+                {
+                    _dgv.BeginEdit(true);
+                    if (_dgv.EditingControl is TextBox tb)
+                    {
+                        tb.SelectionStart = 0;
+                        tb.SelectionLength = tb.TextLength;
+                    }
+                    return true;
+                }
+                return false;
+            }
 
+            if (keyData == Keys.F5)
+            {
+                SpotRefreshRequested?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
 
+            if (keyData == Keys.F6)
+            {
+                AddLegRequested?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
 
+            if (keyData == Keys.F7)
+            {
+                RatesRefreshRequested?.Invoke(this, EventArgs.Empty);
+                return true;
+            }
 
+            // F9: reprice alla ben
+            if (keyData == Keys.F9)
+            {
+                PriceRequested?.Invoke(this, new PriceRequestUiArgs { TargetLeg = null });
+                return true;
+            }
+
+            // DELETE: stumt överallt utom RD/RF i benkolumn (återställ EN sida)
+            if (keyData == Keys.Delete)
+            {
+                var cell = _dgv?.CurrentCell;
+                if (cell == null) return base.ProcessCmdKey(ref msg, keyData);
+
+                string lbl = Convert.ToString(_dgv.Rows[cell.RowIndex].Cells["FIELD"].Value ?? "");
+                string col = _dgv.Columns[cell.ColumnIndex].Name;
+
+                // endast legs (inte "Deal") och endast RD/RF-rader
+                bool isLegCol = !string.Equals(col, "Deal", StringComparison.OrdinalIgnoreCase);
+                bool isRd = string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase);
+                bool isRf = string.Equals(lbl, L.Rf, StringComparison.OrdinalIgnoreCase);
+
+                if (!(isLegCol && (isRd || isRf)))
+                {
+                    // Delete ska vara stumt i alla andra fall
+                    return true;
+                }
+
+                string field = isRd ? "Rd" : "Rf";
+
+                // Hämta baseline: först feed-snapshot (_feedValue), annars cell.Tag (senast kända feed)
+                bool haveBaseline = false;
+                double feed = 0.0;
+
+                if (!haveBaseline && TryGetFeedDouble(isRd ? L.Rd : L.Rf, col, out var f1))
+                {
+                    feed = f1; haveBaseline = true;
+                }
+                if (!haveBaseline)
+                {
+                    int rProbe = isRd ? R(L.Rd) : R(L.Rf);
+                    if (rProbe >= 0)
+                    {
+                        var cProbe = _dgv.Rows[rProbe].Cells[col];
+                        if (cProbe.Tag is double tagVal)
+                        {
+                            feed = tagVal; haveBaseline = true;
+                        }
+                    }
+                }
+
+                // Om vi har en baseline: skriv om just den cellen direkt (värde + släck lila)
+                if (haveBaseline)
+                {
+                    int r = isRd ? R(L.Rd) : R(L.Rf);
+                    var c = _dgv.Rows[r].Cells[col];
+
+                    c.Tag = feed;                         // håll baseline i Tag
+                    c.Value = FormatPercent(feed, 3);     // visa baseline värdet nu
+                    MarkOverride(isRd ? L.Rd : L.Rf, col, false);
+                    _dgv.InvalidateCell(c.ColumnIndex, r);
+                }
+
+                // Signalera till Presentern att nolla override i Store för just DEN sidan
+                RateClearOverrideRequested?.Invoke(this, new RateClearOverrideRequestedEventArgs
+                {
+                    LegColumn = col,
+                    Field = field
+                });
+
+                // Presentern schemalägger debouncad reprice → korrekt premie direkt
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
 
         #endregion
 
@@ -4566,12 +4741,13 @@ namespace FX.UI.WinForms
         }
 
 
-
         /// <summary>
-        /// Visar RD/RF (decimaler) för ett specifikt ben.
-        /// - Formaterar som procent med 3 d.p.
-        /// - Lagrar feed-baseline i Tag (double) för korrekt override-hantering.
-        /// - Om raderna inte finns än, eller kolumnen saknas, görs inget.
+        /// Visar RD/RF från FEED för ett specifikt ben (via LegId) som "baseline":
+        /// - Sätter både Tag (logiskt decimalvärde) och Value (formaterad text) för RD/RF.
+        /// - Lagrar baseline i _feedValue via SetFeedValue(...) så TryGetFeedDouble fungerar robust
+        ///   (viktigt för Delete-reset och för override-jämförelser).
+        /// - Släcker lila (MarkOverride(..., false)) för båda sidor.
+        /// - Sätter ev. stale-hint i tooltip.
         /// </summary>
         public void ShowRatesById(Guid legId, double? rdDec, double? rfDec, bool staleRd, bool staleRf)
         {
@@ -4580,40 +4756,44 @@ namespace FX.UI.WinForms
 
             int rRd = R(L.Rd);
             int rRf = R(L.Rf);
-            if (rRd < 0 || rRf < 0) return; // rd/rf-rader saknas i layouten
+            if (rRd < 0 || rRf < 0) return; // RD/RF-rader saknas i layouten
 
-            // RD
+            // RD (baseline -> Tag/Value + cache i _feedValue)
             var cRd = _dgv.Rows[rRd].Cells[col];
             if (rdDec.HasValue)
             {
-                cRd.Tag = rdDec.Value;                 // feed-baseline som decimal
-                cRd.Value = FormatPercent(rdDec.Value, 3);
+                cRd.Tag = rdDec.Value;                       // feed-baseline som decimal
+                cRd.Value = FormatPercent(rdDec.Value, 3);   // visning
+                SetFeedValue(L.Rd, col, rdDec.Value);        // <-- viktigt: baseline-cache för Delete/TryGetFeedDouble
             }
             else
             {
                 cRd.Tag = null;
                 cRd.Value = "";
+                // valfritt: ta bort ur _feedValue om du vill, annars lämna kvar senaste baseline
+                // _feedValue.Remove(Key(L.Rd, col));
             }
-            // feed ska inte markeras som override
             MarkOverride(L.Rd, col, false);
 
-            // RF
+            // RF (baseline -> Tag/Value + cache i _feedValue)
             var cRf = _dgv.Rows[rRf].Cells[col];
             if (rfDec.HasValue)
             {
-                cRf.Tag = rfDec.Value;                 // feed-baseline som decimal
+                cRf.Tag = rfDec.Value;
                 cRf.Value = FormatPercent(rfDec.Value, 3);
+                SetFeedValue(L.Rf, col, rfDec.Value);        // <-- viktigt
             }
             else
             {
                 cRf.Tag = null;
                 cRf.Value = "";
+                // _feedValue.Remove(Key(L.Rf, col));
             }
             MarkOverride(L.Rf, col, false);
 
-            // (valfritt) Indikera stale i tooltip – icke-blockerande visuell hint
-            if (staleRd) cRd.ToolTipText = "Stale RD (cache TTL passerad)"; else cRd.ToolTipText = null;
-            if (staleRf) cRf.ToolTipText = "Stale RF (cache TTL passerad)"; else cRf.ToolTipText = null;
+            // (valfritt) stale-hint
+            cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
+            cRf.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
 
             _dgv.InvalidateRow(rRd);
             _dgv.InvalidateRow(rRf);
@@ -4621,7 +4801,10 @@ namespace FX.UI.WinForms
             Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
         }
 
+
     }
+
+
 
 
 
