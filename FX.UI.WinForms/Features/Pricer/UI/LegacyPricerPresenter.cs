@@ -251,7 +251,7 @@ namespace FX.UI.WinForms
         private static DataTable LoadHolidaysForPair(string pair6)
         {
             var cals = CurrencyCalendarMapper.GetCalendarsForPair(pair6) ?? Array.Empty<string>();
-            var conn = Environment.GetEnvironmentVariable("AHS_SQL_CONN");
+            var conn = Environment.GetEnvironmentVariable("AHS_SQL_CONN") ?? "Data Source=AHSKvant-prod-db;Initial Catalog=AHS;Integrated Security=True;Connect Timeout=15";
             if (string.IsNullOrWhiteSpace(conn) || cals.Length == 0)
                 return new DataTable();
 
@@ -307,15 +307,15 @@ namespace FX.UI.WinForms
             }
             else
             {
-                if (_suppressUiRatesWriteOnce)
-                {
-                    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (expiry: suppress once).");
-                    _suppressUiRatesWriteOnce = false; // engångsflagga
-                }
-                else
-                {
-                    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (ForceRefreshRates=true).");
-                }
+                //if (_suppressUiRatesWriteOnce)
+                //{
+                //    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (expiry: suppress once).");
+                //    _suppressUiRatesWriteOnce = false; // engångsflagga
+                //}
+                //else
+                //{
+                //    System.Diagnostics.Debug.WriteLine("[Presenter.Rates->Store] Skip UI->Store write (ForceRefreshRates=true).");
+                //}
             }
 
             var snap = _view.GetLegSnapshotById(legId);
@@ -1104,7 +1104,7 @@ namespace FX.UI.WinForms
                     var legIdStr = _legStates[i].LegId.ToString();
                     _mktStore.SetRdOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
                     _mktStore.SetRfOverride(pair6, legIdStr, OverrideMode.None, nowUtc);
-                    System.Diagnostics.Debug.WriteLine($"[Presenter.F7] Cleared overrides (RD/RF) leg={legIdStr}");
+                    //System.Diagnostics.Debug.WriteLine($"[Presenter.F7] Cleared overrides (RD/RF) leg={legIdStr}");
                 }
 
                 // 2) Prisning med ForceRefreshRates=true → nya RD/RF hämtas
@@ -1438,8 +1438,8 @@ namespace FX.UI.WinForms
                                         rfFld.Override != OverrideMode.None &&
                                         rfFld.Source == FX.Core.Domain.MarketData.MarketSource.User;
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Presenter.UI.Rates] leg={legId} rd={(rdMid?.ToString("F6") ?? "-")} rf={(rfMid?.ToString("F6") ?? "-")} ovRd={rdOverrideActive} ovRf={rfOverrideActive}");
+                //System.Diagnostics.Debug.WriteLine(
+                //    $"[Presenter.UI.Rates] leg={legId} rd={(rdMid?.ToString("F6") ?? "-")} rf={(rfMid?.ToString("F6") ?? "-")} ovRd={rdOverrideActive} ovRf={rfOverrideActive}");
 
                 // Respektera override i UI-push:
                 // - Om override aktiv: visa override-värden (lila), rör inte baseline.
@@ -1575,12 +1575,12 @@ namespace FX.UI.WinForms
 
                 _view.ShowForwardById(legId, F, P);
 
-                var ci = System.Globalization.CultureInfo.InvariantCulture;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
-                    $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
-                    $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
-                    $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
+                //var ci = System.Globalization.CultureInfo.InvariantCulture;
+                //System.Diagnostics.Debug.WriteLine(
+                //    $"[Presenter.UI.Fwd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] leg={legId} pair={pair6} " +
+                //    $"S={S.ToString("F6", ci)} rd={rdMid.ToString("F6", ci)} rf={rfMid.ToString("F6", ci)} " +
+                //    $"spot={spotDate:yyyy-MM-dd} settle={settlement:yyyy-MM-dd} Tq={Tq.ToString("F6", ci)} Tb={Tb.ToString("F6", ci)} " +
+                //    $"F={F.ToString("F6", ci)} Pts={P.ToString("F6", ci)}");
             }
             catch (Exception ex)
             {

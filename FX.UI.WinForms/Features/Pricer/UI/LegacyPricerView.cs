@@ -547,11 +547,11 @@ namespace FX.UI.WinForms
 
         void SeedDemoValues()
         {
-            Set("Deal", L.Pair, "USDSEK");
+            Set("Deal", L.Pair, "EURSEK");
             Set("Deal", L.Notional, "10 000 000");
             Set("Deal", L.Side, "Buy");
             Set("Deal", L.CallPut, "Call");
-            Set("Deal", L.Strike, "9.4500");
+            Set("Deal", L.Strike, "10.9500");
 
             // Sprid Deal → legs, sedan RD/RF
             CopyDealToLegs(Section.DealDetails, keepDeal: false);
@@ -772,9 +772,10 @@ namespace FX.UI.WinForms
             var cell = row.Cells[e.ColumnIndex];
             string rowLabel = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
 
-            // Rollback som bevarar rätt format (%, vol-par)
+            // --- Rollback som bevarar rätt format (samma som din befintliga – utökad med Spot-gren) ---
             Action rollback = () =>
             {
+                // RD/RF → procentformat (3 d.p.)
                 if (string.Equals(lbl, L.Rd, StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(lbl, L.Rf, StringComparison.OrdinalIgnoreCase))
                 {
@@ -783,6 +784,7 @@ namespace FX.UI.WinForms
                     else
                         cell.Value = Convert.ToString(cell.Tag ?? cell.Value ?? "");
                 }
+                // VOL → enkel % eller bid/ask-par i %
                 else if (string.Equals(lbl, L.Vol, StringComparison.OrdinalIgnoreCase))
                 {
                     if (cell.Tag is VolCellData vtag)
@@ -801,12 +803,49 @@ namespace FX.UI.WinForms
                         cell.Value = Convert.ToString(cell.Tag ?? cell.Value ?? "");
                     }
                 }
+                // SPOT → ***NYTILLKOMMEN GREN*** (undvik Convert.ToString(SpotCellData))
+                else if (string.Equals(lbl, L.Spot, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Behåll det visuella uttrycket (mid eller "bid / ask") och antal decimals
+                    var prev = Convert.ToString(cell.Value ?? "");
+                    int dp = Math.Max(4, CountDecimalsInSpotDisplay(prev)); // min 4 d.p. som hos dig
+
+                    if (cell.Tag is SpotCellData s)
+                    {
+                        var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+                        // Om det tidigare såg ut som ett par ("x / y"), fortsätt visa som par.
+                        if (prev != null && prev.IndexOf("/", StringComparison.Ordinal) >= 0)
+                        {
+                            // säkerställ monotoni
+                            var bid = s.Bid; var ask = s.Ask;
+                            if (ask < bid) { var t = bid; bid = ask; ask = t; }
+                            cell.Value = bid.ToString("F" + dp, inv) + " / " + ask.ToString("F" + dp, inv);
+                        }
+                        else
+                        {
+                            // visa mid med samma (minst) decimals
+                            var mid = s.Mid;
+                            cell.Value = mid.ToString("F" + dp, inv);
+                        }
+                    }
+                    else
+                    {
+                        // Saknar meningsfull Tag – behåll tidigare display (ingen typenamnsdump).
+                        cell.Value = prev;
+                    }
+                }
+                // Övriga rader → default-beteende
                 else
                 {
                     cell.Value = Convert.ToString(cell.Tag ?? cell.Value ?? "");
                 }
+
                 _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
             };
+            // --- Slut rollback -
+
+
 
             // ===== SPOT =====
             if (string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase))
@@ -826,14 +865,14 @@ namespace FX.UI.WinForms
                 if (ask < bid) { var t = bid; bid = ask; ask = t; } // extra monotoni-säkerhet
                 double mid = 0.5 * (bid + ask);
 
-                // 2) Ändringsdetektering mot edit-start (undvik onödig reprissning)
+                // 2) Ändringsdetektering relativt _editStart
                 string kStart = Key(L.Spot, col);
                 bool changed = true; object startObj;
                 if (_editStart.TryGetValue(kStart, out startObj) && startObj is double s0)
                     changed = Math.Abs(s0 - mid) > 1e-9;
                 _editStart.Remove(kStart);
 
-                // 3) Enligt regel: Spot editeras endast i Deal (inte i ben)
+                // 3) Spot får bara editeras i Deal
                 if (!string.Equals(col, "Deal", StringComparison.OrdinalIgnoreCase))
                 {
                     rollback();
@@ -841,7 +880,17 @@ namespace FX.UI.WinForms
                     return;
                 }
 
-                // 4) Normaliserad visning i Deal-cellen (minst 4 d.p., behåll fler om user skrev fler)
+                // *** NYTT: Om inget har ändrats – rör inte override, behåll tidigare state ***
+                if (!changed)
+                {
+                    // Återställ visningen (bevarar format) och lämna cellen orörd
+                    rollback();
+                    _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
+                    return;
+                }
+                // *** SLUT NYTT ***
+
+                // 4) Normaliserad visning i Deal (minst 4 d.p., behåll fler om user skrev fler)
                 string display = FormatSpotWithMinDecimals(raw, mid, 4);
                 cell.Value = display;
 
@@ -855,7 +904,7 @@ namespace FX.UI.WinForms
                     Source = "User"
                 };
 
-                // 6) Push till alla ben (UI-state + visning)
+                // 6) Push till alla ben (UI-state + visning) – oförändrat beteende
                 int rSpot = FindRow(L.Spot);
                 for (int i = 0; i < _legs.Length; i++)
                 {
@@ -872,50 +921,41 @@ namespace FX.UI.WinForms
                         Source = "User"
                     };
 
-                    // Override-färg relativt feed-baseline (per ben)
+                    // (Befintligt: benens override sätts enligt feed-jämförelse)
                     double fLeg;
                     bool atFeedLeg = TryGetFeedDouble(L.Spot, lg, out fLeg) && Math.Abs(fLeg - mid) <= 1e-9;
                     MarkOverride(L.Spot, lg, !atFeedLeg);
                 }
 
-                // 7) Override-färg för Deal relativt ev. Deal-feed-baseline
+                // 7) Override för Deal relativt ev. Deal-feed-baseline – oförändrat
                 double fDeal;
                 bool atFeedDeal = TryGetFeedDouble(L.Spot, "Deal", out fDeal) && Math.Abs(fDeal - mid) <= 1e-9;
                 MarkOverride(L.Spot, "Deal", !atFeedDeal);
 
-                // 8) Växla läge baserat på inmatning:
-                //    - Two-way → Full
-                //    - Mid (bid==ask) → Mid
+                // 8) Växla läge baserat på inmatning – oförändrat
                 var desired = (Math.Abs(bid - ask) > 1e-12) ? SpotMode.Full : SpotMode.Mid;
                 var oldMode = _spotMode;
                 if (oldMode != desired)
                 {
                     _spotMode = desired;
-
-                    // FULL/LIVE: se till att tvåvägssnapshots finns
                     if (_spotMode == SpotMode.Full || _spotMode == SpotMode.Live)
                         EnsureSpotSnapshotsForAll();
 
-                    // Nollställ knapp-state och tvinga repaint (fix för att chipet ibland inte målades om)
                     _mktBtnPressed = false;
                     _mktBtnInside = false;
                     _dgv.Cursor = Cursors.Default;
-                    _mktBtnRect = Rectangle.Empty;   // räkna om rect i nästa målning
+                    _mktBtnRect = Rectangle.Empty;
 
-                    // Invalidera och tvinga grid att rita om efter att edit-loopen är klar
                     this.BeginInvoke((Action)(() =>
                     {
-                        _dgv.Invalidate();   // invalidatera allt (enkelt och robust)
-                        _dgv.Update();       // rendera direkt
+                        _dgv.Invalidate();
+                        _dgv.Update();
                     }));
 
-                    // Meddela Presentern om nytt läge FÖRE SpotEdited så Store.ViewMode hinner sättas
-                    var ev = SpotModeChanged;
-                    if (ev != null) ev(this, EventArgs.Empty);
+                    SpotModeChanged?.Invoke(this, EventArgs.Empty);
                 }
                 else
                 {
-                    // Läget oförändrat → säkerställ ändå ommålning (chip + rad)
                     _mktBtnPressed = false;
                     _mktBtnInside = false;
                     _dgv.Cursor = Cursors.Default;
@@ -2629,28 +2669,30 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Visar spot som kommer från USER (manuell input) i Deal + alla ben, med exakt 4 d.p.
-        /// Viktigt: sätter override (lila) PÅ. Baseline lämnas oförändrad så att
-        /// lila-indikeringen kvarstår tills feed tar över (F5) eller användaren nollställer.
+        /// Nytt: markerar override (lila) **endast i Deal**. Ben-celler uppdateras i värde
+        /// men får inte lila textfärg (override=false).
         /// </summary>
         public void ShowSpotUserFixed4(double bid, double ask)
         {
             int rSpot = FindRow(L.Spot);
             if (rSpot < 0) return;
 
-            // Deal – markera override = true (lila)
+            // Deal – skriv & markera override = true (lila)
             WriteSpotTwoWayToCell("Deal", bid, 0.0, ask, source: "User");
             MarkOverride(L.Spot, "Deal", true);
 
-            // Ben – samma markering, per kolumn
+            // Ben – skriv värden men markera INTE override (behåll normal textfärg)
             for (int i = 0; i < _legs.Length; i++)
             {
                 var lg = _legs[i];
                 if (!_dgv.Columns.Contains(lg)) continue;
 
                 WriteSpotTwoWayToCell(lg, bid, 0.0, ask, source: "User");
-                MarkOverride(L.Spot, lg, true);
+                // Viktigt: legs ska inte bli lila när Deal editeras.
+                MarkOverride(L.Spot, lg, false);
             }
         }
+
 
         /// <summary>
         /// Returnerar hur många decimaler som UI *visar* för Spot i Deal-kolumnen.
@@ -2871,7 +2913,7 @@ namespace FX.UI.WinForms
             _dgv.InvalidateRow(rRd);
             _dgv.InvalidateRow(rRf);
 
-            Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
+            //Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
         }
 
         // === Helper: re-rendera ett ben med befintliga Tag-värden och aktiv valuta ===

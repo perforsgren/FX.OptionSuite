@@ -429,6 +429,219 @@ namespace FX.Services.MarketData
         }
 
 
+        /// <summary>
+        /// (NY) Diagnostik för USD-ränta från SOFR-kurvan på egna datum.
+        /// Visar DF(spot), DF(settlement), framåtdiskonteringskvot, ACT/360-årsfaktor,
+        /// par MM-ränta (decimal och %) samt jämförelse mot närmsta kurvpelare och ev. 1M-pelaren.
+        /// Ändrar ingen state; skriver även rader till Debug.
+        /// </summary>
+        /// <param name="pair6">Par (t.ex. "USDSEK") – endast för utskrift.</param>
+        /// <param name="spotDate">Spot-datum för perioden.</param>
+        /// <param name="settlement">Delivery/settlement-datum för perioden.</param>
+        /// <param name="forceRefresh">
+        /// true = säkerställ färsk USD-kurva (ignorera cache/TTL); false = använd cache om giltig.
+        /// </param>
+        /// <returns>En färdig-formaterad diagnostiksträng.</returns>
+        public string DumpUsdRfDiagnostics(string pair6, DateTime spotDate, DateTime settlement, bool forceRefresh = false)
+        {
+            // Säkerställ kurvan i cachen (kan starta BLP-session internt vid behov).
+            EnsureUsdCurveCached(forceRefresh); // använder klassens cachepolicy. :contentReference[oaicite:0]{index=0}
+
+            var usd = s_cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+            // Basdata för perioden Spot→Settlement
+            double dfSpot = Clamp01(usd.DiscountFactor(spotDate));
+            double dfSet = Clamp01(usd.DiscountFactor(settlement));
+            double Tmm = YearFracMm(spotDate, settlement, "USD");     // ACT/360 för USD. :contentReference[oaicite:1]{index=1}
+            double rPar = ParMmRate(dfSpot, dfSet, Tmm);               // enkel MM-parränta. :contentReference[oaicite:2]{index=2}
+            double dfFwd = Clamp01(dfSet / Math.Max(1e-12, dfSpot));
+
+            // Hitta närmaste pelare (datum) i kurvan i förhållande till settlement
+            DateTime nearestDate = DateTime.MinValue;
+            string nearestTenor = "";
+            double nearestAbsDays = double.MaxValue;
+
+            var pillars = usd.Pillars;                                   // DataTable: Date, Tenor, ZeroMid, DF. :contentReference[oaicite:3]{index=3}
+            if (pillars != null)
+            {
+                foreach (System.Data.DataRow row in pillars.Rows)
+                {
+                    var d = System.Convert.ToDateTime(row["Date"], inv).Date;
+                    double absDays = Math.Abs((d - settlement.Date).TotalDays);
+                    if (absDays < nearestAbsDays)
+                    {
+                        nearestAbsDays = absDays;
+                        nearestDate = d;
+                        nearestTenor = (pillars.Columns.Contains("Tenor") ? System.Convert.ToString(row["Tenor"] ?? "", inv) : "");
+                    }
+                }
+            }
+
+            // Par-ränta till närmaste pelardatum räknad med våra SPOT→pelare-datum
+            double rNear = double.NaN;
+            if (nearestDate != DateTime.MinValue)
+            {
+                double dfNear = Clamp01(usd.DiscountFactor(nearestDate));
+                double Tnear = YearFracMm(spotDate, nearestDate, "USD");
+                rNear = ParMmRate(dfSpot, dfNear, Tnear);
+            }
+
+            // Försök även läsa ren "1M"-pelare om den existerar i tabellen
+            DateTime oneMDate = DateTime.MinValue;
+            double rOneM = double.NaN;
+            if (pillars != null && pillars.Columns.Contains("Tenor"))
+            {
+                foreach (System.Data.DataRow row in pillars.Rows)
+                {
+                    var tn = System.Convert.ToString(row["Tenor"] ?? "", inv);
+                    if (string.Equals(tn?.Trim(), "1M", StringComparison.OrdinalIgnoreCase))
+                    {
+                        oneMDate = System.Convert.ToDateTime(row["Date"], inv).Date;
+                        double df1m = Clamp01(usd.DiscountFactor(oneMDate));
+                        double T1m = YearFracMm(spotDate, oneMDate, "USD");
+                        rOneM = ParMmRate(dfSpot, df1m, T1m);
+                        break;
+                    }
+                }
+            }
+
+            // Stale-bedomning från cachetidsstämplar
+            bool usdStale = IsStaleByTtl(s_usdLoadedUtc, UsdCurveTtl);   // :contentReference[oaicite:4]{index=4}
+
+            // Skriv ut
+            var sb = new System.Text.StringBuilder(512);
+            sb.AppendLine("[USD SOFR Diagnostics]");
+            sb.AppendLine("Pair: " + (pair6 ?? ""));
+            sb.AppendLine("ValDate: " + usd.ValDate.ToString("yyyy-MM-dd", inv));
+            sb.AppendLine("Spot: " + spotDate.ToString("yyyy-MM-dd", inv) + "  Settlement: " + settlement.ToString("yyyy-MM-dd", inv));
+            sb.AppendLine("ACT/360 (T): " + Tmm.ToString("F6", inv));
+            sb.AppendLine("DF(spot): " + dfSpot.ToString("F9", inv) + "   DF(settle): " + dfSet.ToString("F9", inv));
+            sb.AppendLine("Fwd DF ratio: " + dfFwd.ToString("F9", inv));
+            sb.AppendLine("Par MM rate (decimal): " + rPar.ToString("F6", inv) + "   (" + (rPar * 100.0).ToString("F3", inv) + " %)");
+            if (nearestDate != DateTime.MinValue)
+            {
+                sb.AppendLine("Nearest pillar: " + (string.IsNullOrWhiteSpace(nearestTenor) ? "(n/a)" : nearestTenor)
+                    + " @ " + nearestDate.ToString("yyyy-MM-dd", inv)
+                    + " → par: " + rNear.ToString("F6", inv) + " (" + (rNear * 100.0).ToString("F3", inv) + " %)");
+            }
+            if (oneMDate != DateTime.MinValue)
+            {
+                sb.AppendLine("1M pillar @ " + oneMDate.ToString("yyyy-MM-dd", inv)
+                    + " → par: " + rOneM.ToString("F6", inv) + " (" + (rOneM * 100.0).ToString("F3", inv) + " %)");
+            }
+            sb.AppendLine("Cache: loadedUtc=" + s_usdLoadedUtc.ToString("yyyy-MM-dd HH:mm:ss", inv)
+                + "  ttl=" + UsdCurveTtl.TotalMinutes.ToString("F0", inv) + "m  stale=" + (usdStale ? "YES" : "NO"));
+
+            var s = sb.ToString();
+            System.Diagnostics.Debug.WriteLine(s);
+            return s;
+        }
+
+
+
+        /// <summary>
+        /// (ERSÄTT) Diagnostik för korspar BASE/QUOTE (t.ex. EUR/SEK):
+        /// - Hämtar båda USD-benen (BASEUSD och USDQUOTE) med valfri forceRefresh.
+        /// - Loggar "native" spot och forward från respektive ben, inkl. deras lasttidstämplar.
+        /// - Räknar USD-par (Spot→Settle) ur SOFR-kurvan (forward-konsistent).
+        /// - Löser rd och rf från dessa S/F och visar båda i procent.
+        /// Obs: Ändrar inget state.
+        /// </summary>
+        /// <param name="baseCcy">Tre bokstäver (t.ex. "EUR").</param>
+        /// <param name="quoteCcy">Tre bokstäver (t.ex. "SEK").</param>
+        /// <param name="settlement">Leveransdatum.</param>
+        /// <param name="commonSpotOverride">
+        /// Valfritt: om satt, används detta som <em>spotOverride</em> i ForwardAt(...) för BÅDA benen
+        /// (endast för jämförelse). Använd med försiktighet – numeriskt rätt är egentligen att
+        /// ge respektive bens egen spot från samma tidsstämplade källa.
+        /// </param>
+        /// <param name="forceRefresh">true för att tvinga nyhämtning av båda benen innan logg.</param>
+        /// <returns>Formatterad diagnostiksträng som också skrivs till Debug.</returns>
+        public string DumpCrossRfSnapshot(string baseCcy, string quoteCcy, DateTime settlement, double? commonSpotOverride = null, bool forceRefresh = false)
+        {
+            // 1) Hämta båda USD-benen (BASE→USD och USD→QUOTE) med samma stale-policy.
+            DateTime loadB, loadQ;
+            var legB = GetFxLegCached(baseCcy, "USD", forceRefresh, out loadB);   // BASE→USD
+            var legQ = GetFxLegCached("USD", quoteCcy, forceRefresh, out loadQ);  // USD→QUOTE
+
+            // 2) "Native" spots (från respektive BGN-svar)
+            double sB_native = legB.SpotMid;
+            double sQ_native = legQ.SpotMid;
+
+            // 3) Forward enligt prisning (utan att röra state)
+            double fB_native = legB.ForwardAt(settlement, legB.Pair6, sB_native);
+            double fQ_native = legQ.ForwardAt(settlement, legQ.Pair6, sQ_native);
+
+            // 4) USD MM-par (Spot→Settlement) enligt SOFR-kurvan (forward-konsistent)
+            EnsureUsdCurveCached(false);
+            var usd = s_cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+            // Lokal helper: T+2 helg-only (endast för diagnos; ingen extern kalender krävs)
+            DateTime SpotFromValDateWeekendOnly(DateTime valDate)
+            {
+                bool IsBiz(DateTime d) => d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday;
+                var d = valDate.Date; int added = 0;
+                while (added < 2) { d = d.AddDays(1); if (IsBiz(d)) added++; }
+                return d;
+            }
+
+            DateTime val = usd.ValDate.Date;
+            DateTime spot = SpotFromValDateWeekendOnly(val);
+            double T = Math.Max(0.0, (settlement.Date - spot.Date).TotalDays) / 360.0;
+            double dfSpot = Clamp01(usd.DiscountFactor(spot));
+            double dfSet = Clamp01(usd.DiscountFactor(settlement));
+            double fwdDf = dfSet / Math.Max(1e-12, dfSpot);
+            double rUsd = (1.0 / Math.Max(1e-12, fwdDf) - 1.0) / Math.Max(1e-12, T);
+
+            // 5) Lös rd och rf från native S/F
+            double rd_native = ((1.0 + rUsd * T) * (fB_native / Math.Max(1e-12, sB_native)) - 1.0) / Math.Max(1e-12, T);
+            double rf_native = ((1.0 + rUsd * T) * (sQ_native / Math.Max(1e-12, fQ_native)) - 1.0) / Math.Max(1e-12, T);
+
+            // 6) (Valfritt) gemensam spot-override (samma tal skickas in till båda benen)
+            double? rd_common = null, rf_common = null;
+            if (commonSpotOverride.HasValue)
+            {
+                double sCommon = commonSpotOverride.Value;
+                double fB_common = legB.ForwardAt(settlement, legB.Pair6, sCommon);
+                double fQ_common = legQ.ForwardAt(settlement, legQ.Pair6, sCommon);
+
+                rd_common = ((1.0 + rUsd * T) * (fB_common / Math.Max(1e-12, sCommon)) - 1.0) / Math.Max(1e-12, T);
+                rf_common = ((1.0 + rUsd * T) * (sCommon / Math.Max(1e-12, fQ_common)) - 1.0) / Math.Max(1e-12, T);
+            }
+
+            // 7) Utskrift
+            var sb = new System.Text.StringBuilder(512);
+            sb.AppendLine("[Cross RF Snapshot]");
+            sb.AppendLine("Pair: " + baseCcy + quoteCcy + "   Settle=" + settlement.ToString("yyyy-MM-dd", inv));
+            sb.AppendLine("BaseUSD loadUtc=" + loadB.ToString("yyyy-MM-dd HH:mm:ss", inv) + "   USDQuote loadUtc=" + loadQ.ToString("yyyy-MM-dd HH:mm:ss", inv));
+            sb.AppendLine("USD MM (Spot→Settle): Spot=" + spot.ToString("yyyy-MM-dd", inv) +
+                          "  T=" + T.ToString("F6", inv) + "  rUsd=" + (rUsd * 100.0).ToString("F3", inv) + " %");
+            sb.AppendLine("BASEUSD : S_native=" + sB_native.ToString("F6", inv) + "   F_native=" + fB_native.ToString("F6", inv));
+            sb.AppendLine("USDQUOTE: S_native=" + sQ_native.ToString("F6", inv) + "   F_native=" + fQ_native.ToString("F6", inv));
+            sb.AppendLine("Solved (native): rd=" + (rd_native * 100.0).ToString("F3", inv) + " %   rf=" + (rf_native * 100.0).ToString("F3", inv) + " %");
+
+            if (commonSpotOverride.HasValue)
+            {
+                sb.AppendLine("CommonSpot=" + commonSpotOverride.Value.ToString("F6", inv) + " → applied to BOTH legs for test");
+                sb.AppendLine("Solved (common): rd=" + ((rd_common ?? 0) * 100.0).ToString("F3", inv) + " %   rf=" + ((rf_common ?? 0) * 100.0).ToString("F3", inv) + " %");
+            }
+
+            var s = sb.ToString();
+            System.Diagnostics.Debug.WriteLine(s);
+            return s;
+        }
+
+
+        /// <summary>
+        /// (NY) Bekvämlighetswrapper som bara skriver ut korspar-snapshot till Debug.
+        /// </summary>
+        public void DebugLogCrossRfSnapshot(string baseCcy, string quoteCcy, DateTime settlement, double? commonSpotOverride = null, bool forceRefresh = false)
+        {
+            DumpCrossRfSnapshot(baseCcy, quoteCcy, settlement, commonSpotOverride, forceRefresh);
+        }
+
 
 
     }
