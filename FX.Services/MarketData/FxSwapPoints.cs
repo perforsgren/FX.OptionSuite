@@ -383,34 +383,7 @@ namespace FX.Services.MarketData
 
 
 
-
-
-        public void ComputePointsFromOutrightsIfMissing(double? spotOverride = null)
-        {
-            if (Points == null || Points.Rows.Count == 0) return;
-
-            double spot = UseSpot(spotOverride); // tar SpotMid om override ej anges
-            double pip = (Pair6 ?? "").EndsWith("JPY", StringComparison.OrdinalIgnoreCase) ? 0.01 : 0.0001;
-
-            foreach (DataRow r in Points.Rows)
-            {
-                double outMid = ToDouble(r["OutrightMid"]);
-                double outBid = ToDouble(r["OutrightBid"]);
-                double outAsk = ToDouble(r["OutrightAsk"]);
-
-                // Fyll bara om points saknas/är 0 men outright finns
-                if (ToDouble(r["PointsMid"]) == 0.0 && outMid != 0.0)
-                    r["PointsMid"] = (outMid - spot) / pip;
-
-                if (ToDouble(r["PointsBid"]) == 0.0 && outBid != 0.0)
-                    r["PointsBid"] = (outBid - spot) / pip;
-
-                if (ToDouble(r["PointsAsk"]) == 0.0 && outAsk != 0.0)
-                    r["PointsAsk"] = (outAsk - spot) / pip;
-            }
-        }
-
-
+        #region === Helpers ===
         // ---------- helpers ----------
         private double UseSpot(double? spotOverride)
         {
@@ -544,5 +517,214 @@ namespace FX.Services.MarketData
                 return x;
             return 0.0;
         }
+
+        #endregion
+
+        #region === Atomic multi-load (BLP) ===
+
+        /// <summary>
+        /// (NY) Laddar FLERA FX-tickers i EN Bloomberg ReferenceDataRequest (atomiskt snapshot).
+        /// Returnerar en dictionary [exact ticker string → FxSwapPoints].
+        /// Robust mot saknad DATE i bulk via tenor→datum-fallback.
+        /// </summary>
+        /// <param name="session">Öppen Bloomberg-session.</param>
+        /// <param name="tickers">Lista av tickers, t.ex. { "EURUSD BGN Curncy", "USDEUR BGN Curncy", "USDSEK BGN Curncy", "SEKUSD BGN Curncy" }.</param>
+        /// <param name="tenorToDateFallback">Fallback-funktion för att härleda datum från tenor om DATE saknas i bulk.</param>
+        /// <returns>Dictionary som innehåller endast de tickers som gav giltigt svar.</returns>
+        public static System.Collections.Generic.Dictionary<string, FxSwapPoints> LoadMultipleFromBloombergAtomic(
+            Session session,
+            System.Collections.Generic.IEnumerable<string> tickers,
+            Func<string, DateTime> tenorToDateFallback)
+        {
+            if (session == null) throw new ArgumentNullException(nameof(session));
+            if (tickers == null) throw new ArgumentNullException(nameof(tickers));
+
+            var list = new System.Collections.Generic.List<string>();
+            foreach (var t in tickers)
+            {
+                var s = (t ?? "").Trim();
+                if (s.Length > 0 && !list.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    list.Add(s);
+            }
+            if (list.Count == 0) return new System.Collections.Generic.Dictionary<string, FxSwapPoints>(StringComparer.OrdinalIgnoreCase);
+
+            if (!session.OpenService("//blp/refdata"))
+                throw new InvalidOperationException("Could not open //blp/refdata.");
+
+            var svc = session.GetService("//blp/refdata");
+            var req = svc.CreateRequest("ReferenceDataRequest");
+
+            foreach (var t in list) req.Append("securities", t);
+
+            // Fält: forward-bulk + spotfält
+            req.Append("fields", FldFwdCurve);
+            req.Append("fields", "PX_BID");
+            req.Append("fields", "PX_ASK");
+            req.Append("fields", "PX_MID");
+            req.Append("fields", "PX_LAST");
+
+
+            // VIKTIGT: tvinga fwd_curve att returnera "POINTS" (inte RATES/OUTRIGHT)
+            //var ovs = req.GetElement("overrides");
+            //{
+            //    var ov = ovs.AppendElement();
+            //    ov.SetElement("fieldId", "FWD_CURVE_QUOTE_FORMAT"); // PX342
+            //    ov.SetElement("value", "POINTS");                   // "POINTS" | "OUTRIGHT" | (ev. "RATES" på vissa källor)
+            //}
+
+            // Override kurvdatum → idag
+            var ovd = req.GetElement("overrides").AppendElement();
+            ovd.SetElement("fieldId", "CURVE_DATE");
+            ovd.SetElement("value", System.DateTime.Today.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture));
+
+            session.SendRequest(req, new CorrelationID(9521));
+
+            var result = new System.Collections.Generic.Dictionary<string, FxSwapPoints>(System.StringComparer.OrdinalIgnoreCase);
+            bool done = false;
+
+            while (!done)
+            {
+                var ev = session.NextEvent();
+                foreach (Message msg in ev)
+                {
+                    if (msg.MessageType.ToString() != "ReferenceDataResponse") continue;
+
+                    var sd = msg.GetElement("securityData");
+                    for (int i = 0; i < sd.NumValues; i++)
+                    {
+                        var sec = sd.GetValueAsElement(i);
+                        var ticker = sec.HasElement("security") ? sec.GetElementAsString("security") : "";
+                        if (string.IsNullOrWhiteSpace(ticker)) continue;
+
+                        if (!sec.HasElement("fieldData")) continue;
+                        var fd = sec.GetElement("fieldData");
+
+                        try
+                        {
+                            var built = BuildFromFieldDataAtomic(ticker, fd, tenorToDateFallback);
+                            if (IsValidLeg(built))
+                                result[ticker] = built;
+                        }
+                        catch
+                        {
+                            // Ignorera ogiltig/inkomplett security — vi väljer ett av alternativen per ben
+                        }
+                    }
+                }
+                if (ev.Type == Event.EventType.RESPONSE) done = true;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// (NY) Hjälpare: bedöm om ett leg är "användbart" (spot>0 och åtminstone någon forward-data).
+        /// </summary>
+        public static bool IsValidLeg(FxSwapPoints leg)
+        {
+            if (leg == null) return false;
+            if (!(leg.SpotMid > 0.0)) return false;
+            if (leg.Points == null || leg.Points.Rows.Count == 0) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// (NY) Bygger ett FxSwapPoints från ett fieldData-element (ReferenceDataResponse).
+        /// Läser PX_* för spot, FWD_CURVE till DataTable, normaliserar schema och fyller Points-tabellen.
+        /// Robust mot saknad DATE via tenor→datum-fallback.
+        /// OBS: Skild från ev. befintlig BuildFromFieldData i din fil för att undvika namnkonflikt.
+        /// </summary>
+        private static FxSwapPoints BuildFromFieldDataAtomic(string pairTicker, Element fieldData, System.Func<string, System.DateTime> tenorToDateFallback)
+        {
+            var leg = new FxSwapPoints
+            {
+                PairTicker = (pairTicker ?? "").Trim(),
+                Pair6 = ExtractPair6(pairTicker)
+            };
+
+            // Forward-bulk
+            System.Data.DataTable bulk = null;
+            if (fieldData.HasElement(FldFwdCurve))
+                bulk = BulkToTable(fieldData.GetElement(FldFwdCurve));
+
+            // Spot (PX_*)
+            leg.SpotBid = TryGetDoubleField(fieldData, "PX_BID");
+            leg.SpotAsk = TryGetDoubleField(fieldData, "PX_ASK");
+            var mid = TryGetDoubleField(fieldData, "PX_MID");
+            var last = TryGetDoubleField(fieldData, "PX_LAST");
+            if (!double.IsNaN(mid)) leg.SpotMid = mid;
+            else if (!double.IsNaN(last)) leg.SpotMid = last;
+            else if (!double.IsNaN(leg.SpotBid) && !double.IsNaN(leg.SpotAsk) && !double.IsInfinity(leg.SpotBid) && !double.IsInfinity(leg.SpotAsk))
+                leg.SpotMid = 0.5 * (leg.SpotBid + leg.SpotAsk);
+
+            if (bulk == null || bulk.Rows.Count == 0)
+                throw new System.Exception(pairTicker + ": FWD_CURVE not available.");
+
+            NormalizeSchema(bulk);
+
+            // DATE saknas → generera via fallback
+            if (!bulk.Columns.Contains("DATE"))
+            {
+                if (tenorToDateFallback == null)
+                    throw new System.Exception("FWD_CURVE: DATE missing and no tenor→date resolver provided.");
+
+                bulk.Columns.Add("DATE", typeof(System.DateTime));
+                foreach (System.Data.DataRow r in bulk.Rows)
+                {
+                    var tn = bulk.Columns.Contains("TENOR")
+                        ? System.Convert.ToString(r["TENOR"] ?? "").Trim()
+                        : InferTenorFromSecDesc(System.Convert.ToString(r["SECURITY DESCRIPTION"]), leg.Pair6);
+                    r["DATE"] = tenorToDateFallback(tn);
+                }
+            }
+
+            // Bygg Points-tabellen i samma format som singel-load använder
+            var points = new System.Data.DataTable(leg.Pair6 + "_FWD") { Locale = System.Globalization.CultureInfo.InvariantCulture };
+            points.Columns.Add("Date", typeof(System.DateTime));
+            points.Columns.Add("Tenor", typeof(string));
+            points.Columns.Add("PointsBid", typeof(double));
+            points.Columns.Add("PointsMid", typeof(double));
+            points.Columns.Add("PointsAsk", typeof(double));
+            points.Columns.Add("OutrightBid", typeof(double));
+            points.Columns.Add("OutrightMid", typeof(double));
+            points.Columns.Add("OutrightAsk", typeof(double));
+
+            foreach (System.Data.DataRow r in bulk.Rows)
+            {
+                var d = System.Convert.ToDateTime(r["DATE"], System.Globalization.CultureInfo.InvariantCulture).Date;
+
+                string tn = "";
+                if (bulk.Columns.Contains("TENOR"))
+                    tn = System.Convert.ToString(r["TENOR"] ?? "");
+                else if (bulk.Columns.Contains("SECURITY DESCRIPTION"))
+                    tn = InferTenorFromSecDesc(System.Convert.ToString(r["SECURITY DESCRIPTION"]), leg.Pair6);
+
+                double pMid = FirstNumeric(r, "MID POINTS", "MID_POINTS", "POINTS MID", "POINTS_MID", "POINTS", "FWD_POINTS", "FWD PTS");
+                double pBid = FirstNumeric(r, "BID POINTS", "BID_POINTS");
+                double pAsk = FirstNumeric(r, "ASK POINTS", "ASK_POINTS");
+
+                double oMid = FirstNumeric(r, "OUTRIGHT MID", "OUTRIGHT_MID", "FWD OUTRIGHT", "OUTRIGHT", "PX_MID", "MID");
+                double oBid = FirstNumeric(r, "BID OUTRIGHT", "BID_OUTRIGHT", "BID PX", "BID");
+                double oAsk = FirstNumeric(r, "ASK OUTRIGHT", "ASK_OUTRIGHT", "ASK PX", "ASK");
+
+                var row = points.NewRow();
+                row["Date"] = d;
+                row["Tenor"] = tn;
+                row["PointsBid"] = pBid;
+                row["PointsMid"] = pMid;
+                row["PointsAsk"] = pAsk;
+                row["OutrightBid"] = oBid;
+                row["OutrightMid"] = oMid;
+                row["OutrightAsk"] = oAsk;
+                points.Rows.Add(row);
+            }
+
+            leg.Points = points;
+            leg.ValDate = System.DateTime.Today;
+            return leg;
+        }
+
+        #endregion
+
     }
 }

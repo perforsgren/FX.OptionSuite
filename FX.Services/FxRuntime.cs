@@ -75,22 +75,17 @@ namespace FX.Services
                 {
                     // 0) Indata
                     string pair6 = (cmd.Pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
-
                     if (cmd.Legs == null || cmd.Legs.Count == 0)
                         throw new InvalidOperationException("Request saknar ben.");
-
                     var leg0 = cmd.Legs[0];
                     if (leg0.LegId == Guid.Empty)
                         throw new InvalidOperationException("LegId saknas i RequestPrice.Leg.");
-
                     string legId = leg0.LegId.ToString();
 
-                    // Se till att Store står på rätt par (seedar spot som stale om byte)
+                    // Säkerställ att Store står på rätt par
                     var current = _marketStore.Current;
                     if (current == null || !string.Equals(current.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
-                    {
                         _marketStore.SetSpotFromFeed(pair6, new TwoWay<double>(0d, 0d), DateTime.UtcNow, true);
-                    }
 
                     // 1) Datum
                     var today = DateTime.Today;
@@ -102,30 +97,24 @@ namespace FX.Services
                     var spotDate = dates.SpotDate;
                     var settlement = dates.SettlementDate;
 
-                    // 2b) Säkerställ RD/RF för detta ben – hedra ForceRefreshRates (innan läsning)
+                    // 2) Säkerställ RD/RF (cache-först; endast forceRefresh triggar ny hämtning)
                     using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
                     {
                         feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, /*forceRefresh:*/ cmd.ForceRefreshRates);
-
-                        // 1) Bara native (benens egna spots)
-                        feeder.DebugLogCrossRfSnapshot("EUR", "SEK", settlement);
-
-                        //// 2) Med "gemensam spot" (t.ex. ta UI-spotten för EURSEK eller triangulera från UI)
-                        //double uiSpot = _view.TryGetCrossSpotMid("EURSEK"); // pseudo: använd ditt sätt att läsa UI-spot
-                        //feeder.DebugLogCrossRfSnapshot("EUR", "SEK", settlement, commonSpotOverride: uiSpot);
                     }
 
-                    //using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
-                    //{
-                    //    var diag = feeder.DumpUsdRfDiagnostics("USDSEK", spotDate, settlement, forceRefresh: false);
-                    //    System.Diagnostics.Debug.WriteLine(diag);
-                    //}
+
+                    bool EnableSnapshotDump = false;
+                    if (EnableSnapshotDump)
+                    {
+                        using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
+                            feeder.DumpCrossRfSnapshot(pair6.Substring(0, 3), pair6.Substring(3, 3), spotDate, settlement, true, false);
+                    }
 
                     // 3) Spot enligt Store (respektera ViewMode/Override)
                     var snap = _marketStore.Current;
                     var spotField = snap.Spot;
                     var spotEff = spotField.Effective;
-
                     double spotBid, spotAsk;
                     if (spotField.ViewMode == ViewMode.Mid || spotField.Override == OverrideMode.Mid)
                     {
@@ -137,7 +126,7 @@ namespace FX.Services
                         spotBid = spotEff.Bid; spotAsk = spotEff.Ask;
                     }
 
-                    // 4) RD/RF effektivt för detta ben (efter ensure)
+                    // 4) RD/RF effektivt
                     var rdFld = snap.TryGetRd(legId);
                     var rfFld = snap.TryGetRf(legId);
                     if (rdFld == null || rfFld == null)
@@ -146,7 +135,6 @@ namespace FX.Services
                     var rdEff = rdFld.Effective;
                     var rfEff = rfFld.Effective;
 
-                    // Fall-back säkerhet: om 0/0, gör en engångs-retry med force=true (första varvets seed)
                     bool rdZero = Math.Abs(rdEff.Bid) <= 1e-15 && Math.Abs(rdEff.Ask) <= 1e-15;
                     bool rfZero = Math.Abs(rfEff.Bid) <= 1e-15 && Math.Abs(rfEff.Ask) <= 1e-15;
                     if (rdZero || rfZero)
@@ -155,44 +143,25 @@ namespace FX.Services
                         {
                             feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, true);
                         }
-
                         snap = _marketStore.Current;
-                        rdFld = snap.TryGetRd(legId);
-                        rfFld = snap.TryGetRf(legId);
+                        rdFld = snap.TryGetRd(legId); rfFld = snap.TryGetRf(legId);
                         if (rdFld == null || rfFld == null)
                             throw new InvalidOperationException("RD/RF saknas efter retry-ensure.");
-
-                        rdEff = rdFld.Effective;
-                        rfEff = rfFld.Effective;
+                        rdEff = rdFld.Effective; rfEff = rfFld.Effective;
 
                         rdZero = Math.Abs(rdEff.Bid) <= 1e-15 && Math.Abs(rdEff.Ask) <= 1e-15;
                         rfZero = Math.Abs(rfEff.Bid) <= 1e-15 && Math.Abs(rfEff.Ask) <= 1e-15;
                         if (rdZero || rfZero)
-                        {
-                            throw new InvalidOperationException(
-                                "RD/RF är 0/0 efter ensure. pair=" + pair6 + " legId=" + legId +
-                                " exp=" + expiry.ToString("yyyy-MM-dd") +
-                                " rd=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                                " rf=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
-                        }
+                            throw new InvalidOperationException("RD/RF är 0/0 efter ensure (retry).");
                     }
 
-                    System.Diagnostics.Debug.WriteLine(
-                        "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                        "pair=" + pair6 + " legId=" + legId +
-                        " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                        " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
-
-                    // RD/RF som används i prisningen = mid från Store
-                    double rd = 0.5 * (rdEff.Bid + rdEff.Ask);
-                    double rf = 0.5 * (rfEff.Bid + rfEff.Ask);
-
                     //System.Diagnostics.Debug.WriteLine(
-                    //    "[FxRuntime.UsingRates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
+                    //    "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
                     //    "pair=" + pair6 + " legId=" + legId +
-                    //    " rdUsed=" + rd.ToString("F6") + " rfUsed=" + rf.ToString("F6"));
+                    //    " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
+                    //    " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
 
-                    // 5) Bygg domänens request och prisa (oförändrat i övrigt)
+                    // 5) Prissättning (oförändrat)
                     var legs = new List<OptionLeg>();
                     if (cmd.Legs != null)
                     {
@@ -214,14 +183,7 @@ namespace FX.Services
                             var domExpiry = new Expiry(legExpiry);
                             var pair = new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3));
 
-                            legs.Add(new OptionLeg(
-                                pair: pair,
-                                side: sideEnum,
-                                type: typeEnum,
-                                strike: strikeDom,
-                                expiry: domExpiry,
-                                notional: src.Notional
-                            ));
+                            legs.Add(new OptionLeg(pair, sideEnum, typeEnum, strikeDom, domExpiry, src.Notional));
                         }
                     }
 
@@ -230,8 +192,8 @@ namespace FX.Services
                         legs: legs,
                         spotBid: spotBid,
                         spotAsk: spotAsk,
-                        rd: rd,
-                        rf: rf,
+                        rd: 0.5 * (rdEff.Bid + rdEff.Ask),
+                        rf: 0.5 * (rfEff.Bid + rfEff.Ask),
                         surfaceId: cmd.SurfaceId ?? "default",
                         stickyDelta: cmd.StickyDelta
                     );
@@ -260,11 +222,6 @@ namespace FX.Services
                         Gamma = unit.Gamma,
                         Theta = unit.Theta
                     });
-
-                    //System.Diagnostics.Debug.WriteLine(
-                    //    "[FxRuntime.Done][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                    //    "pair=" + pair6 + " legId=" + legId +
-                    //    " premMid=" + unit.PremiumMid.ToString("F6"));
                 }
                 catch (Exception ex)
                 {
@@ -288,9 +245,6 @@ namespace FX.Services
                 });
             }
         }
-
-
-
 
 
         /// <summary>
