@@ -62,176 +62,16 @@ namespace FX.Services.MarketData
 
 
 
-
-
-
-        /// <summary>
-        /// Bygger och matar in RD/RF för par A/B (A=base, B=quote) i <see cref="IMarketStore"/>.
-        /// - Använder gemensam (statisk) cache + TTL (SOFR 15 min, FX-swap 3 min) för stale-indikatorn.
-        /// - <paramref name="forceRefresh"/>=true ignorerar cache och laddar alltid om från källa (Bloomberg).
-        /// - Vid enbart tenor/datum-byten: kalla med <paramref name="forceRefresh"/>=false (återanvänd cache; UI ser IsStale).
-        /// - Vid parbyte eller explicit ”Refresh”: <paramref name="forceRefresh"/>=true.
-        /// - Viktigt: <see cref="EnsureUsdCurveCached(bool)"/> ansvarar för att starta Bloomberg-session lazily
-        ///   och uppdatera den statiska cachen endast när det behövs.
-        /// </summary>
-        public void EnsureRdRfForOLD(
-            string pair6,
-            string legId,
-            DateTime today,
-            DateTime spotDate,
-            DateTime settlement,
-            bool forceRefresh = false)
-        {
-            if (string.IsNullOrWhiteSpace(pair6)) throw new ArgumentNullException(nameof(pair6));
-            if (string.IsNullOrWhiteSpace(legId)) throw new ArgumentNullException(nameof(legId));
-
-            pair6 = NormalizePair(pair6);
-            var baseCcy = pair6.Substring(0, 3);
-            var quoteCcy = pair6.Substring(3, 3);
-
-            // 1) Säkerställ att USD-kurvan finns i den STATISKA cachen (hämtar fresh vid behov/forceRefresh)
-            //    OBS: EnsureUsdCurveCached() ska internt hantera sessionstart när cache saknas/stale.
-            EnsureUsdCurveCached(forceRefresh);
-
-            // 2) USD par-MM (simple) SPOT→SETTLEMENT från cachead kurva
-            var usdCurve = s_cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
-            var dfUsdSpot = Clamp01(usdCurve.DiscountFactor(spotDate));
-            var dfUsdSet = Clamp01(usdCurve.DiscountFactor(settlement));
-            var T_usd = YearFracMm(spotDate, settlement, "USD");
-            var r_usd_par = ParMmRate(dfUsdSpot, dfUsdSet, T_usd);
-
-            // Stale för USD utifrån TTL (statisk tidsstämpel)
-            bool usdStale = IsStaleByTtl(s_usdLoadedUtc, UsdCurveTtl);
-
-            // Hjälpare: outright forward i ”rätt” riktning
-            double ForwardAt(FxSwapPoints leg, string requiredPair6, double spot)
-                => leg.ForwardAt(settlement, requiredPair6, spot, dfProvider: null, useDfRatioIfAvailable: false);
-
-            double rd_mid = 0.0;
-            double rf_mid = 0.0;
-            bool baseLegStale = false;
-            bool quoteLegStale = false;
-
-            if (string.Equals(baseCcy, "USD", StringComparison.OrdinalIgnoreCase))
-            {
-                // BASE = USD → rf från USD-kurvan; rd via USD↔QUOTE-ben
-                rf_mid = ClampRate(r_usd_par);
-
-                DateTime loadQ;
-                var legUsdQuote = GetFxLegCached("USD" + quoteCcy, quoteCcy + "USD", forceRefresh, out loadQ);
-                quoteLegStale = IsStaleByTtl(loadQ, FxLegTtl);
-
-                bool usdIsBase = legUsdQuote.Pair6.StartsWith("USD", StringComparison.OrdinalIgnoreCase);
-                string required = usdIsBase ? ("USD" + quoteCcy) : (quoteCcy + "USD");
-                double S_q = legUsdQuote.SpotMid;
-                double F_q = ForwardAt(legUsdQuote, required, S_q);
-
-                double Tq = YearFracMm(spotDate, settlement, quoteCcy);
-                double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tq, 1e-12);
-
-                double rd_calc = usdIsBase
-                    ? ((onePlus_usdT * F_q / Math.Max(S_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12)
-                    : ((onePlus_usdT * Math.Max(S_q, 1e-12) / Math.Max(F_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12);
-
-                rd_mid = ClampRate(rd_calc);
-            }
-            else if (string.Equals(quoteCcy, "USD", StringComparison.OrdinalIgnoreCase))
-            {
-                // QUOTE = USD → rd från USD-kurvan; rf via BASE↔USD-ben
-                rd_mid = ClampRate(r_usd_par);
-
-                DateTime loadB;
-                var legBaseUsd = GetFxLegCached(baseCcy + "USD", "USD" + baseCcy, forceRefresh, out loadB);
-                baseLegStale = IsStaleByTtl(loadB, FxLegTtl);
-
-                bool usdIsQuote = legBaseUsd.Pair6.EndsWith("USD", StringComparison.OrdinalIgnoreCase); // "BASEUSD"
-                string required = usdIsQuote ? (baseCcy + "USD") : ("USD" + baseCcy);
-                double S_b = legBaseUsd.SpotMid;
-                double F_b = ForwardAt(legBaseUsd, required, S_b);
-
-                double Tb = YearFracMm(spotDate, settlement, baseCcy);
-                double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tb, 1e-12);
-
-                double rf_calc = usdIsQuote
-                    ? ((onePlus_usdT * Math.Max(S_b, 1e-12) / Math.Max(F_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12)
-                    : ((onePlus_usdT * F_b / Math.Max(S_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12);
-
-                rf_mid = ClampRate(rf_calc);
-            }
-            else
-            {
-                // Korspar: BASE↔USD + USD↔QUOTE
-                DateTime loadB, loadQ;
-                var legBaseUsd = GetFxLegCached(baseCcy + "USD", "USD" + baseCcy, forceRefresh, out loadB);
-                var legUsdQuote = GetFxLegCached("USD" + quoteCcy, quoteCcy + "USD", forceRefresh, out loadQ);
-                baseLegStale = IsStaleByTtl(loadB, FxLegTtl);
-                quoteLegStale = IsStaleByTtl(loadQ, FxLegTtl);
-
-                // rf (base)
-                {
-                    bool usdIsQuote = legBaseUsd.Pair6.EndsWith("USD", StringComparison.OrdinalIgnoreCase);
-                    string required = usdIsQuote ? (baseCcy + "USD") : ("USD" + baseCcy);
-                    double S_b = legBaseUsd.SpotMid;
-                    double F_b = ForwardAt(legBaseUsd, required, S_b);
-
-                    double Tb = YearFracMm(spotDate, settlement, baseCcy);
-                    double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tb, 1e-12);
-
-                    double rf_calc = usdIsQuote
-                        ? ((onePlus_usdT * Math.Max(S_b, 1e-12) / Math.Max(F_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12)
-                        : ((onePlus_usdT * F_b / Math.Max(S_b, 1e-12)) - 1.0) / Math.Max(Tb, 1e-12);
-
-                    rf_mid = ClampRate(rf_calc);
-                }
-
-                // rd (quote)
-                {
-                    bool usdIsBase = legUsdQuote.Pair6.StartsWith("USD", StringComparison.OrdinalIgnoreCase);
-                    string required = usdIsBase ? ("USD" + quoteCcy) : (quoteCcy + "USD");
-                    double S_q = legUsdQuote.SpotMid;
-                    double F_q = ForwardAt(legUsdQuote, required, S_q);
-
-                    double Tq = YearFracMm(spotDate, settlement, quoteCcy);
-                    double onePlus_usdT = 1.0 + r_usd_par * Math.Max(Tq, 1e-12);
-
-                    double rd_calc = usdIsBase
-                        ? ((onePlus_usdT * F_q / Math.Max(S_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12)
-                        : ((onePlus_usdT * Math.Max(S_q, 1e-12) / Math.Max(F_q, 1e-12)) - 1.0) / Math.Max(Tq, 1e-12);
-
-                    rd_mid = ClampRate(rd_calc);
-                }
-            }
-
-            // 4) Sätt IsStale om någon underliggande komponent passerat sin TTL
-            bool isStale = usdStale || baseLegStale || quoteLegStale;
-
-            var now = DateTime.UtcNow;
-            _store.SetRdFromFeed(pair6, legId, new TwoWay<double>(rd_mid, rd_mid), now, isStale);
-            _store.SetRfFromFeed(pair6, legId, new TwoWay<double>(rf_mid, rf_mid), now, isStale);
-        }
-
-
-
         #region === Pricing ===
 
         /// <summary>
-        /// (ERSÄTT) Säkerställ RD/RF i store för ett valutapar (A/B) vid givet settlement.
-        /// Ny funktionalitet i denna version:
-        /// 1) **No-reload-on-stale**: USD-kurvan och FX-ben laddas **inte om** när cache är stale
-        ///    (om inte <paramref name="forceRefresh"/> är true eller policy säger annat). Detta gör att
-        ///    byte av enbart expiry använder cache (framåtberäkning ur cached kurva) istället för ny feed-hit.
-        /// 2) **Cache-först korspar**: För korspar hämtas båda USD-benen först från cache; om något saknas
-        ///    (eller om explicit refresh) laddas båda ben **atomiskt** i EN BLP-request via routing.
-        /// 3) **Common spot (valfritt)**: Om flaggan UseCommonSpotForCross är true trianguleras S_common =
-        ///    S(BASE→USD) * S(USD→QUOTE) och används som spot i båda ForwardAt(...)-anropen för att minska rf-brus.
-        /// Övrigt (SOFR→USD-parrate, formler, store-skrivning) är oförändrat.
+        /// Säkerställ RD/RF i store för givet par/leg och datumintervall.
+        /// Stabil och minimal variant för Steg 1 (POINTS):
+        /// - USD-kurva via relaxed cache (ingen auto-reload på stale om forceRefresh=false).
+        /// - ForwardAt anropas alltid med explicit spotOverride = leg.SpotMid och DF-ratio avstängt,
+        ///   vilket matchar OLD-beteendet och undviker edge-cases.
+        /// - I övrigt oförändrad logik; ForwardAt kan nu använda punkter (S+P) om tillgängligt.
         /// </summary>
-        /// <param name="pair6">Valutapar i 6 tecken, t.ex. "EURSEK". "/" ignoreras.</param>
-        /// <param name="legId">Leg-ID som används i store.</param>
-        /// <param name="today">Dagens datum (valdate).</param>
-        /// <param name="spotDate">Spotdatum (USD T+2 enligt dina kalendrar).</param>
-        /// <param name="settlement">Leveransdatum.</param>
-        /// <param name="forceRefresh">True för att tvinga ny hämtning från källa; annars cache-först utan reload på stale.</param>
         public void EnsureRdRfFor(
             string pair6,
             string legId,
@@ -247,7 +87,7 @@ namespace FX.Services.MarketData
             var baseCcy = pair6.Substring(0, 3);
             var quoteCcy = pair6.Substring(3, 3);
 
-            // --- USD parrate (SOFR) — relaxed cache ---
+            // USD parrate (SOFR) — relaxed cache
             EnsureUsdCurveCachedRelaxed(forceRefresh);
             var usdCurve = s_cachedUsdCurve ?? throw new InvalidOperationException("USD curve cache is null.");
 
@@ -256,13 +96,12 @@ namespace FX.Services.MarketData
             var T_usd = YearFracMm(spotDate, settlement, "USD");
             var r_usd = (1.0 / Math.Max(1e-12, (dfSet / Math.Max(1e-12, dfSpot))) - 1.0) / Math.Max(1e-12, T_usd);
 
-            // Endast markering (ingen implicit reload)
             bool usdStale = IsStaleByTtl(s_usdLoadedUtc, UsdCurveTtl);
 
             double rd_mid = 0.0, rf_mid = 0.0;
             bool baseLegStale = false, quoteLegStale = false;
 
-            // --- USD-par ---
+            // USD-par
             if (string.Equals(baseCcy, "USD", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(quoteCcy, "USD", StringComparison.OrdinalIgnoreCase))
             {
@@ -271,19 +110,18 @@ namespace FX.Services.MarketData
 
                 if (string.Equals(baseCcy, "USD", StringComparison.OrdinalIgnoreCase))
                 {
-                    // USD/QUOTE → kandidater "USD{Q}" och "{Q}USD"
+                    // USD/QUOTE
                     leg = GetFxLegCached("USD" + quoteCcy, quoteCcy + "USD", forceRefresh, out loadUtc);
                     quoteLegStale = IsStaleByTtl(loadUtc, FxLegTtl);
                 }
                 else
                 {
-                    // BASE/USD → kandidater "{B}USD" och "USD{B}"
+                    // BASE/USD
                     leg = GetFxLegCached(baseCcy + "USD", "USD" + baseCcy, forceRefresh, out loadUtc);
                     baseLegStale = IsStaleByTtl(loadUtc, FxLegTtl);
                 }
 
-                double S = leg.SpotMid; // benets egen spot (BGN)
-                                        // Viktigt: explicit spotOverride och DF-ratio AV, som i OLD
+                double S = leg.SpotMid;
                 double F = leg.ForwardAt(settlement, leg.Pair6, S, dfProvider: null, useDfRatioIfAvailable: false);
 
                 if (!(S > 0.0) || !(F > 0.0) || double.IsNaN(S) || double.IsNaN(F) || double.IsInfinity(S) || double.IsInfinity(F))
@@ -316,7 +154,7 @@ namespace FX.Services.MarketData
                 return;
             }
 
-            // --- KORSPAR: cache-först; vid behov atomisk multi-load. Använd benens egna spots. ---
+            // Korspar: cache-först, atomisk vid behov (båda USD-ben)
             {
                 DateTime loadBothUtc;
                 bool fromCache;
@@ -329,12 +167,12 @@ namespace FX.Services.MarketData
 
                 bool legsStale = IsStaleByTtl(loadBothUtc, FxLegTtl);
 
-                // ---- rf (BASE) ur BASE↔USD + r_USD ----
+                // BASE↔USD → rf
                 {
                     bool usdIsQuote = legBaseUsd.Pair6.EndsWith("USD", StringComparison.OrdinalIgnoreCase);
                     string required = usdIsQuote ? (baseCcy + "USD") : ("USD" + baseCcy);
 
-                    double S_b = legBaseUsd.SpotMid; // benets egen spot
+                    double S_b = legBaseUsd.SpotMid;
                     double F_b = legBaseUsd.ForwardAt(settlement, required, S_b, dfProvider: null, useDfRatioIfAvailable: false);
 
                     if (!(S_b > 0.0) || !(F_b > 0.0) || double.IsNaN(S_b) || double.IsNaN(F_b) || double.IsInfinity(S_b) || double.IsInfinity(F_b))
@@ -353,12 +191,12 @@ namespace FX.Services.MarketData
                     rf_mid = ClampRate(rf_calc);
                 }
 
-                // ---- rd (QUOTE) ur USD↔QUOTE + r_USD ----
+                // USD↔QUOTE → rd
                 {
                     bool usdIsBase = legUsdQuote.Pair6.StartsWith("USD", StringComparison.OrdinalIgnoreCase);
                     string required = usdIsBase ? ("USD" + quoteCcy) : (quoteCcy + "USD");
 
-                    double S_q = legUsdQuote.SpotMid; // benets egen spot
+                    double S_q = legUsdQuote.SpotMid;
                     double F_q = legUsdQuote.ForwardAt(settlement, required, S_q, dfProvider: null, useDfRatioIfAvailable: false);
 
                     if (!(S_q > 0.0) || !(F_q > 0.0) || double.IsNaN(S_q) || double.IsNaN(F_q) || double.IsInfinity(S_q) || double.IsInfinity(F_q))
@@ -383,6 +221,7 @@ namespace FX.Services.MarketData
                 _store.SetRfFromFeed(pair6, legId, new TwoWay<double>(rf_mid, rf_mid), now, staleMark);
             }
         }
+
 
         /// <summary>
         /// (NY) Guardrail: kontrollera att S och F är >0 och ej NaN/∞ innan de används/skribas.

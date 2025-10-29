@@ -67,7 +67,7 @@ namespace FX.Services
         /// 4) Läs effektiv RD/RF från Store och använd mid.
         /// 5) Bygg PricingRequest, kör motorn och publicera PriceCalculated.
         /// </summary>
-        private async System.Threading.Tasks.Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
+        private async Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
         {
             try
             {
@@ -155,11 +155,11 @@ namespace FX.Services
                             throw new InvalidOperationException("RD/RF är 0/0 efter ensure (retry).");
                     }
 
-                    //System.Diagnostics.Debug.WriteLine(
-                    //    "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                    //    "pair=" + pair6 + " legId=" + legId +
-                    //    " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                    //    " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
+                    System.Diagnostics.Debug.WriteLine(
+                        "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
+                        "pair=" + pair6 + " legId=" + legId +
+                        " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
+                        " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
 
                     // 5) Prissättning (oförändrat)
                     var legs = new List<OptionLeg>();

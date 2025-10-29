@@ -323,7 +323,7 @@ namespace FX.Services.MarketData
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
-            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---
+            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---   ////////////////////////////////   ska vi göra detta?
             const int DEC = 5;
             var vq = new TwoWay<double>(
                 bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
