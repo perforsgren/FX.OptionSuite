@@ -35,17 +35,7 @@ namespace FX.Services.MarketData
 
 
         /// <summary>
-        /// (NY) Feature-flag som styr hur <c>FWD_CURVE</c> hämtas från Bloomberg:
-        /// <para>- <c>true</c> → begär <b>POINTS</b> (swap-punkter).<br/>
-        /// - <c>false</c> → begär <b>OUTRIGHT</b> (terminskurs).</para>
-        /// Påverkar endast hur vi begär datat; övrig logik/beräkningar lever som idag.
-        /// Default = <c>true</c> för Steg 1 (POINTS).
-        /// </summary>
-        public static bool UsePointsForForwards { get; set; } = true;
-
-
-        /// <summary>
-        /// ERSÄTT (NY version): Laddar ett FX-ben från Bloomberg.
+        /// Laddar ett FX-ben från Bloomberg.
         /// - Begär FWD_CURVE med override FWD_CURVE_QUOTE_FORMAT=POINTS
         /// - Läser swap-points och räknar fram outrights = SpotMid + Points*pip
         /// - Sätter PairTicker/Pair6/SpotMid/Table på denna instans
@@ -110,8 +100,6 @@ namespace FX.Services.MarketData
             this.ValDate = built.ValDate;
             this.Points = built.Points;
         }
-
-
 
 
         /// <summary>
@@ -333,6 +321,109 @@ namespace FX.Services.MarketData
             }
         }
 
+        /// <summary>
+        /// Beräknar forward på <paramref name="settlement"/> för samtliga tre sidor
+        /// (Bid/Mid/Ask) via linjär interpolation på Outright-kolumnerna i <see cref="Points"/>.
+        /// Om Outright-kolumn saknas eller är noll för de nödvändiga raderna faller metoden
+        /// mjukt tillbaka till Points (BID/MID/ASK) + pip baserat på <see cref="SpotMid"/>.
+        /// Pip-regel: JPY-quote => 0.01, annars 0.0001.
+        /// </summary>
+        /// <param name="settlement">Leveransdatum.</param>
+        /// <param name="pair6">Används enbart för pip-konvention (JPY eller ej).</param>
+        /// <param name="spotOverride">Valfritt spot för fallback från points; annars används <see cref="SpotMid"/>.</param>
+        /// <returns>(Bid, Mid, Ask) forwards i samma riktning som <see cref="Pair6"/>.</returns>
+        public (double Bid, double Mid, double Ask) ForwardAtAllSides(DateTime settlement, string pair6, double? spotOverride = null)
+        {
+            if (Points == null || Points.Rows.Count == 0)
+                throw new InvalidOperationException("FxSwapPoints: saknar Points-tabell. Ladda från feed först.");
+
+            // Sortera efter DATE (vi normaliserade kolumnnamnet till versaler i buildern)
+            var rows = Points.AsEnumerable()
+                             .OrderBy(r => r.Field<DateTime>("DATE").Date)
+                             .ToArray();
+
+            string p6 = (pair6 ?? Pair6 ?? "").Trim().ToUpperInvariant().Replace("/", "");
+            bool isJpyQuote = p6.Length >= 6 && p6.EndsWith("JPY", StringComparison.Ordinal);
+            double pip = isJpyQuote ? 0.01 : 0.0001;
+
+            // Plocka Outright-sidor, med fallback till points + S om Outright saknas
+            bool hasOutCols = Points.Columns.Contains("OutrightBid")
+                           && Points.Columns.Contains("OutrightMid")
+                           && Points.Columns.Contains("OutrightAsk");
+
+            bool hasPtsCols = Points.Columns.Contains("BID")
+                           && Points.Columns.Contains("MID")
+                           && Points.Columns.Contains("ASK");
+
+            double S = spotOverride ?? this.SpotMid;
+
+            Func<int, double> OB = i =>
+            {
+                double v = hasOutCols ? rows[i].Field<double>("OutrightBid") : 0.0;
+                if (v != 0.0) return v;
+                if (hasPtsCols) { var p = rows[i].Field<double>("BID"); if (p != 0.0) return S + p * pip; }
+                return 0.0;
+            };
+            Func<int, double> OM = i =>
+            {
+                double v = hasOutCols ? rows[i].Field<double>("OutrightMid") : 0.0;
+                if (v != 0.0) return v;
+                if (hasPtsCols) { var p = rows[i].Field<double>("MID"); if (p != 0.0) return S + p * pip; }
+                return 0.0;
+            };
+            Func<int, double> OA = i =>
+            {
+                double v = hasOutCols ? rows[i].Field<double>("OutrightAsk") : 0.0;
+                if (v != 0.0) return v;
+                if (hasPtsCols) { var p = rows[i].Field<double>("ASK"); if (p != 0.0) return S + p * pip; }
+                return 0.0;
+            };
+
+            DateTime d = settlement.Date;
+            DateTime d0 = rows[0].Field<DateTime>("DATE").Date;
+            DateTime d1 = rows[rows.Length - 1].Field<DateTime>("DATE").Date;
+
+            // YearFrac (enkelt ACT/360 på kalenderdagar – samma som i ForwardAt)
+            Func<DateTime, DateTime, double> YF = (a, b) => Math.Max(0.0, (b.Date - a.Date).TotalDays / 360.0);
+            DateTime spot0 = (this.SpotDate != default(DateTime)) ? this.SpotDate.Date : this.ValDate.Date.AddDays(2);
+
+            // a) Extrapolera åt vänster (före första pilen): skala mellan S och första outright
+            if (d <= d0)
+            {
+                double t = YF(spot0, d);
+                double t1 = Math.Max(1e-12, YF(spot0, d0));
+                double b1 = OB(0), m1 = OM(0), a1 = OA(0);
+                double fb = (b1 != 0.0) ? (S + (t / t1) * (b1 - S)) : 0.0;
+                double fm = (m1 != 0.0) ? (S + (t / t1) * (m1 - S)) : 0.0;
+                double fa = (a1 != 0.0) ? (S + (t / t1) * (a1 - S)) : 0.0;
+                return (fb, fm, fa);
+            }
+
+            // b) Extrapolera åt höger: ta sista raden
+            if (d >= d1)
+                return (OB(rows.Length - 1), OM(rows.Length - 1), OA(rows.Length - 1));
+
+            // c) Interpolera linjärt mellan närmaste pilar
+            var dates = rows.Select(r => r.Field<DateTime>("DATE").Date).ToArray();
+            int hi = Array.BinarySearch(dates, d);
+            if (hi >= 0)
+                return (OB(hi), OM(hi), OA(hi));
+
+            hi = ~hi;
+            int lo = hi - 1;
+
+            double tLo = YF(spot0, dates[lo]);
+            double tHi = YF(spot0, dates[hi]);
+            double tX = YF(spot0, d);
+            double w = (tHi - tLo) > 0 ? (tX - tLo) / (tHi - tLo) : 0.0;
+            if (w < 0.0) w = 0.0; else if (w > 1.0) w = 1.0;
+
+            double oB = OB(lo) + w * (OB(hi) - OB(lo));
+            double oM = OM(lo) + w * (OM(hi) - OM(lo));
+            double oA = OA(lo) + w * (OA(hi) - OA(lo));
+
+            return (oB, oM, oA);
+        }
 
 
         #region === Helpers ===
@@ -624,9 +715,6 @@ namespace FX.Services.MarketData
 
 
         #endregion
-
-
-
 
     }
 }
