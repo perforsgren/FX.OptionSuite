@@ -58,8 +58,8 @@ namespace FX.UI.WinForms
         {
             _bus = bus ?? throw new ArgumentNullException(nameof(bus));
             _view = view ?? throw new ArgumentNullException(nameof(view));
-
             _spotSvc = spotSvc ?? throw new ArgumentNullException(nameof(spotSvc));
+            _mktStore = marketStore ?? throw new ArgumentNullException(nameof(marketStore));
 
             // === Ben: se till att vi startar med 1 stabilt ben ("Vanilla 1") ===
             if (_legStates.Count == 0)
@@ -67,14 +67,12 @@ namespace FX.UI.WinForms
                 var ls = new LegState(Guid.NewGuid(), "Vanilla 1");
                 _legStates.Add(ls);
                 _view.BindLegIdToLabel(ls.LegId, ls.Label); // håller UI-label i sync
-                Debug.WriteLine($"[Presenter.AddNewLeg] Added leg Vanilla {_legStates.Count} ({ls.LegId})");
+                //Debug.WriteLine($"[Presenter.AddNewLeg] Added leg Vanilla {_legStates.Count} ({ls.LegId})");
             }
 
             // Spot-feed kör vi lokalt (ingen DI för den i detta steg)
             _spotFeed = new BloombergSpotFeed(_spotTimeoutMs);
 
-            // Viktigt: använd den injicerade, delade MarketStore-instansen
-            _mktStore = marketStore ?? throw new ArgumentNullException(nameof(marketStore));
             _mktStore.Changed += OnMarketChanged;
 
             // UI →
@@ -89,6 +87,9 @@ namespace FX.UI.WinForms
             _view.SpotRefreshRequested += (_, __) => System.Threading.Tasks.Task.Run(() => RefreshSpotSnapshot());
 
             _view.RateClearOverrideRequested += OnRateClearOverrideRequested;
+
+            // NYTT: reagera på Forward MID/FULL (ingen reload – endast ViewMode på RD/RF)
+            _view.ForwardModeChanged += OnForwardModeChanged;
 
             // Initialt ViewMode till Store
             {
@@ -294,7 +295,7 @@ namespace FX.UI.WinForms
             string reason;
             if (!CanPriceNow(out reason))
             {
-                System.Diagnostics.Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
+                //System.Diagnostics.Debug.WriteLine("[Presenter] Skip PriceSingleLeg: " + reason);
                 return;
             }
 
@@ -539,8 +540,8 @@ namespace FX.UI.WinForms
                 var ok = _spotFeed.TryGetTwoWay(p6, out bid, out ask);
                 if (!ok) return;
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
+                //System.Diagnostics.Debug.WriteLine(
+                //    $"[RefreshSpotSnapshot][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {p6} FEED raw {bid:F6}/{ask:F6}");
 
                 // Nytt: lås upp ev. user-override så att feeden inte ignoreras.
                 var now = DateTime.UtcNow;
@@ -745,8 +746,8 @@ namespace FX.UI.WinForms
                     string reason;
                     if (CanPriceNow(out reason))
                         RepriceAllLegs();
-                    else
-                        Debug.WriteLine("[Presenter] Skip reprice: " + reason);
+                    //else
+                        //Debug.WriteLine("[Presenter] Skip reprice: " + reason);
                 }
                 finally
                 {
@@ -1618,7 +1619,7 @@ namespace FX.UI.WinForms
             double? uiRd, uiRf; bool ovRd, ovRf;
             if (!_view.TryReadRatesForColumn(col, out uiRd, out ovRd, out uiRf, out ovRf))
             {
-                System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] TryReadRatesForColumn misslyckades för col={col} (leg={legId}).");
+                //System.Diagnostics.Debug.WriteLine($"[Presenter.Rates->Store] TryReadRatesForColumn misslyckades för col={col} (leg={legId}).");
                 return;
             }
 
@@ -1718,6 +1719,89 @@ namespace FX.UI.WinForms
         }
 
         #endregion
+
+
+        #region Forward mode (MID/FULL/NET)
+
+        /// <summary>
+        /// Enkel reentrans-vakt när vi applicerar forward-läget mot Store/legs.
+        /// </summary>
+        private bool _applyingForwardMode;
+
+
+        /// <summary>
+        /// Mappar Viewns forward-mode (0=Mid, 1=Full, 2=Net) till ViewMode för RD/RF i Store.
+        /// NET hanteras tills vidare som TwoWay (se TODO i summary).
+        /// </summary>
+        /// <param name="forwardMode">0=Mid, 1=Full, 2=Net (från vyn).</param>
+        /// <returns>ViewMode.Mid eller ViewMode.TwoWay.</returns>
+        private ViewMode MapForwardModeIntToViewMode(int forwardMode)
+        {
+            // 0 = Mid, 1 = Full, 2 = Net (reserverad – behandlas som TwoWay tills engine/netting är aktiv)
+            if (forwardMode == 0) return ViewMode.Mid;
+            // 1 eller 2 (Full/Net) → TwoWay
+            return ViewMode.TwoWay;
+        }
+
+        /// <summary>
+        /// Sätter RD/RF ViewMode för alla legs i aktuell flik/struktur.
+        /// Skapar inga overrides; triggar Store-signals (Changed) som dina redan befintliga flöden plockar upp.
+        /// </summary>
+        /// <param name="vm">ViewMode att applicera (Mid eller TwoWay).</param>
+        private void ApplyForwardViewModeToAllLegs(ViewMode vm)
+        {
+            var p6 = NormalizePair6(_view.ReadPair6());
+            if (string.IsNullOrEmpty(p6) || _legStates == null || _legStates.Count == 0) return;
+
+            var now = DateTime.UtcNow;
+            foreach (var ls in _legStates)
+            {
+                var legId = ls.LegId.ToString();
+                _mktStore.SetRdViewMode(p6, legId, vm, now);
+                _mktStore.SetRfViewMode(p6, legId, vm, now);
+            }
+        }
+
+        /// <summary>
+        /// Reagerar på att användaren växlar FORWARD-läge (MID ⇆ FULL; NET förberett).
+        /// - Läser vyläget via <c>_view.GetForwardMode()</c>: 0=Mid, 1=Full, 2=Net.
+        /// - Mappar till Store-ViewMode (Mid/TwoWay). NET behandlas som TwoWay tills engine-NET aktiveras.
+        /// - Sätter RD/RF ViewMode för alla legs (inga overrides, ingen tvingad fetch).
+        /// - Låter dina befintliga OnMarketChanged/Push-flöden uppdatera UI och trigga reprisning.
+        /// </summary>
+        private void OnForwardModeChanged(object sender, EventArgs e)
+        {
+            if (_applyingForwardMode) return;
+            try
+            {
+                _applyingForwardMode = true;
+
+                // 0=Mid, 1=Full, 2=Net (din View exponerar detta enligt baseline)
+                int mode = _view.GetForwardMode();
+                var vm = MapForwardModeIntToViewMode(mode);
+
+                ApplyForwardViewModeToAllLegs(vm);
+
+                // Extra tydlighet: du har redan debounced reprice/Push via OnMarketChanged.
+                // Vill du vara explicit kan du avkommentera:
+                // ScheduleRepriceDebounced();
+
+                // Forward-raderna (Rate/Points) uppdateras redan i dina Push-flöden.
+                // Om du vill tvinga UI-refresh direkt här:
+                // PushForwardUiAllLegs();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
+            }
+            finally
+            {
+                _applyingForwardMode = false;
+            }
+        }
+
+        #endregion
+
 
     }
 }

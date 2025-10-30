@@ -217,6 +217,13 @@ namespace FX.UI.WinForms
         public event EventHandler<RateClearOverrideRequestedEventArgs> RateClearOverrideRequested;
 
 
+        /// <summary>
+        /// Fired när användaren växlar FORWARD-läge (Mid ⇆ Full) i UI.
+        /// Presentern uppdaterar MarketStore (RD/RF ViewMode) och triggar prisning centralt.
+        /// </summary>
+        public event EventHandler ForwardModeChanged;
+
+
         #endregion
 
         #region === EventArgs (UI→Presenter)
@@ -278,6 +285,7 @@ namespace FX.UI.WinForms
             BuildGrid();
             ApplyLegacyTheme();
             WireEvents();
+
             SeedDemoValues();
             SnapshotFeedFromGrid(); // baseline från nuvarande visning
 
@@ -286,6 +294,8 @@ namespace FX.UI.WinForms
 
             // Rita om spotraden direkt så visningen matchar Tag
             InvalidateSpotRow();
+
+
 
             _dgv.EditingControlShowing += (s, e) =>
             {
@@ -525,14 +535,21 @@ namespace FX.UI.WinForms
             _dgv.KeyPress += Dgv_KeyPressStartEdit;
             _dgv.KeyDown += Dgv_KeyDownStartEdit;
 
+            // Pricing-chip (Quote/Base)
             _dgv.CellMouseDown += Dgv_CellMouseDown_PricingButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_PricingButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_PricingButton;
             _dgv.CellMouseLeave += Dgv_CellMouseLeave_PricingButton;
 
+            // Spot-pill
             _dgv.CellMouseDown += Dgv_CellMouseDown_MktDataButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_MktDataButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_MktDataButton;
+
+            // NY: Forward-pill (MID/FULL) i "Forward Points"
+            _dgv.CellMouseDown += Dgv_CellMouseDown_FwdButton;
+            _dgv.CellMouseUp += Dgv_CellMouseUp_FwdButton;
+            _dgv.CellMouseMove += Dgv_CellMouseMove_FwdButton;
 
             _dgv.CellDoubleClick += (s, e) =>
             {
@@ -1864,6 +1881,81 @@ namespace FX.UI.WinForms
                 e.CellStyle.SelectionForeColor = oldSelFore;
                 return;
             }
+
+
+
+            // ===== 3b) FWD POINTS-radens FIELD-cell: rita etikett + MID/FULL/NET-knapp =====
+            bool isFwdFieldCell =
+                string.Equals(rowLabel, L.FwdPts, StringComparison.OrdinalIgnoreCase) &&
+                e.ColumnIndex == _dgv.Columns["FIELD"].Index;
+
+            if (isFwdFieldCell)
+            {
+                // Bakgrund
+                e.PaintBackground(e.CellBounds, true);
+
+                // Etikett till vänster
+                TextRenderer.DrawText(
+                    e.Graphics, L.FwdPts, new Font(this.Font, FontStyle.Bold),
+                    new Rectangle(e.CellBounds.X + 12, e.CellBounds.Y, e.CellBounds.Width, e.CellBounds.Height),
+                    e.CellStyle.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+
+                // Chip-text styrs av _spotMode
+                string modeText = (_fwdMode == ForwardMode.Full ? "FULL" : "MID");
+
+                var f = _dgv.Font;
+                var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding;
+
+                // Håll konstant bredd (mät största av texterna)
+                int wMid = TextRenderer.MeasureText("MID", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+                int wFull = TextRenderer.MeasureText("FULL", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+                int wNet = TextRenderer.MeasureText("NET", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+                int textW = Math.Max(wMid, Math.Max(wFull, wNet));
+
+                int padX = 8, padY = 2, corner = 8;
+                int btnW = textW + padX * 2;
+                int btnH = Math.Min(e.CellBounds.Height - 10, Math.Max(16, f.Height + padY));
+
+                int btnAbsX = e.CellBounds.Right - btnW - 8;
+                int btnAbsY = e.CellBounds.Top + (e.CellBounds.Height - btnH) / 2 - 1;
+
+                // Spara lokal-rect för hit-test
+                var btnRectLocal = new Rectangle(btnAbsX - e.CellBounds.X, btnAbsY - e.CellBounds.Y, btnW, btnH);
+
+                // Viktigt: exponera "header"-state för befintliga mouse-handlers
+                //_mktHeaderRow = e.RowIndex;
+                _fwdBtnRect = btnRectLocal;
+
+                Color fill = _mktBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
+                Color border = _mktBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
+
+                var btnRectAbs = new Rectangle(
+                    e.CellBounds.X + btnRectLocal.X,
+                    e.CellBounds.Y + btnRectLocal.Y,
+                    btnRectLocal.Width, btnRectLocal.Height);
+
+                using (var path = RoundedRect(btnRectAbs, corner))
+                using (var pen = new Pen(border))
+                using (var fillBr = new SolidBrush(fill))
+                {
+                    e.Graphics.FillPath(fillBr, path);
+                    e.Graphics.DrawPath(pen, path);
+                }
+
+                var textRectAbs = _mktBtnPressed
+                    ? new Rectangle(btnRectAbs.X, btnRectAbs.Y + 1, btnRectAbs.Width, btnRectAbs.Height)
+                    : btnRectAbs;
+
+                TextRenderer.DrawText(e.Graphics, modeText, f, textRectAbs, Color.Black, flags);
+
+                e.Handled = true;
+                e.CellStyle.SelectionBackColor = oldSelBack;
+                e.CellStyle.SelectionForeColor = oldSelFore;
+                return;
+            }
+
+
+
 
             // ===== 4) SPOT-värdeceller: specialmålning (MID vs BID/ASK) =====
             bool isSpotRow = string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase);
@@ -4422,6 +4514,154 @@ namespace FX.UI.WinForms
         private static int BuySellSign(string side)
         {
             return (string.Equals(side, "SELL", StringComparison.OrdinalIgnoreCase)) ? -1 : 1;
+        }
+
+        #endregion
+
+
+        #region === Forward Points-knapp (MID/FULL) ===
+
+        // NY: Forward-lägen för hedge/forward-komponenten i UI.
+        // NET förbereds men används inte i ritning ännu.
+        private enum ForwardMode { Mid = 0, Full = 1, Net = 2 }
+        private ForwardMode _fwdMode = ForwardMode.Full; // default enligt krav
+        private bool _fwdBtnPressed, _fwdBtnInside;
+        private Rectangle _fwdBtnRect = Rectangle.Empty;       // Senaste beräknade rect för pillen
+
+        /// <summary>
+        /// NY: Exponerar forward-läget för Presenter/ritning.
+        /// </summary>
+        public int GetForwardMode() { return (int)_fwdMode; }
+
+        /// <summary>
+        /// NY: Sätter forward-prissättningsläge (MID/FULL/NET) och ritar om Forward-raden.
+        /// Använd när override i FwdPts/FwdRate tvingar läge = MID.
+        /// </summary>
+        public void SetForwardMode(int mode)
+        {
+            var m = (ForwardMode)Math.Max(0, Math.Min(2, mode));
+            if (_fwdMode == m) return;
+            _fwdMode = m;
+            InvalidateFwdRow();
+            var h = ForwardModeChanged;
+            if (h != null) h(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// NY: MouseDown på Forward-pill (MID⇆FULL).
+        /// Hindrar cellselektion och ritar pressed-state.
+        /// </summary>
+        private void Dgv_CellMouseDown_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (!IsInsideFwdButton(e)) return;
+            _fwdBtnPressed = true;
+            _fwdBtnInside = true;
+            InvalidateFwdButton();
+            this.BeginInvoke(new Action(() => _dgv.ClearSelection()));
+        }
+
+        /// <summary>
+        /// NY: MouseMove – håll pressed-state bara när musen är kvar i knappen.
+        /// </summary>
+        private void Dgv_CellMouseMove_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (!_fwdBtnPressed) return;
+            bool nowInside = IsInsideFwdButton(e);
+            if (nowInside != _fwdBtnInside)
+            {
+                _fwdBtnInside = nowInside;
+                InvalidateFwdButton();
+            }
+        }
+
+        /// <summary>
+        /// NY: MouseUp – växlar MID&lt;-&gt;FULL (NET reserverat för senare).
+        /// Meddelar Presenter via ForwardModeChanged.
+        /// </summary>
+        private void Dgv_CellMouseUp_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (!_fwdBtnPressed) return;
+
+            bool inside = IsInsideFwdButton(e);
+            _fwdBtnPressed = false;
+            _fwdBtnInside = false;
+
+            if (!inside) { InvalidateFwdButton(); return; }
+
+            if (e.Button == MouseButtons.Left)
+            {
+                _fwdMode = (_fwdMode == ForwardMode.Mid) ? ForwardMode.Full : ForwardMode.Mid;
+            }
+            else if (e.Button == MouseButtons.Right)
+            {
+                // Förberett – aktiveras när NET-mode i engine finns.
+                //_fwdMode = ForwardMode.Net;
+            }
+
+            InvalidateFwdButton();
+            InvalidateFwdRow();
+
+            var h = ForwardModeChanged;
+            if (h != null) h(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// NY: Hit-test för Forward-pill i "FIELD" på raden "Forward Points".
+        /// Beräknar knapprutan deterministiskt (samma geometri som Spot-pill),
+        /// så vi slipper lagra rect i Paint.
+        /// </summary>
+        private bool IsInsideFwdButton(DataGridViewCellMouseEventArgs e)
+        {
+            int r = FindRow(L.FwdPts);
+            if (r < 0 || e.RowIndex != r) return false;
+            if (!_dgv.Columns.Contains("FIELD")) return false;
+
+            var cellRect = _dgv.GetCellDisplayRectangle(_dgv.Columns["FIELD"].Index, r, true);
+            if (cellRect.Width <= 0 || cellRect.Height <= 0) return false;
+
+            var f = _dgv.Font;
+            int wMid = TextRenderer.MeasureText("MID", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            int wFull = TextRenderer.MeasureText("FULL", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            int textW = Math.Max(wMid, wFull);
+            int padX = 8, padY = 2;
+            int btnW = textW + padX * 2;
+            int btnH = Math.Min(cellRect.Height - 10, Math.Max(16, f.Height + padY));
+            int btnX = cellRect.Right - btnW - 8;
+            int btnY = cellRect.Top + (cellRect.Height - btnH) / 2 - 1;
+
+            var btnAbs = new Rectangle(btnX, btnY, btnW, btnH);
+            var pt = _dgv.PointToClient(Cursor.Position);
+            return btnAbs.Contains(pt);
+        }
+
+        /// <summary>
+        /// NY: Invaliderar pill-cellen (FIELD på "Forward Points").
+        /// </summary>
+        private void InvalidateFwdButton()
+        {
+            int r = FindRow(L.FwdPts);
+            if (r >= 0 && _dgv.Columns.Contains("FIELD"))
+                _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, r);
+        }
+
+        /// <summary>
+        /// NY: Invaliderar Forward-raderna (Points + Rate).
+        /// </summary>
+        private void InvalidateFwdRow()
+        {
+            int rPts = FindRow(L.FwdPts);
+            int rRate = FindRow(L.FwdRate);
+            if (rPts >= 0) _dgv.InvalidateRow(rPts);
+            if (rRate >= 0) _dgv.InvalidateRow(rRate);
+        }
+
+        /// <summary>
+        /// NY: Hjälp för målningen om du vill läsa texten från state.
+        /// </summary>
+        public string GetForwardModeText()
+        {
+            return (_fwdMode == ForwardMode.Full) ? "FULL" :
+                   (_fwdMode == ForwardMode.Mid) ? "MID" : "NET";
         }
 
         #endregion
