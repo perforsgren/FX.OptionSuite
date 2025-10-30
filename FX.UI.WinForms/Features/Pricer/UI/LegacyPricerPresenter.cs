@@ -1756,58 +1756,56 @@ namespace FX.UI.WinForms
 
         #region Forward mode (MID/FULL/NET)
 
-
         /// <summary>
-        /// Mappar Viewns forward-mode (0=Mid, 1=Full, 2=Net) till ViewMode för RD/RF i Store.
-        /// NET hanteras tills vidare som TwoWay (se TODO i summary).
-        /// </summary>
-        /// <param name="forwardMode">0=Mid, 1=Full, 2=Net (från vyn).</param>
-        /// <returns>ViewMode.Mid eller ViewMode.TwoWay.</returns>
-        private ViewMode MapForwardModeIntToViewMode(int forwardMode)
-        {
-            // 0 = Mid, 1 = Full, 2 = Net (Net -> TwoWay tills vidare)
-            return (forwardMode == 0) ? ViewMode.Mid : ViewMode.TwoWay;
-        }
-
-        /// <summary>
-        /// Sätter RD/RF ViewMode för alla legs i aktuell flik/struktur.
-        /// Skapar inga overrides; triggar Store-signals (Changed) som dina redan befintliga flöden plockar upp.
-        /// </summary>
-        /// <param name="vm">ViewMode att applicera (Mid eller TwoWay).</param>
-        private void ApplyForwardViewModeToAllLegs(ViewMode vm)
-        {
-            var p6 = NormalizePair6(_view.ReadPair6());
-            if (string.IsNullOrEmpty(p6) || _legStates == null || _legStates.Count == 0) return;
-
-            var now = DateTime.UtcNow;
-            foreach (var ls in _legStates)
-            {
-                var legId = ls.LegId.ToString();
-                _mktStore.SetRdViewMode(p6, legId, vm, now);
-                _mktStore.SetRfViewMode(p6, legId, vm, now);
-            }
-        }
-
-        /// <summary>
-        /// Reagerar på att användaren växlar FORWARD-läge (MID ⇆ FULL; NET förberett).
-        /// - Läser vy-läget via _view.GetForwardMode(): 0=Mid, 1=Full, 2=Net.
-        /// - Mappar till Store.ViewMode (Mid/TwoWay) och applicerar på alla legs.
-        /// - Pushar omedelbart forward-UI (så användaren ser rätt ”mid” resp. ”bid/ask”).
-        /// - Schemalägger debounced reprice (oberoende av Store:Changed-reason).
+        /// Reagerar på att användaren växlar FORWARD-läge (MID ⇆ FULL ⇆ NET).
+        /// Policy:
+        ///  - ForwardPricingMode är “single source of truth”.
+        ///  - Presenter synkar RD/RF ViewMode: MID → ViewMode.Mid, FULL → ViewMode.TwoWay, NET (förberett) → ViewMode.TwoWay tills vidare.
+        /// Beteende:
+        ///  - Sätter RD/RF ViewMode på ALLA ben.
+        ///  - Pushar omedelbart RD/RF-UI + Forward-UI (snabb visuell feedback).
+        ///  - Triggar ALLTID debouncad reprice oberoende av Store-events/cooldowns.
         /// </summary>
         private void OnForwardModeChanged(object sender, EventArgs e)
         {
             try
             {
-                int mode = _view.GetForwardMode();                 // 0=Mid, 1=Full, 2=Net
-                var vm = MapForwardModeIntToViewMode(mode);
+                var p6 = NormalizePair6(_view.ReadPair6());
+                if (string.IsNullOrWhiteSpace(p6) || _legStates == null || _legStates.Count == 0)
+                    return;
 
-                ApplyForwardViewModeToAllLegs(vm);
+                // Hämta forward-mode från vyn (0=Mid, 1=Full, 2=Net). Net → TwoWay (tills engine-stödet är klart).
+                int mode = _view.GetForwardMode();
+                ViewMode vm;
+                switch (mode)
+                {
+                    case 0: // MID
+                        vm = ViewMode.Mid;
+                        break;
+                    case 1: // FULL
+                        vm = ViewMode.TwoWay;
+                        break;
+                    case 2: // NET (förberett) – håll RD/RF tvåväg så att engine kan prisa sida-för-sida
+                    default:
+                        vm = ViewMode.TwoWay;
+                        break;
+                }
 
-                // Visa rätt forward/points direkt
+                var now = DateTime.UtcNow;
+
+                // 1) Synka RD/RF ViewMode i Store för ALLA ben
+                for (int i = 0; i < _legStates.Count; i++)
+                {
+                    var legIdStr = _legStates[i].LegId.ToString();
+                    _mktStore.SetRdViewMode(p6, legIdStr, vm, now);
+                    _mktStore.SetRfViewMode(p6, legIdStr, vm, now);
+                }
+
+                // 2) Omedelbar UI-push: RD/RF + Forward (ingen väntan på Store-events)
+                PushRatesUiAllLegs();
                 PushForwardUiAllLegs();
 
-                // Prisa om
+                // 3) Alltid schemalägg reprice (debounced)
                 ScheduleRepriceDebounced();
             }
             catch (Exception ex)
@@ -1815,6 +1813,8 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
             }
         }
+
+
 
         #endregion
 

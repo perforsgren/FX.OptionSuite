@@ -22,13 +22,13 @@ namespace FX.Services
 
         /// <summary>
         /// Tvåvägsprissättning (GK på F) där Spot och RD/RF kan vara tvåväg.
-        /// - Räknar två forward-scenarier från RD/RF med S_mid som bas:
-        ///     scenBid:  DFd_fwd_bid (rdAsk), DFf_fwd_bid (rfBid)
-        ///     scenAsk:  DFd_fwd_ask (rdBid), DFf_fwd_ask (rfAsk)
+        /// Viktigt: Forward per sida använder spot-sidan (S_bid/S_ask) så att Spot-pillen påverkar premien.
+        /// - Vi räknar två scenarier:
+        ///     scenBid:  S_bid,  DFd_fwd(rdAsk), DFf_fwd(rfBid),  DF till expiry med samma sidning
+        ///     scenAsk:  S_ask,  DFd_fwd(rdBid), DFf_fwd(rfAsk),  DF till expiry med samma sidning
         /// - Mappning till Bid/Ask beror på optionstyp:
         ///     * Call: Bid = lägre F, Ask = högre F
         ///     * Put : Bid = högre F, Ask = lägre F
-        /// - Varje sida diskonteras med respektive DF till expiry och använder sin vol (bid/ask).
         /// - Greker tas på mid (F_mid, rdMid/rfMid).
         /// </summary>
         public async Task<TwoSidedPriceResult> PriceAsync(PricingRequest request, CancellationToken ct = default(CancellationToken))
@@ -65,8 +65,10 @@ namespace FX.Services
             double TdfDom_fwd = Math.Max(0.0, (settlement - spotDate).TotalDays) / denomDom;
             double TdfFor_fwd = Math.Max(0.0, (settlement - spotDate).TotalDays) / denomFor;
 
-            // 1) Spot tvåväg → använd S_mid som bas för forward-härledning (stabilt)
-            double sMid = 0.5 * (request.SpotBid + request.SpotAsk);
+            // 1) Spot tvåväg – använd sidorna (återställt så Spot-pillen påverkar premien)
+            double sBid = request.SpotBid;
+            double sAsk = request.SpotAsk;
+            double sMid = 0.5 * (sBid + sAsk);
 
             // 2) RD/RF tvåväg
             double rdBid = request.RdBid, rdAsk = request.RdAsk;
@@ -74,33 +76,36 @@ namespace FX.Services
             double rdMid = 0.5 * (rdBid + rdAsk);
             double rfMid = 0.5 * (rfBid + rfAsk);
 
-            // 3) DF till expiry (mid och sidade)
+            // 3) DF till expiry (mid och scenarier)
             double DFd_exp_mid = Math.Exp(-rdMid * TdfDom_exp);
             double DFf_exp_mid = Math.Exp(-rfMid * TdfFor_exp);
 
-            double DFd_exp_scenBid = Math.Exp(-rdAsk * TdfDom_exp); // “bid-scenariot” diskonteras hårdare (lägre DFd)
+            // scenBid diskonteras mot expiry med rdAsk/rfBid
+            double DFd_exp_scenBid = Math.Exp(-rdAsk * TdfDom_exp);
             double DFf_exp_scenBid = Math.Exp(-rfBid * TdfFor_exp);
 
-            double DFd_exp_scenAsk = Math.Exp(-rdBid * TdfDom_exp); // “ask-scenariot” diskonteras mjukare (högre DFd)
+            // scenAsk diskonteras mot expiry med rdBid/rfAsk
+            double DFd_exp_scenAsk = Math.Exp(-rdBid * TdfDom_exp);
             double DFf_exp_scenAsk = Math.Exp(-rfAsk * TdfFor_exp);
 
             // 4) DF för forwardperiod (för F)
             double DFd_fwd_scenBid = Math.Exp(-rdAsk * TdfDom_fwd);
             double DFf_fwd_scenBid = Math.Exp(-rfBid * TdfFor_fwd);
+
             double DFd_fwd_scenAsk = Math.Exp(-rdBid * TdfDom_fwd);
             double DFf_fwd_scenAsk = Math.Exp(-rfAsk * TdfFor_fwd);
 
-            // 5) Forward per scenario, baserat på S_mid
-            double F_scenBid = sMid * (DFf_fwd_scenBid / Math.Max(1e-12, DFd_fwd_scenBid));
-            double F_scenAsk = sMid * (DFf_fwd_scenAsk / Math.Max(1e-12, DFd_fwd_scenAsk));
+            // 5) Forward per scenario – NU med spot-sida
+            double F_scenBid = sBid * (DFf_fwd_scenBid / Math.Max(1e-12, DFd_fwd_scenBid));
+            double F_scenAsk = sAsk * (DFf_fwd_scenAsk / Math.Max(1e-12, DFd_fwd_scenAsk));
 
             // 6) Mappa scenarier till Bid/Ask beroende på optionstyp
-            //    För call vill vi ha lägre F på Bid-sidan; för put tvärtom.
             double F_bid, F_ask;
             double DFd_exp_bid, DFf_exp_bid, DFd_exp_ask, DFf_exp_ask;
 
             if (isCall)
             {
+                // Call: pris stiger med F → lägg lägre F på Bid
                 if (F_scenBid <= F_scenAsk)
                 {
                     F_bid = F_scenBid; DFd_exp_bid = DFd_exp_scenBid; DFf_exp_bid = DFf_exp_scenBid;
@@ -112,8 +117,9 @@ namespace FX.Services
                     F_ask = F_scenBid; DFd_exp_ask = DFd_exp_scenBid; DFf_exp_ask = DFf_exp_scenBid;
                 }
             }
-            else // Put
+            else
             {
+                // Put: pris sjunker med F → lägg högre F på Bid
                 if (F_scenBid >= F_scenAsk)
                 {
                     F_bid = F_scenBid; DFd_exp_bid = DFd_exp_scenBid; DFf_exp_bid = DFf_exp_scenBid;
@@ -126,8 +132,10 @@ namespace FX.Services
                 }
             }
 
-            // 7) Mid-forward för greker
-            double F_mid = sMid * (Math.Exp(-rfMid * TdfFor_fwd) / Math.Max(1e-12, Math.Exp(-rdMid * TdfDom_fwd)));
+            // 7) Mid-forward för greker (behåll mid för stabila greker)
+            double DFd_fwd_mid = Math.Exp(-rdMid * TdfDom_fwd);
+            double DFf_fwd_mid = Math.Exp(-rfMid * TdfFor_fwd);
+            double F_mid = sMid * (DFf_fwd_mid / Math.Max(1e-12, DFd_fwd_mid));
 
             // 8) Sigma
             double sigmaMid = request.Vol.Mid;
@@ -136,19 +144,20 @@ namespace FX.Services
 
             // 9) Prisningar
             var mid = await PriceOneSigmaCoreAsync(F_mid, K, isCall, sigmaMid, Topt, sqrtT, DFd_exp_mid, DFf_exp_mid, ct).ConfigureAwait(false);
-            var bidRes = await PriceOneSigmaCoreAsync(F_bid, K, isCall, sigmaBid, Topt, sqrtT, DFd_exp_bid, DFf_exp_bid, ct).ConfigureAwait(false);
-            var askRes = await PriceOneSigmaCoreAsync(F_ask, K, isCall, sigmaAsk, Topt, sqrtT, DFd_exp_ask, DFf_exp_ask, ct).ConfigureAwait(false);
+            var bidPx = await PriceOneSigmaCoreAsync(F_bid, K, isCall, sigmaBid, Topt, sqrtT, DFd_exp_bid, DFf_exp_bid, ct).ConfigureAwait(false);
+            var askPx = await PriceOneSigmaCoreAsync(F_ask, K, isCall, sigmaAsk, Topt, sqrtT, DFd_exp_ask, DFf_exp_ask, ct).ConfigureAwait(false);
 
             return new TwoSidedPriceResult(
-                premiumBid: bidRes.Premium,
+                premiumBid: bidPx.Premium,
                 premiumMid: mid.Premium,
-                premiumAsk: askRes.Premium,
+                premiumAsk: askPx.Premium,
                 delta: mid.Delta,
                 gamma: mid.Gamma,
                 vega: mid.Vega,
                 theta: mid.Theta
             );
         }
+
 
 
         /// <summary>
