@@ -1488,12 +1488,117 @@ namespace FX.UI.WinForms
             }
         }
 
+
+
+        /// <summary>
+        /// ERSÄTT: Beräknar Forward Rate och Points för ett ben och pushar till UI.
+        /// - MID-läge: singelvärde via ShowForwardById(...).
+        /// - FULL-läge: "bid / ask" via ShowForwardTwoWayById(...).
+        /// - Formler (MM-approx, DF-logik):
+        ///   S_mid = (S_bid+S_ask)/2
+        ///   MID:  F = S_mid * (1 + rd_mid*Tq) / (1 + rf_mid*Tb)
+        ///         P = F - S_mid
+        ///   FULL: F_bid = S_mid * (1 + rd_ask*Tq) / (1 + rf_bid*Tb)
+        ///         F_ask = S_mid * (1 + rd_bid*Tq) / (1 + rf_ask*Tb)
+        ///         P_*   = F_* - S_mid
+        /// </summary>
+        private void PushForwardUiForLeg(Guid legId)
+        {
+            try
+            {
+                var pair6 = NormalizePair6(_view.ReadPair6());
+                if (string.IsNullOrEmpty(pair6))
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                var baseCcy = pair6.Substring(0, 3);
+                var quoteCcy = pair6.Substring(3, 3);
+
+                var today = DateTime.Today;
+                var expIso = _view.TryGetResolvedExpiryIsoById(legId);
+                DateTime expiry;
+                if (!DateTime.TryParse(expIso, out expiry)) expiry = today;
+
+                var dates = _spotSvc.Compute(pair6, today, expiry);
+                var spotDate = dates.SpotDate;
+                var settlement = dates.SettlementDate;
+
+                var snap = _mktStore.Current;
+                if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                // Spot mid
+                var se = snap.Spot.Effective;
+                var spotMid = 0.5 * (se.Bid + se.Ask);
+
+                // RD/RF eff för detta leg
+                var key = legId.ToString();
+                var rdFld = snap.TryGetRd(key);
+                var rfFld = snap.TryGetRf(key);
+                if (rdFld == null || rfFld == null)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+
+                double rdBid = rdFld.Effective.Bid, rdAsk = rdFld.Effective.Ask;
+                double rfBid = rfFld.Effective.Bid, rfAsk = rfFld.Effective.Ask;
+
+                // Year fractions
+                var Tq = YearFracMm(spotDate, settlement, quoteCcy);
+                var Tb = YearFracMm(spotDate, settlement, baseCcy);
+
+                int mode = _view.GetForwardMode(); // 0=Mid, 1=Full, 2=Net
+                bool twoWay = (mode != 0);
+
+                if (!twoWay)
+                {
+                    // MID
+                    var rdMid = 0.5 * (rdBid + rdAsk);
+                    var rfMid = 0.5 * (rfBid + rfAsk);
+
+                    double denom = (1.0 + rfMid * Tb);
+                    if (denom <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
+
+                    double F = spotMid * (1.0 + rdMid * Tq) / denom;
+                    double P = F - spotMid;
+
+                    _view.ShowForwardById(legId, F, P);
+                }
+                else
+                {
+                    // FULL → tvåväg
+                    double denomBid = (1.0 + rfBid * Tb);
+                    double denomAsk = (1.0 + rfAsk * Tb);
+                    if (denomBid <= 0.0 || denomAsk <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
+
+                    double F_bid = spotMid * (1.0 + rdAsk * Tq) / denomBid;
+                    double F_ask = spotMid * (1.0 + rdBid * Tq) / denomAsk;
+
+                    double P_bid = F_bid - spotMid;
+                    double P_ask = F_ask - spotMid;
+
+                    _view.ShowForwardTwoWayById(legId, F_bid, F_ask, P_bid, P_ask);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushForwardUiForLeg: " + ex.Message);
+            }
+        }
+
+
         /// <summary>
         /// Beräknar Forward Rate och Forward Points för ett specifikt ben (legId)
         /// utifrån aktuell spot + rd/rf i MarketStore och benets resolverade expiry i UI,
         /// och pushar till vyn (vyn skalar points ×1000 i presentation).
         /// </summary>
-        private void PushForwardUiForLeg(Guid legId)
+        private void PushForwardUiForLegOLD(Guid legId)
         {
             try
             {
@@ -1723,11 +1828,6 @@ namespace FX.UI.WinForms
 
         #region Forward mode (MID/FULL/NET)
 
-        /// <summary>
-        /// Enkel reentrans-vakt när vi applicerar forward-läget mot Store/legs.
-        /// </summary>
-        private bool _applyingForwardMode;
-
 
         /// <summary>
         /// Mappar Viewns forward-mode (0=Mid, 1=Full, 2=Net) till ViewMode för RD/RF i Store.
@@ -1737,10 +1837,8 @@ namespace FX.UI.WinForms
         /// <returns>ViewMode.Mid eller ViewMode.TwoWay.</returns>
         private ViewMode MapForwardModeIntToViewMode(int forwardMode)
         {
-            // 0 = Mid, 1 = Full, 2 = Net (reserverad – behandlas som TwoWay tills engine/netting är aktiv)
-            if (forwardMode == 0) return ViewMode.Mid;
-            // 1 eller 2 (Full/Net) → TwoWay
-            return ViewMode.TwoWay;
+            // 0 = Mid, 1 = Full, 2 = Net (Net -> TwoWay tills vidare)
+            return (forwardMode == 0) ? ViewMode.Mid : ViewMode.TwoWay;
         }
 
         /// <summary>
@@ -1764,39 +1862,29 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Reagerar på att användaren växlar FORWARD-läge (MID ⇆ FULL; NET förberett).
-        /// - Läser vyläget via <c>_view.GetForwardMode()</c>: 0=Mid, 1=Full, 2=Net.
-        /// - Mappar till Store-ViewMode (Mid/TwoWay). NET behandlas som TwoWay tills engine-NET aktiveras.
-        /// - Sätter RD/RF ViewMode för alla legs (inga overrides, ingen tvingad fetch).
-        /// - Låter dina befintliga OnMarketChanged/Push-flöden uppdatera UI och trigga reprisning.
+        /// - Läser vy-läget via _view.GetForwardMode(): 0=Mid, 1=Full, 2=Net.
+        /// - Mappar till Store.ViewMode (Mid/TwoWay) och applicerar på alla legs.
+        /// - Pushar omedelbart forward-UI (så användaren ser rätt ”mid” resp. ”bid/ask”).
+        /// - Schemalägger debounced reprice (oberoende av Store:Changed-reason).
         /// </summary>
         private void OnForwardModeChanged(object sender, EventArgs e)
         {
-            if (_applyingForwardMode) return;
             try
             {
-                _applyingForwardMode = true;
-
-                // 0=Mid, 1=Full, 2=Net (din View exponerar detta enligt baseline)
-                int mode = _view.GetForwardMode();
+                int mode = _view.GetForwardMode();                 // 0=Mid, 1=Full, 2=Net
                 var vm = MapForwardModeIntToViewMode(mode);
 
                 ApplyForwardViewModeToAllLegs(vm);
 
-                // Extra tydlighet: du har redan debounced reprice/Push via OnMarketChanged.
-                // Vill du vara explicit kan du avkommentera:
-                // ScheduleRepriceDebounced();
+                // Visa rätt forward/points direkt
+                PushForwardUiAllLegs();
 
-                // Forward-raderna (Rate/Points) uppdateras redan i dina Push-flöden.
-                // Om du vill tvinga UI-refresh direkt här:
-                // PushForwardUiAllLegs();
+                // Prisa om
+                ScheduleRepriceDebounced();
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
-            }
-            finally
-            {
-                _applyingForwardMode = false;
             }
         }
 

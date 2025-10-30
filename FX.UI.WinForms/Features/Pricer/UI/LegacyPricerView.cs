@@ -550,6 +550,7 @@ namespace FX.UI.WinForms
             _dgv.CellMouseDown += Dgv_CellMouseDown_FwdButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_FwdButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_FwdButton;
+            _dgv.CellEndEdit += Dgv_CellEndEdit_ForwardAutoSwitch;
 
             _dgv.CellDoubleClick += (s, e) =>
             {
@@ -630,7 +631,7 @@ namespace FX.UI.WinForms
                     // undertryck fäll/expand EN gång.
                     //if ((isPricing || isMktData) && _suppressNextSectionToggle)
                     if (isPricing && _suppressNextSectionToggle)
-                        {
+                    {
                         _suppressNextSectionToggle = false; // reset för nästa klick
                         return; // hoppa över ToggleSection
                     }
@@ -4665,6 +4666,112 @@ namespace FX.UI.WinForms
         }
 
         #endregion
+
+        #region === Forward Rate/Points: tvåvägsvisning (bid / ask) ===
+
+        /// <summary>
+        /// NY: Visar tvåvägs Forward Rate och Forward Points i cellerna för ett ben.
+        /// - Rate: "bid / ask" med 6 d.p.
+        /// - Points: "bid / ask" i pips (×10 000) med 3 d.p.
+        /// - Null/ogiltigt → tom cell.
+        /// </summary>
+        public void ShowForwardTwoWayById(Guid legId, double? fwdBid, double? fwdAsk, double? ptsBid, double? ptsAsk)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
+
+            int rRate = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+            if (rRate >= 0)
+            {
+                string s = (fwdBid.HasValue && fwdAsk.HasValue)
+                    ? $"{fwdBid.Value.ToString("F6", ci)} / {fwdAsk.Value.ToString("F6", ci)}"
+                    : "";
+                _dgv.Rows[rRate].Cells[col].Value = s;
+            }
+
+            if (rPts >= 0)
+            {
+                string s = "";
+                if (ptsBid.HasValue && ptsAsk.HasValue)
+                {
+                    double b = ptsBid.Value * 10000.0;
+                    double a = ptsAsk.Value * 10000.0;
+                    s = $"{b.ToString("F3", ci)} / {a.ToString("F3", ci)}";
+                }
+                _dgv.Rows[rPts].Cells[col].Value = s;
+            }
+        }
+
+        #endregion
+
+        #region === Autoswitch för Forward Points/Rate + event ===
+
+        public enum ForwardInputKind { Unknown = 0, Single = 1, TwoWay = 2 }
+
+        public sealed class ForwardInputEditedEventArgs : EventArgs
+        {
+            public string RowLabel { get; private set; }
+            public string ColumnName { get; private set; }
+            public ForwardInputKind Kind { get; private set; }
+            public string Raw { get; private set; }
+            public ForwardInputEditedEventArgs(string rowLabel, string col, ForwardInputKind kind, string raw)
+            {
+                RowLabel = rowLabel; ColumnName = col; Kind = kind; Raw = raw;
+            }
+        }
+
+        /// <summary>NY: Eldas när användaren editerat Forward Rate/Points.</summary>
+        public event EventHandler<ForwardInputEditedEventArgs> ForwardInputEdited;
+
+        /// <summary>
+        /// NY: Känner igen singeltal vs "bid / ask" på raderna Forward Points/Rate
+        /// och växlar pill-läge automatiskt: Single→MID, TwoWay→FULL.
+        /// </summary>
+        private void Dgv_CellEndEdit_ForwardAutoSwitch(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            if (!_dgv.Columns.Contains("FIELD")) return;
+
+            string rowLabel = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
+            if (!string.Equals(rowLabel, L.FwdPts, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(rowLabel, L.FwdRate, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string col = _dgv.Columns[e.ColumnIndex].Name;
+            var raw = Convert.ToString(_dgv.Rows[e.RowIndex].Cells[e.ColumnIndex].EditedFormattedValue ?? "");
+            if (string.IsNullOrWhiteSpace(raw)) return;
+
+            var s = raw.Trim();
+
+            // TwoWay om "x / y" (slash mellan två tal). Tillåt , eller . som decimal.
+            var twoWay = System.Text.RegularExpressions.Regex.IsMatch(
+                s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*/\s*[+-]?\d+(?:[.,]\d+)?\s*$");
+
+            // Single om exakt ett tal
+            var single = System.Text.RegularExpressions.Regex.IsMatch(
+                s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*$");
+
+            if (twoWay)
+            {
+                if (GetForwardMode() != 1) SetForwardMode(1); // FULL
+                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.TwoWay, raw));
+            }
+            else if (single)
+            {
+                if (GetForwardMode() != 0) SetForwardMode(0); // MID
+                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.Single, raw));
+            }
+            else
+            {
+                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.Unknown, raw));
+            }
+        }
+
+        #endregion
+
 
     }
 
