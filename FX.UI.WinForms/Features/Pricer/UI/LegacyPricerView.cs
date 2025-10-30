@@ -4670,7 +4670,7 @@ namespace FX.UI.WinForms
         #region === Forward Rate/Points: tvåvägsvisning (bid / ask) ===
 
         /// <summary>
-        /// NY: Visar tvåvägs Forward Rate och Forward Points i cellerna för ett ben.
+        /// Visar tvåvägs Forward Rate och Forward Points i cellerna för ett ben.
         /// - Rate: "bid / ask" med 6 d.p.
         /// - Points: "bid / ask" i pips (×10 000) med 3 d.p.
         /// - Null/ogiltigt → tom cell.
@@ -4705,12 +4705,14 @@ namespace FX.UI.WinForms
             }
         }
 
+
         #endregion
 
         #region === Autoswitch för Forward Points/Rate + event ===
 
         public enum ForwardInputKind { Unknown = 0, Single = 1, TwoWay = 2 }
 
+        /// <summary>EventArgs för ForwardInputEdited.</summary>
         public sealed class ForwardInputEditedEventArgs : EventArgs
         {
             public string RowLabel { get; private set; }
@@ -4718,17 +4720,15 @@ namespace FX.UI.WinForms
             public ForwardInputKind Kind { get; private set; }
             public string Raw { get; private set; }
             public ForwardInputEditedEventArgs(string rowLabel, string col, ForwardInputKind kind, string raw)
-            {
-                RowLabel = rowLabel; ColumnName = col; Kind = kind; Raw = raw;
-            }
+            { RowLabel = rowLabel; ColumnName = col; Kind = kind; Raw = raw; }
         }
 
         /// <summary>NY: Eldas när användaren editerat Forward Rate/Points.</summary>
         public event EventHandler<ForwardInputEditedEventArgs> ForwardInputEdited;
 
         /// <summary>
-        /// NY: Känner igen singeltal vs "bid / ask" på raderna Forward Points/Rate
-        /// och växlar pill-läge automatiskt: Single→MID, TwoWay→FULL.
+        /// Känner igen singeltal vs "bid / ask" på raderna Forward Points/Rate
+        /// och växlar pill-läge automatiskt: Single → MID, TwoWay → FULL.
         /// </summary>
         private void Dgv_CellEndEdit_ForwardAutoSwitch(object sender, DataGridViewCellEventArgs e)
         {
@@ -4746,11 +4746,9 @@ namespace FX.UI.WinForms
 
             var s = raw.Trim();
 
-            // TwoWay om "x / y" (slash mellan två tal). Tillåt , eller . som decimal.
             var twoWay = System.Text.RegularExpressions.Regex.IsMatch(
                 s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*/\s*[+-]?\d+(?:[.,]\d+)?\s*$");
 
-            // Single om exakt ett tal
             var single = System.Text.RegularExpressions.Regex.IsMatch(
                 s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*$");
 

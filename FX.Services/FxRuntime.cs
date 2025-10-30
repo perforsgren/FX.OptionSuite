@@ -55,17 +55,14 @@ namespace FX.Services
             _ = Task.Run(() => HandleRequestPriceWorkerAsync(cmd));
         }
 
-
-
-
-
         /// <summary>
         /// Huvudhandler för prisförfrågningar.
+        /// Flöde:
         /// 1) Normalisera indata och räkna datum (expiry via cmd, spot/settle via ISpotSetDateService).
         /// 2) Säkerställ RD/RF i MarketStore för aktuellt legId (hedrar ForceRefreshRates).
-        /// 3) Läs spot enligt Store (respektera ViewMode/Override).
-        /// 4) Läs effektiv RD/RF från Store och använd mid.
-        /// 5) Bygg PricingRequest, kör motorn och publicera PriceCalculated.
+        /// 3) Läs Spot enligt Store (respektera ViewMode/Override) → SpotBid/SpotAsk (MID ⇒ bid=ask=mid).
+        /// 4) Läs RD/RF enligt Store (respektera ViewMode/Override) → RdBid/RdAsk/RfBid/RfAsk (MID ⇒ bid=ask=mid).
+        /// 5) Bygg PricingRequest med tvåvägs Spot + tvåvägs RD/RF, sätt Vol, kör motorn och publicera PriceCalculated.
         /// </summary>
         private async Task HandleRequestPriceWorkerAsync(RequestPrice cmd)
         {
@@ -126,7 +123,8 @@ namespace FX.Services
                         spotBid = spotEff.Bid; spotAsk = spotEff.Ask;
                     }
 
-                    // 4) RD/RF effektivt
+
+                    // 4) RD/RF enligt Store (respektera ViewMode/Override) → tvåväg
                     var rdFld = snap.TryGetRd(legId);
                     var rfFld = snap.TryGetRf(legId);
                     if (rdFld == null || rfFld == null)
@@ -141,7 +139,7 @@ namespace FX.Services
                     {
                         using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
                         {
-                            feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, true);
+                            feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement, /*forceRefresh:*/ true);
                         }
                         snap = _marketStore.Current;
                         rdFld = snap.TryGetRd(legId); rfFld = snap.TryGetRf(legId);
@@ -155,13 +153,32 @@ namespace FX.Services
                             throw new InvalidOperationException("RD/RF är 0/0 efter ensure (retry).");
                     }
 
+                    // Bygg RD tvåväg med hänsyn till ViewMode/Override (MID ⇒ bid=ask=mid)
+                    double rdBid, rdAsk;
+                    {
+                        double b = rdEff.Bid, a = rdEff.Ask, m = 0.5 * (b + a);
+                        if (rdFld.ViewMode == ViewMode.Mid || rdFld.Override == OverrideMode.Mid) { rdBid = m; rdAsk = m; }
+                        else { rdBid = b; rdAsk = a; }
+                    }
+
+                    // Bygg RF tvåväg med hänsyn till ViewMode/Override (MID ⇒ bid=ask=mid)
+                    double rfBid, rfAsk;
+                    {
+                        double b = rfEff.Bid, a = rfEff.Ask, m = 0.5 * (b + a);
+                        if (rfFld.ViewMode == ViewMode.Mid || rfFld.Override == OverrideMode.Mid) { rfBid = m; rfAsk = m; }
+                        else { rfBid = b; rfAsk = a; }
+                    }
+
                     System.Diagnostics.Debug.WriteLine(
                         "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
                         "pair=" + pair6 + " legId=" + legId +
                         " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                        " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6"));
+                        " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6") +
+                        " rdUse=" + rdBid.ToString("F6") + "/" + rdAsk.ToString("F6") +
+                        " rfUse=" + rfBid.ToString("F6") + "/" + rfAsk.ToString("F6"));
 
-                    // 5) Prissättning (oförändrat)
+
+                    // 5) Prissättning
                     var legs = new List<OptionLeg>();
                     if (cmd.Legs != null)
                     {
@@ -187,17 +204,21 @@ namespace FX.Services
                         }
                     }
 
+                    // PricingRequest – nu tvåvägs Spot + tvåvägs RD/RF
                     var domainReq = new PricingRequest(
                         pair: new CurrencyPair(pair6.Substring(0, 3), pair6.Substring(3, 3)),
                         legs: legs,
                         spotBid: spotBid,
                         spotAsk: spotAsk,
-                        rd: 0.5 * (rdEff.Bid + rdEff.Ask),
-                        rf: 0.5 * (rfEff.Bid + rfEff.Ask),
+                        rdBid: rdBid,
+                        rdAsk: rdAsk,
+                        rfBid: rfBid,
+                        rfAsk: rfAsk,
                         surfaceId: cmd.SurfaceId ?? "default",
                         stickyDelta: cmd.StickyDelta
                     );
 
+                    // Vol (tvåvägsprocent)
                     double? bidDec = cmd.VolBidPct.HasValue ? (cmd.VolBidPct.Value / 100.0) : (double?)null;
                     double? askDec = cmd.VolAskPct.HasValue ? (cmd.VolAskPct.Value / 100.0) : (double?)null;
                     domainReq.SetVol(new VolQuote(bidDec, askDec));
@@ -251,14 +272,14 @@ namespace FX.Services
         /// Liten hjälpare: hämta/bygg rd/rf för (pair6, legId) med feedern en gång.
         /// Anropa när du har today/spotDate/settlement från dina kalender-tjänster.
         /// </summary>
-        public void EnsureRdRfOnce(string pair6, string legId, DateTime today, DateTime spotDate, DateTime settlement)
-        {
-            if (_marketStore == null) return;
-            using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
-            {
-                feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement);
-            }
-        }
+        //public void EnsureRdRfOnce(string pair6, string legId, DateTime today, DateTime spotDate, DateTime settlement)
+        //{
+        //    if (_marketStore == null) return;
+        //    using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
+        //    {
+        //        feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement);
+        //    }
+        //}
 
         private static BuySell ParseSide(string s)
         {
