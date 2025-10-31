@@ -1,7 +1,22 @@
 using System;
 
+
 namespace FX.Core.Domain.MarketData
 {
+
+    /// <summary>
+    /// Global visnings-/prispolicy för forwardrelaterade rader i UI.
+    /// Mid  = visa singelvärden (mid) för RD/RF/Forward.
+    /// Full = visa tvåväg (bid/ask) för RD/RF/Forward.
+    /// Net  = förberett; UI som tvåväg, engine kan senare tillämpa sided-with-netting.
+    /// </summary>
+    public enum ForwardPricingMode
+    {
+        Mid = 0,
+        Full = 1,
+        Net = 2
+    }
+
     /// <summary>
     /// Kontrakt för en enkel in-memory store för marknadsdata.
     /// - Håller senaste snapshotet (Spot + per-leg Rd/Rf).
@@ -16,8 +31,12 @@ namespace FX.Core.Domain.MarketData
         /// <summary>Aktuellt snapshot (aldrig null efter konstruktion).</summary>
         MarketSnapshot Current { get; }
 
+        ForwardPricingMode GetForwardPricingMode();
+        void SetForwardPricingMode(string pair6, ForwardPricingMode mode, DateTime nowUtc);
+
+
         // ================================
-        // SPOT (oförändrat)
+        // SPOT 
         // ================================
 
         /// <summary>
@@ -118,9 +137,6 @@ namespace FX.Core.Domain.MarketData
         void InvalidateRatesForLeg(string pair6, string legId, DateTime nowUtc);
 
     }
-
-
-
 
     /// <summary>Event-args som bär med sig nytt snapshot och orsak.</summary>
     public sealed class MarketChangedEventArgs : EventArgs

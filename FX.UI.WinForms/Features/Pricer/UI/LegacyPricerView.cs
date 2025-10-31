@@ -283,7 +283,7 @@ namespace FX.UI.WinForms
             BackColor = Color.White;
 
             BuildGrid();
-            ApplyLegacyTheme();
+            ApplyPricerTheme();
             WireEvents();
 
             SeedDemoValues();
@@ -311,7 +311,7 @@ namespace FX.UI.WinForms
             };
         }
 
-        private void ApplyLegacyTheme()
+        private void ApplyPricerTheme()
         {
             // 1) Lås font för hela pricer-vyn (välj den storlek du vill ha som “baseline”)
             //    8.25f var vanligt i WinForms, eller 9f om du vill ha lite större.
@@ -497,6 +497,38 @@ namespace FX.UI.WinForms
                     c.Style.Format = "";
                 }
             }
+
+
+            // === RD: Lås helt (Deal + alla legs) ===
+            SetRowReadOnly(L.Rd, true);
+            int rRd = FindRow(L.Rd);
+            if (rRd >= 0)
+            {
+                // Gråa ut legs (Deal kan förbli default-färg som signal att raden existerar,
+                // men är ReadOnly enligt SetRowReadOnly).
+                foreach (var leg in _legs)
+                {
+                    var c = _dgv.Rows[rRd].Cells[leg];
+                    c.ReadOnly = true;
+                    c.Style.ForeColor = Color.Gray;
+                    c.Style.Format = "";
+                }
+            }
+
+            // === RF: Lås helt (Deal + alla legs) ===
+            SetRowReadOnly(L.Rf, true);
+            int rRf = FindRow(L.Rf);
+            if (rRf >= 0)
+            {
+                foreach (var leg in _legs)
+                {
+                    var c = _dgv.Rows[rRf].Cells[leg];
+                    c.ReadOnly = true;
+                    c.Style.ForeColor = Color.Gray;
+                    c.Style.Format = "";
+                }
+            }
+
 
             // Spot: Deal editbar; legs readonly
             SetRowReadOnly(L.Spot, true);
@@ -714,9 +746,13 @@ namespace FX.UI.WinForms
             }
         }
 
-        /// <summary>Sätter rollback-state och edit-start snapshot för ändringsdetektering.</summary>
+        /// <summary>
+        /// Start på cell-redigering i gridden. Lagrar startvärden (för rollback/ändringsdetektering),
+        /// men ignorerar helt när programmatisk UI-push pågår (event-vakt).
+        /// </summary>
         private void Dgv_CellBeginEdit(object sender, DataGridViewCellCancelEventArgs e)
         {
+
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
 
             string lbl = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
@@ -778,6 +814,7 @@ namespace FX.UI.WinForms
         /// <summary>
         /// Validerar, normaliserar, rollback vid fel, samt sätter override-färg endast om ändrat
         /// (feed-baseline jämförelse) och triggar repricing för berörda ben.
+        /// Respekterar även event-vakten: om programmatisk UI-push pågår görs ingen logik.
         /// </summary>
         private void Dgv_CellEndEdit(object sender, DataGridViewCellEventArgs e)
         {
@@ -1149,7 +1186,7 @@ namespace FX.UI.WinForms
 
                         bool atFeed = false; double f;
                         if (TryGetFeedDouble(lbl, lg, out f))
-                            atFeed = Math.Abs(f - dec) <= 1e-9;
+                            atFeed = DisplayEqualRate(dec, f);
                         MarkOverride(lbl, lg, !atFeed);
 
                         RateEdited?.Invoke(this, new RateEditedEventArgs
@@ -1336,7 +1373,7 @@ namespace FX.UI.WinForms
                     _editStart.Remove(Key(L.Side, col));
 
                     // =======================
-                    // [ADDED - STEP 3] Bold i premie ska uppdateras när Side ändras
+                    // Bold i premie ska uppdateras när Side ändras
                     // =======================
                     _dgv.InvalidateRow(R(L.PremUnit));
                     _dgv.InvalidateRow(R(L.PremTot));
@@ -1361,7 +1398,7 @@ namespace FX.UI.WinForms
                     _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
 
                     // =======================
-                    // [ADDED - STEP 3] Bold i premie ska uppdateras när Side ändras
+                    // Bold i premie ska uppdateras när Side ändras
                     // =======================
                     _dgv.InvalidateRow(R(L.PremUnit));
                     _dgv.InvalidateRow(R(L.PremTot));
@@ -1416,6 +1453,7 @@ namespace FX.UI.WinForms
                 return;
             }
         }
+
 
         /// <summary>KeyPress → starta edit med teckeninsättning och caret på slutet.</summary>
         private void Dgv_KeyPressStartEdit(object sender, KeyPressEventArgs e)
@@ -3009,6 +3047,69 @@ namespace FX.UI.WinForms
             //Debug.WriteLine($"[View.ShowRates] leg={legId} col={col} rd={rdDec?.ToString("P3") ?? "-"} rf={rfDec?.ToString("P3") ?? "-"} staleRd={staleRd} staleRf={staleRf}");
         }
 
+        /// <summary>
+        /// Visar RD/RF som tvåväg (”bid / ask”) för ett specifikt ben (via LegId).
+        /// - Sätter både Tag (baseline = mid som decimal) och Value (formaterad ”bid / ask”) för RD/RF.
+        /// - Lagrar baseline i _feedValue via SetFeedValue(...), så Delete/TryGetFeedDouble fortsatt fungerar.
+        /// - Släcker lila (MarkOverride(..., false)) för båda sidor.
+        /// - Sätter ev. stale-hint i tooltip.
+        /// </summary>
+        public void ShowRatesTwoWayById(
+            Guid legId,
+            double rdBid, double rdAsk,
+            double rfBid, double rfAsk,
+            bool staleRd, bool staleRf)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col)) return;
+
+            int rRd = R(L.Rd);
+            int rRf = R(L.Rf);
+            if (rRd < 0 || rRf < 0) return; // RD/RF-rader saknas i layouten
+
+            // RD
+            {
+                var c = _dgv.Rows[rRd].Cells[col];
+                double mid = 0.5 * (rdBid + rdAsk);
+
+                // Baseline / reset-stöd
+                c.Tag = mid;                        // decimal (t.ex. 0.018159)
+                SetFeedValue(L.Rd, col, mid);       // baseline-cache
+
+                // Visning ”bid / ask”
+                var bidTxt = FormatPercent(rdBid, 3);
+                var askTxt = FormatPercent(rdAsk, 3);
+                c.Value = $"{bidTxt} / {askTxt}";
+
+                // Ingen override-färg i tvåvägsläge
+                MarkOverride(L.Rd, col, false);
+                c.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
+            }
+
+            // RF
+            {
+                var c = _dgv.Rows[rRf].Cells[col];
+                double mid = 0.5 * (rfBid + rfAsk);
+
+                // Baseline / reset-stöd
+                c.Tag = mid;
+                SetFeedValue(L.Rf, col, mid);
+
+                // Visning ”bid / ask”
+                var bidTxt = FormatPercent(rfBid, 3);
+                var askTxt = FormatPercent(rfAsk, 3);
+                c.Value = $"{bidTxt} / {askTxt}";
+
+                MarkOverride(L.Rf, col, false);
+                c.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
+            }
+
+            // Rita om raderna
+            _dgv.InvalidateRow(rRd);
+            _dgv.InvalidateRow(rRf);
+        }
+
+
         // === Helper: re-rendera ett ben med befintliga Tag-värden och aktiv valuta ===
         private void RenderLegPricing(string legCol)
         {
@@ -3722,15 +3823,20 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
-        /// relativt FEED-baseline. 
-        /// 
+        /// relativt FEED-baseline.
+        ///
+        /// Strategi (UI-konsistent jämförelse):
+        /// - UI visar räntor med 3 d.p. i procent. Det motsvarar 5 decimaler i decimalform.
+        /// - För att undvika "spök-override" jämför vi därför <b>kvantiserade</b> värden:
+        ///   rd_ui_q = Round(rd_ui, 5), rd_feed_q = Round(rd_feed, 5) och samma för rf.
+        /// - Override sätts ENDAST om de kvantiserade värdena skiljer sig (|ui_q - feed_q| > 1e-12).
+        ///
         /// Viktigt:
         /// - Aktuellt UI-värde hämtas från cell.Value (det användaren ser/har editerat).
         /// - FEED-baseline hämtas via TryGetFeedDouble(label, col, out feed).
-        /// - Override sätts ENDAST om |UI - FEED| > tolerans.
-        /// - Saknar vi FEED-baseline just nu -> override = false (kan ej avgöras).
-        /// 
-        /// Returnerar: 
+        /// - Saknar vi FEED-baseline just nu → override = false (kan ej avgöras).
+        ///
+        /// Returnerar:
         ///   rd / rf i DECIMAL (ex: 0.0123 = 1.23%), samt rdOverride / rfOverride.
         /// </summary>
         public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
@@ -3741,7 +3847,12 @@ namespace FX.UI.WinForms
             if (string.IsNullOrWhiteSpace(col))
                 return false;
 
-            const double tol = 1e-9;
+            // UI visar 3 d.p. i procent ⇒ 5 decimaler i decimalform
+            const int percentDp = 3;
+            const int decimalDp = 2 + percentDp; // 3 d.p. %  => 5 decimaler i decimal
+            const double eqEps = 1e-12;          // säkerhetsmarginal efter avrundning
+
+            double Quantize(double x) => Math.Round(x, decimalDp, MidpointRounding.AwayFromZero);
 
             // === RD ===
             try
@@ -3755,16 +3866,23 @@ namespace FX.UI.WinForms
                 else if (cRd?.Tag is double rdBaselineFromTag)
                     rd = rdBaselineFromTag; // fallback om cellen är tom -> returnera baseline som värde
 
-                // 2) Läs FEED-baseline och avgör override.
+                // 2) Läs FEED-baseline och avgör override via kvantisering
                 if (TryGetFeedDouble(L.Rd, col, out var rdFeed))
                 {
                     if (rd.HasValue)
-                        rdOverride = Math.Abs(rd.Value - rdFeed) > tol;
-                    // saknas rd => lämna rdOverride=false
+                    {
+                        var uiQ = Quantize(rd.Value);
+                        var feedQ = Quantize(rdFeed);
+                        rdOverride = Math.Abs(uiQ - feedQ) > eqEps;
+                    }
+                    else
+                    {
+                        rdOverride = false;
+                    }
                 }
                 else
                 {
-                    // Ingen FEED-baseline tillgänglig just nu → kan ej avgöra override -> false.
+                    // Ingen FEED-baseline tillgänglig → kan ej avgöra override
                     rdOverride = false;
                 }
             }
@@ -3787,7 +3905,15 @@ namespace FX.UI.WinForms
                 if (TryGetFeedDouble(L.Rf, col, out var rfFeed))
                 {
                     if (rf.HasValue)
-                        rfOverride = Math.Abs(rf.Value - rfFeed) > tol;
+                    {
+                        var uiQ = Quantize(rf.Value);
+                        var feedQ = Quantize(rfFeed);
+                        rfOverride = Math.Abs(uiQ - feedQ) > eqEps;
+                    }
+                    else
+                    {
+                        rfOverride = false;
+                    }
                 }
                 else
                 {
@@ -3802,6 +3928,7 @@ namespace FX.UI.WinForms
             // Returnera true om vi lyckades läsa något alls för RD eller RF
             return rd.HasValue || rf.HasValue;
         }
+
 
 
         /// <summary>
@@ -4058,6 +4185,9 @@ namespace FX.UI.WinForms
         /// <summary>Slår på/av override-färg (och selection-färg) för en cell.</summary>
         private void MarkOverride(string label, string col, bool on)
         {
+
+            //if (IsUiEventsSuspended) return;
+
             int r = FindRow(label);
             if (r < 0) return;
 
@@ -4519,6 +4649,31 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region Helpers – Rate display quantization
+
+        /// <summary>
+        /// Rundar ett räntevärde (i DECIMAL-form, t.ex. 0.0123 = 1,23 %) till samma precision
+        /// som UI-visningen (3 d.p. i procent), dvs 5 decimaler i decimalform.
+        /// </summary>
+        private static double RoundRateToDisplay(double x)
+        {
+            return Math.Round(x, 5, MidpointRounding.AwayFromZero);
+        }
+
+        /// <summary>
+        /// Jämför två räntevärden (i DECIMAL-form) så som de visas i UI:t.
+        /// Returnerar true om de är lika efter kvantisering till 5 decimaler (3 d.p. %).
+        /// </summary>
+        private static bool DisplayEqualRate(double a, double b)
+        {
+            var ra = RoundRateToDisplay(a);
+            var rb = RoundRateToDisplay(b);
+            return Math.Abs(ra - rb) <= 1e-12;
+        }
+
+        #endregion
+
+
 
         #region === Forward Points-knapp (MID/FULL) ===
 
@@ -4769,7 +4924,6 @@ namespace FX.UI.WinForms
         }
 
         #endregion
-
 
     }
 

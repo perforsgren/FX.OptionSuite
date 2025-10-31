@@ -426,10 +426,6 @@ namespace FX.UI.WinForms
             _bus.Publish(cmd);
         }
 
-
-
-
-
         /// <summary>
         /// Bekvämlighetsöverlagring: standard = ingen force refresh.
         /// </summary>
@@ -613,9 +609,6 @@ namespace FX.UI.WinForms
             }
         }
 
-
-
-
         /// <summary>
         /// UI → MarketStore: en specifik ränta (RD eller RF) har editerats för ett visst ben.
         /// Skriv ENDAST det fältet till Store som User-override. Andra fält lämnas orörda.
@@ -764,6 +757,38 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
+        /// Detekterar om en MarketStore-reason signalerar ändrat Forward-läge,
+        /// antingen som direkt "ForwardMode" eller i batchsträng "Batch:...;Forward=n;...".
+        /// </summary>
+        private static bool IsForwardReason(string reason)
+        {
+            if (string.IsNullOrEmpty(reason))
+                return false;
+
+            if (string.Equals(reason, "ForwardMode", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (reason.StartsWith("Batch:", StringComparison.OrdinalIgnoreCase))
+            {
+                // Sök Forward=NN i batchsträngen
+                var key = "Forward=";
+                var i = reason.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+                if (i >= 0)
+                {
+                    int s = i + key.Length;
+                    int e = s;
+                    while (e < reason.Length && char.IsDigit(reason[e])) e++;
+                    var num = reason.Substring(s, e - s);
+                    int val;
+                    if (int.TryParse(num, out val) && val > 0)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+
+        /// <summary>
         /// Reagerar på ändringar i MarketStore och uppdaterar UI + prissättning.
         /// Regler:
         /// - Spot-only (även Batch med enbart Spot>0): uppdatera BARA spot i UI + Forward (ej RD/RF) + debounce-reprice.
@@ -786,7 +811,48 @@ namespace FX.UI.WinForms
                 var spotField = snap?.Spot;
                 TwoWay<double>? eff = (spotField != null ? (TwoWay<double>?)spotField.Effective : null);
 
-                // =========== [ADDED – STEP 1] User-override RD/RF (rate-only user) ===========
+                // =========== ForwardMode toggled ===========
+                if (IsForwardReason(reason))
+                {
+                    var snap2 = _mktStore.Current;
+                    var p6snap = snap2?.Pair6 ?? _view.ReadPair6();
+                    var p6 = NormalizePair6(p6snap);
+
+                    if (!string.IsNullOrWhiteSpace(p6) && _legStates != null && _legStates.Count > 0)
+                    {
+                        var fpm = _mktStore.GetForwardPricingMode();
+                        var vm = (fpm == FX.Core.Domain.MarketData.ForwardPricingMode.Mid)
+                                 ? ViewMode.Mid
+                                 : ViewMode.TwoWay; // Full/Net → TwoWay
+
+                        var nowUtc = DateTime.UtcNow;
+
+                        // Sätt endast om ändring krävs per ben → undvik loops/extra events
+                        for (int i = 0; i < _legStates.Count; i++)
+                        {
+                            var legIdStr = _legStates[i].LegId.ToString();
+
+                            var rdFld = snap2.TryGetRd(legIdStr);
+                            if (rdFld != null && rdFld.ViewMode != vm)
+                                _mktStore.SetRdViewMode(p6, legIdStr, vm, nowUtc);
+
+                            var rfFld = snap2.TryGetRf(legIdStr);
+                            if (rfFld != null && rfFld.ViewMode != vm)
+                                _mktStore.SetRfViewMode(p6, legIdStr, vm, nowUtc);
+                        }
+
+                        // UI-push + reprice (debounced) — inuti UI-eventskydd för att undvika spök-override
+                        OnUi(() =>
+                        {
+                            PushRatesUiAllLegs();
+                            PushForwardUiAllLegs();
+                        });
+                        ScheduleRepriceDebounced();
+                        return;
+                    }
+                }
+
+                // =========== [User-override RD/RF (rate-only user)] ===========
                 {
                     bool isUserRd = reason.StartsWith("UserRd:", StringComparison.OrdinalIgnoreCase);
                     bool isUserRf = reason.StartsWith("UserRf:", StringComparison.OrdinalIgnoreCase);
@@ -818,11 +884,17 @@ namespace FX.UI.WinForms
                             System.Diagnostics.Debug.WriteLine(
                                 $"[Presenter.UserRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] reason={reason} leg={gid} rd={(rdMid.HasValue ? rdMid.Value.ToString("F6") : "-")} rf={(rfMid.HasValue ? rfMid.Value.ToString("F6") : "-")}");
 
-                            // Visa override i UI (Guid) utan att röra baseline → lila stannar kvar
-                            _view.ShowRatesOverrideById(gid, rdMid, rfMid, staleRd, staleRf);
+                            // UI-push inom eventskydd → inga edit/commit-handlers
+                            OnUi(() =>
+                            {
 
-                            // Forward påverkas av RD/RF → uppdatera för just detta ben
-                            PushForwardUiForLeg(gid);
+                                // Visa override i UI (Guid) utan att röra baseline → lila stannar kvar
+                                _view.ShowRatesOverrideById(gid, rdMid, rfMid, staleRd, staleRf);
+
+                                // Forward påverkas av RD/RF → uppdatera för just detta ben
+                                PushForwardUiForLeg(gid);
+
+                            });
 
                             // Reprice debounced (rate-only user)
                             ScheduleRepriceDebounced();
@@ -830,23 +902,29 @@ namespace FX.UI.WinForms
                         }
                     }
                 }
-                // ======= [END ADDED – STEP 1] =======
 
-                // =========== 1) Direkta spot-reasons =============
+                // =========== 1) Direkta spot-reasons ===========
                 if (IsSpotReason(reason))
                 {
-                    if (eff.HasValue)
+                    // Skydda spot + forward UI-push inom eventskydd
+                    OnUi(() =>
                     {
-                        bool isUserSpot =
-                            reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
-                            (spotField != null && spotField.Source == FX.Core.Domain.MarketData.MarketSource.User);
 
-                        if (isUserSpot) _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
-                        else _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                    }
+                        if (eff.HasValue)
+                        {
+                            bool isUserSpot =
+                                reason.StartsWith("UserSpot", StringComparison.OrdinalIgnoreCase) ||
+                                (spotField != null && spotField.Source == FX.Core.Domain.MarketData.MarketSource.User);
 
-                    // Viktigt: RÖR INTE RD/RF-UI här – men uppdatera Forward (påverkas av spot).
-                    PushForwardUiAllLegs();
+                            if (isUserSpot) _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
+                            else _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                        }
+
+                        // Viktigt: RÖR INTE RD/RF-UI här – men uppdatera Forward (påverkas av spot).
+                        PushForwardUiAllLegs();
+
+                    });
+
                     ScheduleRepriceDebounced();
                     return;
                 }
@@ -875,16 +953,23 @@ namespace FX.UI.WinForms
                     // Spot-only i batch → behandla som spot-only
                     if (spotCnt > 0 && rdCnt == 0 && rfCnt == 0)
                     {
-                        if (eff.HasValue)
+                        // Skydda spot + forward UI-push inom eventskydd
+                        OnUi(() =>
                         {
-                            if (spotField.Source == FX.Core.Domain.MarketData.MarketSource.User)
-                                _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
-                            else
-                                _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
-                        }
 
-                        // Endast Forward uppdateras här (RD/RF lämnas orörda)
-                        PushForwardUiAllLegs();
+                            if (eff.HasValue)
+                            {
+                                if (spotField.Source == FX.Core.Domain.MarketData.MarketSource.User)
+                                    _view.ShowSpotUserFixed4(eff.Value.Bid, eff.Value.Ask);
+                                else
+                                    _view.ShowSpotFeedFixed4(eff.Value.Bid, eff.Value.Ask);
+                            }
+
+                            // Endast Forward uppdateras här (RD/RF lämnas orörda)
+                            PushForwardUiAllLegs();
+
+                        });
+
                         ScheduleRepriceDebounced();
                         return;
                     }
@@ -892,8 +977,12 @@ namespace FX.UI.WinForms
                     // Någon rate ändrades → uppdatera RD/RF + forward
                     if (rdCnt > 0 || rfCnt > 0)
                     {
-                        PushRatesUiAllLegs();
-                        PushForwardUiAllLegs();
+                        // Skydda programmatiska uppdateringar i rate-only-batch
+                        OnUi(() =>
+                        {
+                            PushRatesUiAllLegs();
+                            PushForwardUiAllLegs();
+                        });
 
                         if (!_pricingInFlight &&
                             (System.DateTime.UtcNow - _lastPriceFinishedUtc) >= _rateWriteCooldown)
@@ -911,8 +1000,8 @@ namespace FX.UI.WinForms
                 bool isRateOnly =
                     reason.StartsWith("FeedRd", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("FeedRf", StringComparison.OrdinalIgnoreCase) ||
-                    reason.StartsWith("UserRd", StringComparison.OrdinalIgnoreCase) ||   // täcks tidigt men kvar för tydlighet
-                    reason.StartsWith("UserRf", StringComparison.OrdinalIgnoreCase) ||   // täcks tidigt men kvar för tydlighet
+                    reason.StartsWith("UserRd", StringComparison.OrdinalIgnoreCase) ||
+                    reason.StartsWith("UserRf", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("RdViewMode", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("RfViewMode", StringComparison.OrdinalIgnoreCase) ||
                     reason.StartsWith("RdOverride", StringComparison.OrdinalIgnoreCase) ||
@@ -923,13 +1012,23 @@ namespace FX.UI.WinForms
                     Guid gid;
                     if (TryParseLegGuidFromReason(reason, out gid) && gid != Guid.Empty)
                     {
-                        PushRatesUiForLeg(gid);
-                        PushForwardUiForLeg(gid);
+                        // Skydda programmatiska uppdateringar (per ben)
+                        OnUi(() =>
+                        {
+                            PushRatesUiForLeg(gid);
+                            PushForwardUiForLeg(gid);
+
+                        });
                     }
                     else
                     {
-                        PushRatesUiAllLegs();
-                        PushForwardUiAllLegs();
+                        // Skydda programmatiska uppdateringar (alla ben)
+                        OnUi(() =>
+                        {
+                            PushRatesUiAllLegs();
+                            PushForwardUiAllLegs();
+
+                        });
                     }
 
                     if (_pricingInFlight) return;
@@ -947,6 +1046,10 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnMarketChanged: " + ex.Message);
             }
         }
+
+
+
+
 
         /// <summary>
         /// Får normaliserad two-way Spot från vyn (Bid/Ask + WasMid) och skriver den som User till MarketStore.
@@ -1394,11 +1497,11 @@ namespace FX.UI.WinForms
         #region #region UI sync (Store→UI & UI→Store)
 
         /// <summary>
-        /// UI-push för RD/RF för ett specifikt ben:
-        /// - Om Store har aktiv USER-override på RD och/eller RF → visa partial override (lila) endast för de sidor som är override:ade.
-        /// - Annars → visa feed-baseline (neutral), vilket även släcker lila i vyn (via ShowRatesById).
-        /// - Mid definieras här som (Bid+Ask)/2 från Effective-fältet.
-        /// - Stale-status från Store mappas till tooltip i vyn.
+        /// Uppdaterar RD/RF i UI för ett specifikt ben och respekterar:
+        /// - User-override (visas som lila och singelvärde via ShowRatesOverrideById)
+        /// - ViewMode per ränta (Mid → singel; TwoWay → "bid / ask")
+        /// 
+        /// Not: ViewMode är redan synkad av Presentern från Forward-pillen (MID ⇆ FULL).
         /// </summary>
         private void PushRatesUiForLeg(Guid legId)
         {
@@ -1413,24 +1516,29 @@ namespace FX.UI.WinForms
                 var rdFld = snap.TryGetRd(legIdStr);
                 var rfFld = snap.TryGetRf(legIdStr);
 
-                // Effektiva mid-värden (User om override, annars Feed)
+                // Effektiva värden + stale
                 double? rdMid = null, rfMid = null;
                 bool staleRd = false, staleRf = false;
+
+                double? rdBid = null, rdAsk = null;
+                double? rfBid = null, rfAsk = null;
 
                 if (rdFld != null)
                 {
                     var e = rdFld.Effective;
+                    rdBid = e.Bid; rdAsk = e.Ask;
                     rdMid = 0.5 * (e.Bid + e.Ask);
                     staleRd = rdFld.IsStale;
                 }
                 if (rfFld != null)
                 {
                     var e = rfFld.Effective;
+                    rfBid = e.Bid; rfAsk = e.Ask;
                     rfMid = 0.5 * (e.Bid + e.Ask);
                     staleRf = rfFld.IsStale;
                 }
 
-                // Override-aktiv? (User-låsning)
+                // Override-aktiv? (User-låsning – visa alltid override singelvärde i lila)
                 bool rdOverrideActive = rdFld != null &&
                                         rdFld.Override != OverrideMode.None &&
                                         rdFld.Source == FX.Core.Domain.MarketData.MarketSource.User;
@@ -1439,12 +1547,6 @@ namespace FX.UI.WinForms
                                         rfFld.Override != OverrideMode.None &&
                                         rfFld.Source == FX.Core.Domain.MarketData.MarketSource.User;
 
-                //System.Diagnostics.Debug.WriteLine(
-                //    $"[Presenter.UI.Rates] leg={legId} rd={(rdMid?.ToString("F6") ?? "-")} rf={(rfMid?.ToString("F6") ?? "-")} ovRd={rdOverrideActive} ovRf={rfOverrideActive}");
-
-                // Respektera override i UI-push:
-                // - Om override aktiv: visa override-värden (lila), rör inte baseline.
-                // - Annars: visa feed-baseline (ingen lila).
                 if (rdOverrideActive || rfOverrideActive)
                 {
                     _view.ShowRatesOverrideById(
@@ -1453,6 +1555,24 @@ namespace FX.UI.WinForms
                         rfOverrideActive ? rfMid : (double?)null,
                         staleRd,
                         staleRf
+                    );
+                    return;
+                }
+
+                // Ingen override → bind visningen till ViewMode (proxy för Forward-läge):
+                // Mid  → singel (ShowRatesById)
+                // TwoWay → "bid / ask" (ShowRatesTwoWayById)
+                var showTwoWay =
+                    (rdFld != null && rdFld.ViewMode == ViewMode.TwoWay) ||
+                    (rfFld != null && rfFld.ViewMode == ViewMode.TwoWay);
+
+                if (showTwoWay && rdBid.HasValue && rdAsk.HasValue && rfBid.HasValue && rfAsk.HasValue)
+                {
+                    _view.ShowRatesTwoWayById(
+                        legId,
+                        rdBid.Value, rdAsk.Value,
+                        rfBid.Value, rfAsk.Value,
+                        staleRd, staleRf
                     );
                 }
                 else
@@ -1471,6 +1591,7 @@ namespace FX.UI.WinForms
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushRatesUiForLeg: " + ex.Message);
             }
         }
+
 
         /// <summary>
         /// Uppdaterar RD/RF i UI för alla ben. Respekterar override per ben (se <see cref="PushRatesUiForLeg(Guid)"/>).
@@ -1757,60 +1878,33 @@ namespace FX.UI.WinForms
         #region Forward mode (MID/FULL/NET)
 
         /// <summary>
-        /// Reagerar på att användaren växlar FORWARD-läge (MID ⇆ FULL ⇆ NET).
-        /// Policy:
-        ///  - ForwardPricingMode är “single source of truth”.
-        ///  - Presenter synkar RD/RF ViewMode: MID → ViewMode.Mid, FULL → ViewMode.TwoWay, NET (förberett) → ViewMode.TwoWay tills vidare.
-        /// Beteende:
-        ///  - Sätter RD/RF ViewMode på ALLA ben.
-        ///  - Pushar omedelbart RD/RF-UI + Forward-UI (snabb visuell feedback).
-        ///  - Triggar ALLTID debouncad reprice oberoende av Store-events/cooldowns.
+        /// Hanterar klick på Forward-pill (MID/FULL/NET).
+        /// Gör minsta möjliga: sätter endast MarketStore.ForwardPricingMode.
+        /// OnMarketChanged (reason = "ForwardMode") sköter därefter synk av RD/RF-ViewMode,
+        /// UI-push (Rates/Forward) och debouncad reprice.
         /// </summary>
         private void OnForwardModeChanged(object sender, EventArgs e)
         {
             try
             {
                 var p6 = NormalizePair6(_view.ReadPair6());
-                if (string.IsNullOrWhiteSpace(p6) || _legStates == null || _legStates.Count == 0)
+                if (string.IsNullOrWhiteSpace(p6))
                     return;
 
-                // Hämta forward-mode från vyn (0=Mid, 1=Full, 2=Net). Net → TwoWay (tills engine-stödet är klart).
-                int mode = _view.GetForwardMode();
-                ViewMode vm;
-                switch (mode)
-                {
-                    case 0: // MID
-                        vm = ViewMode.Mid;
-                        break;
-                    case 1: // FULL
-                        vm = ViewMode.TwoWay;
-                        break;
-                    case 2: // NET (förberett) – håll RD/RF tvåväg så att engine kan prisa sida-för-sida
-                    default:
-                        vm = ViewMode.TwoWay;
-                        break;
-                }
+                // 0=Mid, 1=Full, 2=Net
+                int sel = _view.GetForwardMode();
 
-                var now = DateTime.UtcNow;
+                var fpm =
+                    (sel == 0) ? ForwardPricingMode.Mid
+                  : (sel == 1) ? ForwardPricingMode.Full
+                               : ForwardPricingMode.Net;
 
-                // 1) Synka RD/RF ViewMode i Store för ALLA ben
-                for (int i = 0; i < _legStates.Count; i++)
-                {
-                    var legIdStr = _legStates[i].LegId.ToString();
-                    _mktStore.SetRdViewMode(p6, legIdStr, vm, now);
-                    _mktStore.SetRfViewMode(p6, legIdStr, vm, now);
-                }
-
-                // 2) Omedelbar UI-push: RD/RF + Forward (ingen väntan på Store-events)
-                PushRatesUiAllLegs();
-                PushForwardUiAllLegs();
-
-                // 3) Alltid schemalägg reprice (debounced)
-                ScheduleRepriceDebounced();
+                _mktStore.SetForwardPricingMode(p6, fpm, DateTime.UtcNow);
+                // Ingen UI-push här; OnMarketChanged tar hand om det (även vid batchade reasons).
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
+                Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
             }
         }
 

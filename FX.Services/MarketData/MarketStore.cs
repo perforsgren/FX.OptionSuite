@@ -3,6 +3,7 @@
 using System;
 using System.Globalization;
 using FX.Core.Domain.MarketData;
+using static FX.Core.Domain.MarketData.IMarketStore;
 
 namespace FX.Services.MarketData
 {
@@ -22,7 +23,8 @@ namespace FX.Services.MarketData
         private readonly object _chgGate = new object();
         private System.Threading.Timer _chgTimer;
         private const int ChangedDebounceMs = 30; // 20–50 ms är vanligtvis lagom
-        private int _chgRdCount, _chgRfCount, _chgSpotCount, _chgOtherCount;
+        private int _chgRdCount, _chgRfCount, _chgSpotCount, _chgFwdCount, _chgOtherCount;
+
 
         public MarketStore()
         {
@@ -39,6 +41,43 @@ namespace FX.Services.MarketData
 
             _current = new MarketSnapshot("EURSEK", spot);
         }
+
+        #region Forward Pricing Mode  // ERSÄTT
+
+        // Default-läge = Full (tvåväg i visning). Detta påverkar inte engine – endast UI-policy.
+        private ForwardPricingMode _forwardMode = ForwardPricingMode.Full;
+
+        /// <summary>
+        /// Hämtar aktuellt forward-läge (MID/FULL/NET) för den aktuella dealen/fliken.
+        /// Används av Presenter/View för att rendera RD/RF/Forward konsekvent.
+        /// </summary>
+        public ForwardPricingMode GetForwardPricingMode()
+        {
+            return _forwardMode;
+        }
+
+        /// <summary>
+        /// Sätter forward-läge (MID/FULL/NET). Om värdet ändras fire:as ett debouncat Changed-event
+        /// med reason “ForwardMode”. Engine/Runtime läser inte denna flagga; de konsumerar Spot/RD/RF
+        /// enligt respektive ViewMode som Presentern redan ställer.
+        /// </summary>
+        /// <param name="pair6">Valutapar (t.ex. "EURSEK") – används endast för logg/diagnostik.</param>
+        /// <param name="mode">Nytt forward-läge.</param>
+        /// <param name="nowUtc">Tidsstämpel (UTC) för ändringen.</param>
+        public void SetForwardPricingMode(string pair6, ForwardPricingMode mode, DateTime nowUtc)
+        {
+            if (_forwardMode == mode)
+                return;
+
+            _forwardMode = mode;
+
+            // Debounced batch-event; konsumenter kan läsa Current samt GetForwardPricingMode().
+            RaiseChanged("ForwardMode");
+        }
+
+        #endregion
+
+
 
         #region Spot
 
@@ -656,6 +695,11 @@ namespace FX.Services.MarketData
                     {
                         _chgSpotCount++;
                     }
+                    else if (string.Equals(reason, "ForwardMode", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Ny särskild kategori för forward-läget (MID/FULL/NET)
+                        _chgFwdCount++;
+                    }
                     else
                     {
                         _chgOtherCount++;
@@ -684,7 +728,7 @@ namespace FX.Services.MarketData
         /// </summary>
         private void ChangedTimerCallback(object state)
         {
-            int rd, rf, spot, other;
+            int rd, rf, spot, fwd, other;
             MarketSnapshot snap;
 
             lock (_chgGate)
@@ -692,12 +736,13 @@ namespace FX.Services.MarketData
                 rd = _chgRdCount; _chgRdCount = 0;
                 rf = _chgRfCount; _chgRfCount = 0;
                 spot = _chgSpotCount; _chgSpotCount = 0;
+                fwd = _chgFwdCount; _chgFwdCount = 0;
                 other = _chgOtherCount; _chgOtherCount = 0;
 
                 snap = _current;
             }
 
-            var aggReason = $"Batch:Rd={rd};Rf={rf};Spot={spot};Other={other}";
+            var aggReason = $"Batch:Rd={rd};Rf={rf};Spot={spot};Forward={fwd};Other={other}";
 
             //if (DebugFlags.StoreBatch)
             //{
