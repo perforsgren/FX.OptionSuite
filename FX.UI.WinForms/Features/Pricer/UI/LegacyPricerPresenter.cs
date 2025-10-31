@@ -1612,18 +1612,21 @@ namespace FX.UI.WinForms
 
 
         /// <summary>
-        /// Beräknar och pushar Forward Rate och Forward Points för ett specifikt ben (legId).
-        /// - MID-läge: visar singelvärde (F_mid, P_mid).
-        /// - FULL-läge: visar "bid / ask" med korrekt sid-kombination:
-        ///     * Bid = rd_bid + rf_ask  (lägre F)
-        ///     * Ask = rd_ask + rf_bid  (högre F)
-        /// - S_ref för visning sätts till S_mid för stabila pips i UI.
+        /// Uppdaterar Forward-rate och -points för ett enskilt ben baserat på Store.
+        /// Logik:
+        /// - Alltid definiera points relativt S_mid (stabila pips när spot-pill växlas).
+        /// - MID (räntor i Mid): visa F_mid och P_mid (singel).
+        /// - FULL (räntor i TwoWay): beräkna P_bid/P_ask från sided räntor (mot S_mid).
+        ///   Forward rate visas med enkel aritmetik:
+        ///      F_bid = S_bid + P_bid, F_ask = S_ask + P_ask.
+        ///   Points visas då tvåvägs (inte "bid=ask").
+        /// Vid ogiltig data döljs forward-fältet för benet.
         /// </summary>
         private void PushForwardUiForLeg(Guid legId)
         {
             try
             {
-                // 1) Pair + datum (expiry tas från vyns resolverade ISO)
+                // 1) Pair + datum
                 var pair6 = NormalizePair6(_view.ReadPair6()) ?? "EURSEK";
                 var baseCcy = pair6.Substring(0, 3);
                 var quoteCcy = pair6.Substring(3, 3);
@@ -1638,7 +1641,7 @@ namespace FX.UI.WinForms
                 var spotDate = dates.SpotDate;
                 var settlement = dates.SettlementDate;
 
-                // 2) Spot effektiv (respektera ViewMode/Override)
+                // 2) Snapshot
                 var snap = _mktStore.Current;
                 if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1647,26 +1650,28 @@ namespace FX.UI.WinForms
                 }
 
                 var sf = snap.Spot;
-                var se = sf.Effective;
-                if (se.Bid <= 0.0 && se.Ask <= 0.0)
+                if (sf == null)
                 {
                     _view.ShowForwardById(legId, null, null);
                     return;
                 }
+                var se = sf.Effective;
 
-                double spotBid, spotAsk;
+                // Spot: S_mid för points; S_bid/S_ask för rate om spot-view är TwoWay
+                var S_mid = 0.5 * (se.Bid + se.Ask);
+                double S_bid_for_rate, S_ask_for_rate;
                 if (sf.ViewMode == ViewMode.Mid || sf.Override == OverrideMode.Mid)
                 {
-                    var mid = 0.5 * (se.Bid + se.Ask);
-                    spotBid = mid; spotAsk = mid;
+                    S_bid_for_rate = S_mid;
+                    S_ask_for_rate = S_mid;
                 }
                 else
                 {
-                    spotBid = se.Bid; spotAsk = se.Ask;
+                    S_bid_for_rate = se.Bid;
+                    S_ask_for_rate = se.Ask;
                 }
-                double S_mid = 0.5 * (spotBid + spotAsk); // S_ref för visning
 
-                // 3) rd/rf effektivt för detta ben
+                // 3) RD/RF per ben
                 var key = legId.ToString();
                 var rdFld = snap.TryGetRd(key);
                 var rfFld = snap.TryGetRf(key);
@@ -1675,14 +1680,10 @@ namespace FX.UI.WinForms
                     _view.ShowForwardById(legId, null, null);
                     return;
                 }
-
                 var rdEff = rdFld.Effective;
                 var rfEff = rfFld.Effective;
 
-                double rd_bid = rdEff.Bid, rd_ask = rdEff.Ask, rd_mid = 0.5 * (rdEff.Bid + rdEff.Ask);
-                double rf_bid = rfEff.Bid, rf_ask = rfEff.Ask, rf_mid = 0.5 * (rfEff.Bid + rfEff.Ask);
-
-                // 4) Year fractions enligt MM
+                // 4) Year fractions
                 var Tq = YearFracMm(spotDate, settlement, quoteCcy);
                 var Tb = YearFracMm(spotDate, settlement, baseCcy);
                 if (Tq <= 0.0 && Tb <= 0.0)
@@ -1691,55 +1692,66 @@ namespace FX.UI.WinForms
                     return;
                 }
 
-                // 5) Full vs Mid (policy). Om du ännu inte exponerar ForwardPricingMode i Presentern:
-                //    använd en säker proxy: FULL om någon av RD/RF står i TwoWay, annars MID.
+                // 5) Points relativt S_mid
+                // Mid-points:
+                var rd_mid = 0.5 * (rdEff.Bid + rdEff.Ask);
+                var rf_mid = 0.5 * (rfEff.Bid + rfEff.Ask);
+                var denom_mid = 1.0 + rf_mid * Tb;
+                if (denom_mid <= 0.0)
+                {
+                    _view.ShowForwardById(legId, null, null);
+                    return;
+                }
+                var F_mid = S_mid * (1.0 + rd_mid * Tq) / denom_mid;
+                var P_mid = F_mid - S_mid;
+
+                // Är räntor i TwoWay? (proxy för FULL-läge)
                 bool isFull =
                     (rdFld.ViewMode == ViewMode.TwoWay || rfFld.ViewMode == ViewMode.TwoWay) &&
                     (rdFld.Override != OverrideMode.Mid && rfFld.Override != OverrideMode.Mid);
 
                 if (!isFull)
                 {
-                    // MID: singelvärde
-                    var denom = 1.0 + rf_mid * Tb;
-                    if (denom <= 0.0) { _view.ShowForwardById(legId, null, null); return; }
-
-                    var F_mid = S_mid * (1.0 + rd_mid * Tq) / denom;
-                    var P_mid = F_mid - S_mid;
+                    // MID: singel rate & singel points (mot S_mid)
                     _view.ShowForwardById(legId, F_mid, P_mid);
+                    return;
                 }
-                else
+
+                // FULL: ta fram sided points (fortfarande mot S_mid), sedan F_side = S_side + P_side.
+                // Sided points: använd ordningen rf_ask i bid-denominator, rf_bid i ask-denominator (samma som engine-sidning).
+                var rd_bid = rdEff.Bid; var rd_ask = rdEff.Ask;
+                var rf_bid = rfEff.Bid; var rf_ask = rfEff.Ask;
+
+                var denom_bid = 1.0 + rf_ask * Tb;
+                var denom_ask = 1.0 + rf_bid * Tb;
+                if (denom_bid <= 0.0 || denom_ask <= 0.0)
                 {
-                    // FULL: korrekt sid-kombination (Bid ≤ Ask) — FIX FÖR INVERTERADE PUNKTER
-                    // Bid = rd_bid + rf_ask  (lägre F), Ask = rd_ask + rf_bid (högre F)
-                    var denom_bid = 1.0 + rf_ask * Tb;
-                    var denom_ask = 1.0 + rf_bid * Tb;
-                    if (denom_bid <= 0.0 || denom_ask <= 0.0)
-                    {
-                        _view.ShowForwardById(legId, null, null);
-                        return;
-                    }
-
-                    var F_bid = S_mid * (1.0 + rd_bid * Tq) / denom_bid;
-                    var F_ask = S_mid * (1.0 + rd_ask * Tq) / denom_ask;
-
-                    // Monotonivakter (dev)
-                    System.Diagnostics.Debug.Assert(F_bid <= F_ask, "Forward monotoni bruten (bid > ask).");
-
-                    var P_bid = F_bid - S_mid;
-                    var P_ask = F_ask - S_mid;
-
-                    // Även punkter ska vara ordnade (mer negativt till vänster vid negativa points)
-                    System.Diagnostics.Debug.Assert(P_bid <= P_ask, "Points monotoni bruten (bid > ask).");
-
-                    // Tvåvägsvisning i vyn
-                    _view.ShowForwardTwoWayById(legId, F_bid, F_ask, P_bid, P_ask);
+                    _view.ShowForwardById(legId, null, null);
+                    return;
                 }
+
+                // Fwd från S_mid för att få points per sida (stabila mot spot-pill):
+                var F_from_mid_bid = S_mid * (1.0 + rd_bid * Tq) / denom_bid;
+                var F_from_mid_ask = S_mid * (1.0 + rd_ask * Tq) / denom_ask;
+                var P_bid = F_from_mid_bid - S_mid;
+                var P_ask = F_from_mid_ask - S_mid;
+
+                // Forward RATE enligt "enkel matematik": F_side = S_side + P_side
+                var F_bid = S_bid_for_rate + P_bid;
+                var F_ask = S_ask_for_rate + P_ask;
+                if (F_bid > F_ask)
+                {
+                    var tmp = F_bid; F_bid = F_ask; F_ask = tmp; // monotoni-vakt
+                }
+
+                _view.ShowForwardTwoWayById(legId, F_bid, F_ask, P_bid, P_ask);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[ERR] Presenter.PushForwardUiForLeg: " + ex.Message);
             }
         }
+
 
 
 
