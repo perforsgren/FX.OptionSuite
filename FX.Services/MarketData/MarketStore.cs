@@ -42,7 +42,7 @@ namespace FX.Services.MarketData
             _current = new MarketSnapshot("EURSEK", spot);
         }
 
-        #region Forward Pricing Mode  // ERSÄTT
+        #region Forward Pricing Mode
 
         // Default-läge = Full (tvåväg i visning). Detta påverkar inte engine – endast UI-policy.
         private ForwardPricingMode _forwardMode = ForwardPricingMode.Full;

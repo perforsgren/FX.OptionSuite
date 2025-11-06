@@ -223,10 +223,65 @@ namespace FX.UI.WinForms
         /// </summary>
         public event EventHandler ForwardModeChanged;
 
+        /// <summary>
+        /// Fired när användaren editerat Forward-mål (Points/Rate). Ingen autoswitch eller solver här.
+        /// Presentern kan tolka och agera (steg 5b–5c).
+        /// </summary>
+        public event EventHandler<ForwardTargetEditedEventArgs> ForwardTargetEdited;
 
         #endregion
 
         #region === EventArgs (UI→Presenter)
+
+        /// <summary>
+        /// Typ av forward-mål som användaren editerade i gridden.
+        /// </summary>
+        public enum ForwardTargetType
+        {
+            /// <summary>Okänt (ska normalt inte förekomma).</summary>
+            Unknown = 0,
+            /// <summary>Mål i Forward Points (pips/points i prisvalutan).</summary>
+            Points = 1,
+            /// <summary>Mål i Forward Rate (nivå i prisvalutan).</summary>
+            Rate = 2
+        }
+
+        /// <summary>
+        /// Event-data när användaren editerat Forward-mål (Points eller Rate), singel eller tvåväg.
+        /// Bevarar råtext (för visning utan studs) samt decimalprecision för snygg återrendering.
+        /// </summary>
+        public sealed class ForwardTargetEditedEventArgs : EventArgs
+        {
+            /// <summary>Benets identitet (Guid) om känd via kolumn→leg-mappning; annars Guid.Empty.</summary>
+            public Guid LegId { get; set; }
+
+            /// <summary>Kolumnnamn (t.ex. "Vanilla 1") som editerades.</summary>
+            public string ColumnName { get; set; }
+
+            /// <summary>Vilken forwardrad: Points eller Rate.</summary>
+            public ForwardTargetType TargetType { get; set; }
+
+            /// <summary>True om användaren skrev två siffror (bid/ask); annars singel.</summary>
+            public bool IsPair { get; set; }
+
+            /// <summary>Singelvärdet (vid IsPair=false). Null annars.</summary>
+            public double? Single { get; set; }
+
+            /// <summary>Bid-värde (vid IsPair=true). Null annars.</summary>
+            public double? Bid { get; set; }
+
+            /// <summary>Ask-värde (vid IsPair=true). Null annars.</summary>
+            public double? Ask { get; set; }
+
+            /// <summary>Råtext exakt som användaren skrev (för att undvika studs i cellen).</summary>
+            public string RawDisplay { get; set; }
+
+            /// <summary>Antal decimaler i användarens förstatal (för konsekvent visning).</summary>
+            public int Decimals { get; set; }
+
+            /// <summary>True om inmatningen var ett ensamt tal (”mid-stil”).</summary>
+            public bool WasMidStyle { get; set; }
+        }
 
         /// <summary>Event-data när användaren editerat Spot i gridet.</summary>
         public sealed class SpotEditedEventArgs : EventArgs
@@ -578,11 +633,13 @@ namespace FX.UI.WinForms
             _dgv.CellMouseUp += Dgv_CellMouseUp_MktDataButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_MktDataButton;
 
-            // NY: Forward-pill (MID/FULL) i "Forward Points"
+            // Forward-pill (MID/FULL) i "Forward Points"
             _dgv.CellMouseDown += Dgv_CellMouseDown_FwdButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_FwdButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_FwdButton;
-            _dgv.CellEndEdit += Dgv_CellEndEdit_ForwardAutoSwitch;
+
+            //_dgv.CellEndEdit += Dgv_CellEndEdit_ForwardAutoSwitch;
+            _dgv.CellEndEdit += Dgv_CellEndEdit_ForwardTarget;
 
             _dgv.CellDoubleClick += (s, e) =>
             {
@@ -898,9 +955,6 @@ namespace FX.UI.WinForms
 
                 _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
             };
-            // --- Slut rollback -
-
-
 
             // ===== SPOT =====
             if (string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase))
@@ -1609,7 +1663,7 @@ namespace FX.UI.WinForms
             if (over != _pricingBtnHover)
             {
                 _pricingBtnHover = over;
-                _dgv.Cursor = over ? Cursors.Hand : Cursors.Default;
+                //_dgv.Cursor = over ? Cursors.Hand : Cursors.Default;
                 _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, _pricingHeaderRow);
             }
         }
@@ -1627,6 +1681,8 @@ namespace FX.UI.WinForms
                     _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, _pricingHeaderRow);
             }
         }
+
+
 
         private void Dgv_CellMouseDown_MktDataButton(object sender, DataGridViewCellMouseEventArgs e)
         {
@@ -1940,7 +1996,7 @@ namespace FX.UI.WinForms
                     e.CellStyle.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
 
                 // Chip-text styrs av _spotMode
-                string modeText = (_fwdMode == ForwardMode.Full ? "FULL" : "MID");
+                string modeText = GetForwardModeText();
 
                 var f = _dgv.Font;
                 var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding;
@@ -1965,8 +2021,8 @@ namespace FX.UI.WinForms
                 //_mktHeaderRow = e.RowIndex;
                 _fwdBtnRect = btnRectLocal;
 
-                Color fill = _mktBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
-                Color border = _mktBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
+                Color fill = _fwdBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
+                Color border = _fwdBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
 
                 var btnRectAbs = new Rectangle(
                     e.CellBounds.X + btnRectLocal.X,
@@ -1981,7 +2037,7 @@ namespace FX.UI.WinForms
                     e.Graphics.DrawPath(pen, path);
                 }
 
-                var textRectAbs = _mktBtnPressed
+                var textRectAbs = _fwdBtnPressed
                     ? new Rectangle(btnRectAbs.X, btnRectAbs.Y + 1, btnRectAbs.Width, btnRectAbs.Height)
                     : btnRectAbs;
 
@@ -3019,7 +3075,7 @@ namespace FX.UI.WinForms
                 // valfritt: ta bort ur _feedValue om du vill, annars lämna kvar senaste baseline
                 // _feedValue.Remove(Key(L.Rd, col));
             }
-            MarkOverride(L.Rd, col, false);
+            //MarkOverride(L.Rd, col, false);
 
             // RF (baseline -> Tag/Value + cache i _feedValue)
             var cRf = _dgv.Rows[rRf].Cells[col];
@@ -3035,7 +3091,7 @@ namespace FX.UI.WinForms
                 cRf.Value = "";
                 // _feedValue.Remove(Key(L.Rf, col));
             }
-            MarkOverride(L.Rf, col, false);
+            //MarkOverride(L.Rf, col, false);
 
             // (valfritt) stale-hint
             cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
@@ -3082,7 +3138,7 @@ namespace FX.UI.WinForms
                 c.Value = $"{bidTxt} / {askTxt}";
 
                 // Ingen override-färg i tvåvägsläge
-                MarkOverride(L.Rd, col, false);
+                //MarkOverride(L.Rd, col, false);
                 c.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
             }
 
@@ -3100,7 +3156,7 @@ namespace FX.UI.WinForms
                 var askTxt = FormatPercent(rfAsk, 3);
                 c.Value = $"{bidTxt} / {askTxt}";
 
-                MarkOverride(L.Rf, col, false);
+                //MarkOverride(L.Rf, col, false);
                 c.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
             }
 
@@ -3689,8 +3745,10 @@ namespace FX.UI.WinForms
         #region === LegId ↔ UI-kolumn ===
 
         /// <summary>
-        /// Visar Forward Rate och Forward Points för ett visst ben (legId).
-        /// Points presenteras som ×1000 (enbart presentation).
+        /// Visar Forward Rate och Forward Points (singel) för ett ben.
+        /// - Respekterar ev. PIN i cell.Tag (för att undvika studs).
+        /// - Uppdaterar PREV (senast godkända visning).
+        /// - Decimalpolicy: Points = max(1, userPtsDp); Rate = max(5, userRateDp, 4 + userPtsDp).
         /// </summary>
         public void ShowForwardById(Guid legId, double? fwd, double? pts)
         {
@@ -3703,26 +3761,60 @@ namespace FX.UI.WinForms
 
             var ci = System.Globalization.CultureInfo.InvariantCulture;
 
+            // ---- Rate (singel) ----
             if (rFwd >= 0)
-                _dgv.Rows[rFwd].Cells[col].Value = (fwd.HasValue ? fwd.Value.ToString("F6", ci) : "");
-
-            if (rPts >= 0)
             {
-                // Skala ×1000 i visningen
-                string txt = "";
-                if (pts.HasValue)
+                var c = _dgv.Rows[rFwd].Cells[col];
+                var pinned = GetPinnedTextOrNull(c);
+                if (pinned != null)
                 {
-                    double scaled = pts.Value * 10000.0;
-                    txt = scaled.ToString("F3", ci);
+                    c.Value = pinned;
+                    // PREV = pinned
+                    SetPrevText(c, pinned);
                 }
-                _dgv.Rows[rPts].Cells[col].Value = txt;
+                else
+                {
+                    // bestäm dp för rate
+                    int userRateDp = GetUserRateDp(legId);         // default 0 → hanteras nedan
+                    int userPtsDp = GetUserPointsDp(legId);       // default 0
+                    int rateDp = Math.Max(5, Math.Max(userRateDp, 4 + Math.Max(1, userPtsDp)));
+
+                    string txt = fwd.HasValue ? fwd.Value.ToString("F" + rateDp, ci) : "";
+                    c.Value = txt;
+                    SetPrevText(c, txt);
+                }
             }
 
-            //System.Diagnostics.Debug.WriteLine(
-            //    $"[View.Forward] leg={legId} col={col} fwd={(fwd.HasValue ? fwd.Value.ToString("F6", ci) : "-")} ptsx10000={(pts.HasValue ? (pts.Value * 10000.0).ToString("F3", ci) : "-")}");
+            // ---- Points (singel) ----
+            if (rPts >= 0)
+            {
+                var c = _dgv.Rows[rPts].Cells[col];
+                var pinned = GetPinnedTextOrNull(c);
+                if (pinned != null)
+                {
+                    c.Value = pinned;
+                    SetPrevText(c, pinned);
+                }
+                else
+                {
+                    // dp för points
+                    int userPtsDp = GetUserPointsDp(legId);
+                    int ptsDp = Math.Max(1, userPtsDp);
+
+                    string txt = "";
+                    if (pts.HasValue)
+                    {
+                        double scaled = pts.Value * 10000.0;
+                        txt = scaled.ToString("F" + ptsDp, ci);
+                    }
+                    c.Value = txt;
+                    SetPrevText(c, txt);
+                }
+            }
         }
 
-        // === NEW: LegId → label-karta i vyn ===
+
+
         private readonly Dictionary<Guid, string> _legIdToLabel = new Dictionary<Guid, string>();
 
         /// <summary>
@@ -3817,27 +3909,361 @@ namespace FX.UI.WinForms
                                   label, StringComparison.OrdinalIgnoreCase));
         }
 
+        /// <summary>
+        /// Pinnar råtexten i Forward-cellen (Rate eller Points) för ett givet ben så att
+        /// efterföljande UI-pushar inte orsakar "studs". Innehåller även visnings-normalisering
+        /// och validering. Vid ogiltig input rullas cellen tillbaka till föregående visning.
+        /// Cross-sync: avpinnar syskoncellen (Rate ↔ Points).
+        /// </summary>
+        public void PinForwardDisplay(Guid legId, ForwardTargetType targetType, string rawDisplay)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
+
+            // 1) Normalisera visning (','→'.', spacing runt "/")
+            string normalized = NormalizeForwardDisplayText(rawDisplay ?? string.Empty);
+
+            // 2) Hitta celler (denna + syskon)
+            var labelThis = (targetType == ForwardTargetType.Rate) ? L.FwdRate : L.FwdPts;
+            var labelOther = (targetType == ForwardTargetType.Rate) ? L.FwdPts : L.FwdRate;
+
+            int rThis = FindRow(labelThis);
+            int rOther = FindRow(labelOther);
+            if (rThis < 0) return;
+
+            var cellThis = _dgv.Rows[rThis].Cells[col];
+
+            // 3) Validera att normalized är numeriskt (singel eller "x / y")
+            if (!IsValidForwardDisplayText(normalized))
+            {
+                // Ogiltigt: rulla tillbaka till tidigare visning (PREV) och ta bort ev. pin
+                var prev = GetPrevTextOrEmpty(cellThis);
+                ClearPinnedText(cellThis);
+                cellThis.Value = prev;
+                return;
+            }
+
+            // 4) Sätt PIN på denna cell och uppdatera värdet
+            SetPinnedText(cellThis, normalized);
+            cellThis.Value = normalized;
+
+            // 5) Avpinna syskoncellen (så att den kan uppdateras vid nästa push)
+            if (rOther >= 0)
+            {
+                var cellOther = _dgv.Rows[rOther].Cells[col];
+                ClearPinnedText(cellOther);
+            }
+
+            // 6) Spara PREV = normalized (senast godkända visning)
+            SetPrevText(cellThis, normalized);
+
+            // 7) Registrera användarens decimalpreferens (för punkt 3)
+            RegisterUserDpPreference(legId, targetType, normalized);
+        }
+
+
+
+
+
+
+        /// <summary>
+        /// Tar bort eventuell PIN i en Forward-cell (Rate eller Points) för ett ben.
+        /// Om targetType är null avpinnas båda (Rate och Points).
+        /// Bevarar andra Tag-segment (PREV, DPP/DPR) så vi undviker ”studs” och håller användarens dp-val.
+        /// </summary>
+        public void UnpinForwardDisplay(Guid legId, ForwardTargetType? targetType = null)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
+
+            void UnpinRow(string label)
+            {
+                int r = FindRow(label);
+                if (r >= 0)
+                {
+                    var cell = _dgv.Rows[r].Cells[col];
+                    ClearPinnedText(cell); // tar bort PIN-segment oavsett segmentordning
+                }
+            }
+
+            if (targetType == null)
+            {
+                UnpinRow(L.FwdRate);
+                UnpinRow(L.FwdPts);
+            }
+            else
+            {
+                UnpinRow(targetType == ForwardTargetType.Rate ? L.FwdRate : L.FwdPts);
+            }
+        }
+
+
+        /// <summary>
+        /// Tar bort PIN i Forward Rate och Forward Points för alla ben/kolumner.
+        /// Anropa inför ”forced rate refresh” (t.ex. F7) så att ny data får slå igenom.
+        /// Bevarar andra Tag-segment (PREV, DPP/DPR).
+        /// </summary>
+        public void UnpinAllForwardDisplays()
+        {
+            int rRate = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+            if (rRate < 0 && rPts < 0) return;
+
+            foreach (DataGridViewColumn col in _dgv.Columns)
+            {
+                if (!col.Visible) continue;
+
+                if (rRate >= 0)
+                {
+                    var cRate = _dgv.Rows[rRate].Cells[col.Index];
+                    ClearPinnedText(cRate);
+                }
+                if (rPts >= 0)
+                {
+                    var cPts = _dgv.Rows[rPts].Cells[col.Index];
+                    ClearPinnedText(cPts);
+                }
+            }
+        }
+
+        
+
+        /// <summary>
+        /// Returnerar pinnad råtext från cell.Tag om Tag har formatet "\u0001PIN:{text}".
+        /// Stödjer att Tag även kan innehålla andra segment (t.ex. PREV/DP).
+        /// </summary>
+        private static string GetPinnedTextOrNull(DataGridViewCell cell)
+        {
+            return ReadTagSegment(cell, "\u0001PIN:");
+        }
+
+        /// <summary>Rensar ev. PIN-segment från Tag.</summary>
+        private static void ClearPinnedText(DataGridViewCell cell)
+        {
+            WriteOrRemoveTagSegment(cell, "\u0001PIN:", null);
+        }
+
+        /// <summary>Sätter PIN-segmentet i Tag.</summary>
+        private static void SetPinnedText(DataGridViewCell cell, string text)
+        {
+            WriteOrRemoveTagSegment(cell, "\u0001PIN:", text ?? string.Empty);
+        }
+
+        /// <summary>Hämtar senast godkända visning (PREV) eller tom sträng.</summary>
+        private static string GetPrevTextOrEmpty(DataGridViewCell cell)
+        {
+            return ReadTagSegment(cell, "\u0002PREV:") ?? string.Empty;
+        }
+
+        /// <summary>Sätter PREV-segmentet i Tag.</summary>
+        private static void SetPrevText(DataGridViewCell cell, string text)
+        {
+            WriteOrRemoveTagSegment(cell, "\u0002PREV:", text ?? string.Empty);
+        }
+
+        /// <summary>
+        /// Läser ett segment ur Tag-strängen. Segmentformat: "{prefix}{payload}".
+        /// Flera segment kan samexistera och separeras implicit (vi letar per prefix).
+        /// </summary>
+        private static string ReadTagSegment(DataGridViewCell cell, string prefix)
+        {
+            var tag = cell?.Tag as string;
+            if (string.IsNullOrEmpty(tag) || string.IsNullOrEmpty(prefix)) return null;
+            int ix = tag.IndexOf(prefix, StringComparison.Ordinal);
+            if (ix < 0) return null;
+            ix += prefix.Length;
+            // payload slutar vid nästa kontrollprefix om det finns
+            int next = NextPrefixIndex(tag, ix);
+            return next >= 0 ? tag.Substring(ix, next - ix) : tag.Substring(ix);
+        }
+
+        /// <summary>
+        /// Skriver (eller tar bort) ett segment i Tag-strängen, där segment identifieras av prefix.
+        /// </summary>
+        private static void WriteOrRemoveTagSegment(DataGridViewCell cell, string prefix, string payloadOrNull)
+        {
+            var tag = cell?.Tag as string ?? string.Empty;
+            int ix = tag.IndexOf(prefix, StringComparison.Ordinal);
+            if (payloadOrNull == null)
+            {
+                if (ix >= 0)
+                {
+                    int start = ix;
+                    int afterPayload = NextPrefixIndex(tag, ix + prefix.Length);
+                    tag = (afterPayload >= 0)
+                        ? tag.Remove(start, afterPayload - start)
+                        : tag.Substring(0, start);
+                    cell.Tag = tag;
+                }
+                return;
+            }
+
+            // vi ska skriva/uppdatera prefix+payload
+            if (ix < 0)
+            {
+                // append
+                cell.Tag = tag + prefix + payloadOrNull;
+            }
+            else
+            {
+                // ersätt befintligt payload
+                int afterPayload = NextPrefixIndex(tag, ix + prefix.Length);
+                string left = tag.Substring(0, ix);
+                string right = (afterPayload >= 0) ? tag.Substring(afterPayload) : string.Empty;
+                cell.Tag = left + prefix + payloadOrNull + right;
+            }
+        }
+
+        /// <summary>Hittar index för nästa kända prefix efter 'from', annars -1.</summary>
+        private static int NextPrefixIndex(string tag, int from)
+        {
+            int best = -1;
+            string[] prefixes = { "\u0001PIN:", "\u0002PREV:", "\u0004DPP:", "\u0005DPR:" };
+            foreach (var p in prefixes)
+            {
+                int j = tag.IndexOf(p, from, StringComparison.Ordinal);
+                if (j >= 0) best = (best < 0) ? j : Math.Min(best, j);
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// Normaliserar forward-displaytext för enhetlig presentation:
+        /// - Byter komma till punkt
+        /// - Trim:ar ytterkanter
+        /// - Om "/" finns → säkerställ "lhs / rhs" med mellanslag
+        /// - Om exakt två tal separerade av whitespace → skriv "x / y"
+        /// </summary>
+        private static string NormalizeForwardDisplayText(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return string.Empty;
+
+            string s = raw.Replace(',', '.').Trim();
+
+            int slashIx = s.IndexOf('/');
+            if (slashIx >= 0)
+            {
+                var left = s.Substring(0, slashIx).Trim();
+                var right = s.Substring(slashIx + 1).Trim();
+                return string.IsNullOrEmpty(left) || string.IsNullOrEmpty(right)
+                    ? s
+                    : $"{left} / {right}";
+            }
+
+            var parts = System.Text.RegularExpressions.Regex.Split(s, @"\s+");
+            if (parts.Length == 2 && LooksNumeric(parts[0]) && LooksNumeric(parts[1]))
+                return $"{parts[0]} / {parts[1]}";
+
+            return s;
+        }
+
+        /// <summary>True om token är numerisk (InvariantCulture, ".", ev. ledande "-").</summary>
+        private static bool LooksNumeric(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return false;
+            double tmp;
+            return double.TryParse(token, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out tmp);
+        }
+
+        /// <summary>
+        /// Validerar att displaytexten är antingen ett tal ELLER "x / y" där x och y är tal.
+        /// </summary>
+        private static bool IsValidForwardDisplayText(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+
+            int ix = s.IndexOf('/');
+            if (ix < 0)
+            {
+                return LooksNumeric(s);
+            }
+            var left = s.Substring(0, ix).Trim();
+            var right = s.Substring(ix + 1).Trim();
+            return LooksNumeric(left) && LooksNumeric(right);
+        }
+
+        /// <summary>Räknar decimaler i ett numeriskt token (efter ".").</summary>
+        private static int CountDecimals(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return 0;
+            int ix = token.IndexOf('.');
+            return (ix >= 0) ? Math.Max(0, token.Length - ix - 1) : 0;
+        }
+
+        /// <summary>
+        /// Registrerar användarens decimalpreferens i Tag-segment på aktuell cell
+        /// samt (vid behov) på syskon-cellen (för att Rate ska kunna läsa Points-dp).
+        /// </summary>
+        private void RegisterUserDpPreference(Guid legId, ForwardTargetType targetType, string normalizedDisplay)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return;
+
+            // Beräkna user-dp (max dp vid par)
+            int userDp = 0;
+            int ix = normalizedDisplay.IndexOf('/');
+            if (ix < 0)
+            {
+                userDp = CountDecimals(normalizedDisplay);
+            }
+            else
+            {
+                var left = normalizedDisplay.Substring(0, ix).Trim();
+                var right = normalizedDisplay.Substring(ix + 1).Trim();
+                userDp = Math.Max(CountDecimals(left), CountDecimals(right));
+            }
+
+            string dpPrefix = (targetType == ForwardTargetType.Rate) ? "\u0005DPR:" : "\u0004DPP:";
+            string label = (targetType == ForwardTargetType.Rate) ? L.FwdRate : L.FwdPts;
+            int r = FindRow(label);
+            if (r >= 0)
+            {
+                var cell = _dgv.Rows[r].Cells[col];
+                WriteOrRemoveTagSegment(cell, dpPrefix, userDp.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+        }
+
+        /// <summary>Hämtar användarens Points-dp (0 om okänt).</summary>
+        private int GetUserPointsDp(Guid legId)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return 0;
+            int r = FindRow(L.FwdPts);
+            if (r < 0) return 0;
+            var cell = _dgv.Rows[r].Cells[col];
+            var s = ReadTagSegment(cell, "\u0004DPP:");
+            int dp;
+            return (s != null && int.TryParse(s, out dp)) ? dp : 0;
+        }
+
+        /// <summary>Hämtar användarens Rate-dp (0 om okänt).</summary>
+        private int GetUserRateDp(Guid legId)
+        {
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return 0;
+            int r = FindRow(L.FwdRate);
+            if (r < 0) return 0;
+            var cell = _dgv.Rows[r].Cells[col];
+            var s = ReadTagSegment(cell, "\u0005DPR:");
+            int dp;
+            return (s != null && int.TryParse(s, out dp)) ? dp : 0;
+        }
+
+
         #endregion
 
         #region === Market hooks (feed snapshot & apply) ===
 
         /// <summary>
         /// Läser RD/RF för en given kolumn (t.ex. "Vanilla 1") från gridden och avgör override-status
-        /// relativt FEED-baseline.
-        ///
-        /// Strategi (UI-konsistent jämförelse):
-        /// - UI visar räntor med 3 d.p. i procent. Det motsvarar 5 decimaler i decimalform.
-        /// - För att undvika "spök-override" jämför vi därför <b>kvantiserade</b> värden:
-        ///   rd_ui_q = Round(rd_ui, 5), rd_feed_q = Round(rd_feed, 5) och samma för rf.
-        /// - Override sätts ENDAST om de kvantiserade värdena skiljer sig (|ui_q - feed_q| > 1e-12).
-        ///
-        /// Viktigt:
-        /// - Aktuellt UI-värde hämtas från cell.Value (det användaren ser/har editerat).
-        /// - FEED-baseline hämtas via TryGetFeedDouble(label, col, out feed).
-        /// - Saknar vi FEED-baseline just nu → override = false (kan ej avgöras).
-        ///
-        /// Returnerar:
-        ///   rd / rf i DECIMAL (ex: 0.0123 = 1.23%), samt rdOverride / rfOverride.
+        /// relativt FEED-baseline. Värden returneras i decimal (0.0123 = 1.23%).
+        /// 
+        /// Nytt: Robustare override-detektering vid MID/FULL-toggle.
+        /// - I stället för att jämföra hårt efter avrundning använder vi "bin-likhet":
+        ///   två värden betraktas som lika om de ligger inom ≤ halvt tick på decimalDp.
+        /// - Detta eliminerar spök-override när mid råkar ligga på exakt halvt tick
+        ///   och flyttalsrepresentationen styr avrundningen åt olika håll.
         /// </summary>
         public bool TryReadRatesForColumn(string col, out double? rd, out bool rdOverride, out double? rf, out bool rfOverride)
         {
@@ -3850,9 +4276,14 @@ namespace FX.UI.WinForms
             // UI visar 3 d.p. i procent ⇒ 5 decimaler i decimalform
             const int percentDp = 3;
             const int decimalDp = 2 + percentDp; // 3 d.p. %  => 5 decimaler i decimal
-            const double eqEps = 1e-12;          // säkerhetsmarginal efter avrundning
 
-            double Quantize(double x) => Math.Round(x, decimalDp, MidpointRounding.AwayFromZero);
+            // Halvt tick i decimalvärlden: 0.5 * 10^(-decimalDp)
+            // + en mycket liten säkerhetsmarginal för flyttal (utan att släppa igenom hela tick).
+            double halfTick = 0.5 * Math.Pow(10, -decimalDp);
+            const double tiny = 1e-12;
+
+            bool SameBin(double a, double b)
+                => Math.Abs(a - b) <= (halfTick + tiny);
 
             // === RD ===
             try
@@ -3866,19 +4297,13 @@ namespace FX.UI.WinForms
                 else if (cRd?.Tag is double rdBaselineFromTag)
                     rd = rdBaselineFromTag; // fallback om cellen är tom -> returnera baseline som värde
 
-                // 2) Läs FEED-baseline och avgör override via kvantisering
+                // 2) Läs FEED-baseline och avgör override via bin-likhet
                 if (TryGetFeedDouble(L.Rd, col, out var rdFeed))
                 {
                     if (rd.HasValue)
-                    {
-                        var uiQ = Quantize(rd.Value);
-                        var feedQ = Quantize(rdFeed);
-                        rdOverride = Math.Abs(uiQ - feedQ) > eqEps;
-                    }
+                        rdOverride = !SameBin(rd.Value, rdFeed);
                     else
-                    {
                         rdOverride = false;
-                    }
                 }
                 else
                 {
@@ -3905,15 +4330,9 @@ namespace FX.UI.WinForms
                 if (TryGetFeedDouble(L.Rf, col, out var rfFeed))
                 {
                     if (rf.HasValue)
-                    {
-                        var uiQ = Quantize(rf.Value);
-                        var feedQ = Quantize(rfFeed);
-                        rfOverride = Math.Abs(uiQ - feedQ) > eqEps;
-                    }
+                        rfOverride = !SameBin(rf.Value, rfFeed);
                     else
-                    {
                         rfOverride = false;
-                    }
                 }
                 else
                 {
@@ -3928,8 +4347,6 @@ namespace FX.UI.WinForms
             // Returnera true om vi lyckades läsa något alls för RD eller RF
             return rd.HasValue || rf.HasValue;
         }
-
-
 
         /// <summary>
         /// Robust parser av cell.Value till DECIMAL (0.0123 = 1.23%).
@@ -3996,7 +4413,7 @@ namespace FX.UI.WinForms
             {
                 var cRd = _dgv.Rows[rRd].Cells[col];
                 cRd.Value = FormatPercent(rdMid.Value, 3);
-                MarkOverride(L.Rd, col, true);
+                //MarkOverride(L.Rd, col, true);
                 cRd.ToolTipText = staleRd ? "Stale RD (cache TTL passerad)" : null;
             }
 
@@ -4005,7 +4422,7 @@ namespace FX.UI.WinForms
             {
                 var cRf = _dgv.Rows[rRf].Cells[col];
                 cRf.Value = FormatPercent(rfMid.Value, 3);
-                MarkOverride(L.Rf, col, true);
+                //MarkOverride(L.Rf, col, true);
                 cRf.ToolTipText = staleRf ? "Stale RF (cache TTL passerad)" : null;
             }
 
@@ -4183,7 +4600,7 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>Slår på/av override-färg (och selection-färg) för en cell.</summary>
-        private void MarkOverride(string label, string col, bool on)
+        public void MarkOverride(string label, string col, bool on)
         {
 
             //if (IsUiEventsSuspended) return;
@@ -4244,7 +4661,7 @@ namespace FX.UI.WinForms
 
                 // Uppdatera endast display – lämna c.Tag (feed-baseline) orörd
                 c.Value = FormatPercent(rdMid.Value, 3);
-                MarkOverride(L.Rd, col, true);
+                //MarkOverride(L.Rd, col, true);
 
                 System.Diagnostics.Debug.WriteLine(
                     $"[View.ShowRatesOverride] col={col} RD={rdMid.Value:F6} stale={staleRd}");
@@ -4258,7 +4675,7 @@ namespace FX.UI.WinForms
 
                 // Uppdatera endast display – lämna c.Tag (feed-baseline) orörd
                 c.Value = FormatPercent(rfMid.Value, 3);
-                MarkOverride(L.Rf, col, true);
+                //MarkOverride(L.Rf, col, true);
 
                 System.Diagnostics.Debug.WriteLine(
                     $"[View.ShowRatesOverride] col={col} RF={rfMid.Value:F6} stale={staleRf}");
@@ -4314,6 +4731,7 @@ namespace FX.UI.WinForms
 
             if (keyData == Keys.F7)
             {
+                UnpinAllForwardDisplays();
                 RatesRefreshRequested?.Invoke(this, EventArgs.Empty);
                 return true;
             }
@@ -4649,7 +5067,7 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region Helpers – Rate display quantization
+        #region === Helpers – Rate display quantization ===
 
         /// <summary>
         /// Rundar ett räntevärde (i DECIMAL-form, t.ex. 0.0123 = 1,23 %) till samma precision
@@ -4673,24 +5091,21 @@ namespace FX.UI.WinForms
 
         #endregion
 
-
-
         #region === Forward Points-knapp (MID/FULL) ===
 
-        // NY: Forward-lägen för hedge/forward-komponenten i UI.
-        // NET förbereds men används inte i ritning ännu.
+        // Forward-lägen för hedge/forward-komponenten i UI.
         private enum ForwardMode { Mid = 0, Full = 1, Net = 2 }
         private ForwardMode _fwdMode = ForwardMode.Full; // default enligt krav
         private bool _fwdBtnPressed, _fwdBtnInside;
         private Rectangle _fwdBtnRect = Rectangle.Empty;       // Senaste beräknade rect för pillen
 
         /// <summary>
-        /// NY: Exponerar forward-läget för Presenter/ritning.
+        /// Exponerar forward-läget för Presenter/ritning.
         /// </summary>
         public int GetForwardMode() { return (int)_fwdMode; }
 
         /// <summary>
-        /// NY: Sätter forward-prissättningsläge (MID/FULL/NET) och ritar om Forward-raden.
+        /// Sätter forward-prissättningsläge (MID/FULL/NET) och ritar om Forward-raden.
         /// Använd när override i FwdPts/FwdRate tvingar läge = MID.
         /// </summary>
         public void SetForwardMode(int mode)
@@ -4704,7 +5119,7 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// NY: MouseDown på Forward-pill (MID⇆FULL).
+        /// MouseDown på Forward-pill (MID⇆FULL).
         /// Hindrar cellselektion och ritar pressed-state.
         /// </summary>
         private void Dgv_CellMouseDown_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
@@ -4717,7 +5132,7 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// NY: MouseMove – håll pressed-state bara när musen är kvar i knappen.
+        /// MouseMove – håll pressed-state bara när musen är kvar i knappen.
         /// </summary>
         private void Dgv_CellMouseMove_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
         {
@@ -4731,40 +5146,40 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// NY: MouseUp – växlar MID&lt;-&gt;FULL (NET reserverat för senare).
-        /// Meddelar Presenter via ForwardModeChanged.
+        /// MouseUp på "Forward Points"-pill. Vänsterklick cyklar MID → FULL → NET → MID.
+        /// Högerklick används inte för NET (inget special-case).
         /// </summary>
         private void Dgv_CellMouseUp_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
         {
-            if (!_fwdBtnPressed) return;
+            if (e.Button != MouseButtons.Left) return;
 
-            bool inside = IsInsideFwdButton(e);
+            // Endast FIELD-cellen på raden "Forward Points" och om klicket var inne i pillen
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            string lbl = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
+            if (!string.Equals(lbl, L.FwdPts, StringComparison.OrdinalIgnoreCase)) return;
+            if (!IsInsideFwdButton(e)) return;
+
+            // Cykla tre lägen: Mid(0) → Full(1) → Net(2) → Mid(0)
+            var next = (ForwardMode)(((int)_fwdMode + 1) % 3);
+            _fwdMode = next;
+
             _fwdBtnPressed = false;
             _fwdBtnInside = false;
 
-            if (!inside) { InvalidateFwdButton(); return; }
-
-            if (e.Button == MouseButtons.Left)
-            {
-                _fwdMode = (_fwdMode == ForwardMode.Mid) ? ForwardMode.Full : ForwardMode.Mid;
-            }
-            else if (e.Button == MouseButtons.Right)
-            {
-                // Förberett – aktiveras när NET-mode i engine finns.
-                //_fwdMode = ForwardMode.Net;
-            }
-
+            // Rita om pill + båda forward-raderna
             InvalidateFwdButton();
             InvalidateFwdRow();
 
-            var h = ForwardModeChanged;
-            if (h != null) h(this, EventArgs.Empty);
+            // Signalera uppåt att forward-läget ändrats (0/1/2)
+            ForwardModeChanged?.Invoke(this, EventArgs.Empty);
         }
 
+
+
+
         /// <summary>
-        /// NY: Hit-test för Forward-pill i "FIELD" på raden "Forward Points".
-        /// Beräknar knapprutan deterministiskt (samma geometri som Spot-pill),
-        /// så vi slipper lagra rect i Paint.
+        /// Hit-test för Forward-pill i "FIELD" på raden "Forward Points".
+        /// Storleken tar höjd för längst av texterna "MID", "FULL", "NET".
         /// </summary>
         private bool IsInsideFwdButton(DataGridViewCellMouseEventArgs e)
         {
@@ -4778,7 +5193,9 @@ namespace FX.UI.WinForms
             var f = _dgv.Font;
             int wMid = TextRenderer.MeasureText("MID", f, Size.Empty, TextFormatFlags.NoPadding).Width;
             int wFull = TextRenderer.MeasureText("FULL", f, Size.Empty, TextFormatFlags.NoPadding).Width;
-            int textW = Math.Max(wMid, wFull);
+            int wNet = TextRenderer.MeasureText("NET", f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            int textW = Math.Max(wMid, Math.Max(wFull, wNet));
+
             int padX = 8, padY = 2;
             int btnW = textW + padX * 2;
             int btnH = Math.Min(cellRect.Height - 10, Math.Max(16, f.Height + padY));
@@ -4790,8 +5207,10 @@ namespace FX.UI.WinForms
             return btnAbs.Contains(pt);
         }
 
+
+
         /// <summary>
-        /// NY: Invaliderar pill-cellen (FIELD på "Forward Points").
+        /// Invaliderar pill-cellen (FIELD på "Forward Points").
         /// </summary>
         private void InvalidateFwdButton()
         {
@@ -4801,7 +5220,7 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// NY: Invaliderar Forward-raderna (Points + Rate).
+        /// Invaliderar Forward-raderna (Points + Rate).
         /// </summary>
         private void InvalidateFwdRow()
         {
@@ -4812,7 +5231,7 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// NY: Hjälp för målningen om du vill läsa texten från state.
+        /// Hjälp för målningen om du vill läsa texten från state.
         /// </summary>
         public string GetForwardModeText()
         {
@@ -4826,9 +5245,14 @@ namespace FX.UI.WinForms
 
         /// <summary>
         /// Visar tvåvägs Forward Rate och Forward Points i cellerna för ett ben.
-        /// - Rate: "bid / ask" med 6 d.p.
-        /// - Points: "bid / ask" i pips (×10 000) med 3 d.p.
-        /// - Null/ogiltigt → tom cell.
+        /// - Om cellen är pinnad (användartext) visas pinnad text oförändrad.
+        /// - Om Points finns (och cellen inte är pinnad) räknas Rate från UI-Spot som den visas:
+        ///     Full (two-way):  Rate_bid = Spot_bid_ui + P_bid, Rate_ask = Spot_ask_ui + P_ask
+        ///     Mid:             Rate_mid används för båda sidorna (Spot_mid_ui + P_side)
+        ///   där Spot_ui först kvantiseras till antalet decimals som faktiskt visas i Spot-raden.
+        /// - Rate-decimals: max(spotDp + 1, 5, userRateDp, 4 + userPointsDp)
+        /// - Points i pips (×10 000) med minst 1 d.p. (eller fler om användaren skrev fler).
+        /// - Om både ptsBid och ptsAsk är ~0 → rendera tomt i Points (undvik "0 / 0" vid init).
         /// </summary>
         public void ShowForwardTwoWayById(Guid legId, double? fwdBid, double? fwdAsk, double? ptsBid, double? ptsAsk)
         {
@@ -4839,91 +5263,326 @@ namespace FX.UI.WinForms
             int rPts = FindRow(L.FwdPts);
             var ci = System.Globalization.CultureInfo.InvariantCulture;
 
+            // ---- Rates (two-way) ----
             if (rRate >= 0)
             {
-                string s = (fwdBid.HasValue && fwdAsk.HasValue)
-                    ? $"{fwdBid.Value.ToString("F6", ci)} / {fwdAsk.Value.ToString("F6", ci)}"
-                    : "";
-                _dgv.Rows[rRate].Cells[col].Value = s;
+                var c = _dgv.Rows[rRate].Cells[col];
+                var pinned = GetPinnedTextOrNull(c);
+                if (pinned != null)
+                {
+                    c.Value = pinned;
+                    SetPrevText(c, pinned);
+                }
+                else
+                {
+                    // Läs användarpreferenser för decimals
+                    int userRateDp = GetUserRateDp(legId);
+                    int userPtsDp = GetUserPointsDp(legId);
+
+                    // Läs hur Spot faktiskt visas i UI (antal decimals) och hämta quantiserad spot per sida
+                    int spotDp = GetSpotUiDecimalsForColumn(col);
+                    var sBidUi = GetSpotUiRoundedSideForColumn(col, isBid: true, spotDp: spotDp);
+                    var sAskUi = GetSpotUiRoundedSideForColumn(col, isBid: false, spotDp: spotDp);
+
+                    // Rate-decimals enligt policy
+                    int rateDp = Math.Max(
+                        Math.Max(spotDp + 1, 5),
+                        Math.Max(userRateDp, 4 + Math.Max(1, userPtsDp))
+                    );
+
+                    string txt;
+                    bool havePts = ptsBid.HasValue && ptsAsk.HasValue &&
+                                   (Math.Abs(ptsBid.Value) > 1e-12 || Math.Abs(ptsAsk.Value) > 1e-12);
+
+                    if (havePts && sBidUi.HasValue && sAskUi.HasValue)
+                    {
+                        // Räkna Rate från UI-Spot (som visas) + Points (rate-enhet)
+                        double rb, ra;
+                        if (_spotMode == SpotMode.Full || _spotMode == SpotMode.Live)
+                        {
+                            rb = sBidUi.Value + ptsBid.Value;
+                            ra = sAskUi.Value + ptsAsk.Value;
+                        }
+                        else
+                        {
+                            // MID-visning: använd mid-spot för båda sidorna
+                            // (GetSpotUiRoundedSideForColumn ger mid när inte Full/Live)
+                            rb = sBidUi.Value + ptsBid.Value;
+                            ra = sAskUi.Value + ptsAsk.Value;
+                        }
+
+                        // Monotoni & formatering
+                        if (rb > ra) { var t = rb; rb = ra; ra = t; }
+                        txt = $"{rb.ToString("F" + rateDp, ci)} / {ra.ToString("F" + rateDp, ci)}";
+                    }
+                    else if (fwdBid.HasValue && fwdAsk.HasValue)
+                    {
+                        // Fallback: använd forward-rate från presentern
+                        txt = $"{fwdBid.Value.ToString("F" + Math.Max(5, userRateDp), ci)} / {fwdAsk.Value.ToString("F" + Math.Max(5, userRateDp), ci)}";
+                    }
+                    else
+                    {
+                        txt = "";
+                    }
+
+                    c.Value = txt;
+                    SetPrevText(c, txt);
+                }
             }
 
+            // ---- Points (two-way) ----
             if (rPts >= 0)
             {
-                string s = "";
-                if (ptsBid.HasValue && ptsAsk.HasValue)
+                var c = _dgv.Rows[rPts].Cells[col];
+                var pinned = GetPinnedTextOrNull(c);
+                if (pinned != null)
                 {
-                    double b = ptsBid.Value * 10000.0;
-                    double a = ptsAsk.Value * 10000.0;
-                    s = $"{b.ToString("F3", ci)} / {a.ToString("F3", ci)}";
+                    c.Value = pinned;
+                    SetPrevText(c, pinned);
                 }
-                _dgv.Rows[rPts].Cells[col].Value = s;
+                else
+                {
+                    int userPtsDp = GetUserPointsDp(legId);
+                    int ptsDp = Math.Max(1, userPtsDp);
+
+                    string txt = "";
+                    if (ptsBid.HasValue && ptsAsk.HasValue)
+                    {
+                        double b = ptsBid.Value * 10000.0;
+                        double a = ptsAsk.Value * 10000.0;
+
+                        // Undvik "0 / 0" vid init – visa tomt om båda är ~0
+                        if (Math.Abs(b) > 1e-9 || Math.Abs(a) > 1e-9)
+                            txt = $"{b.ToString("F" + ptsDp, ci)} / {a.ToString("F" + ptsDp, ci)}";
+                    }
+                    c.Value = txt;
+                    SetPrevText(c, txt);
+                }
             }
         }
 
+
+        /// <summary>
+        /// Returnerar hur många decimaler Spot visas med i UI för en given kolumn.
+        /// Om Spot visas som "bid / ask" tar vi max av vardera sidans decimals.
+        /// Fallback = 4.
+        /// </summary>
+        private int GetSpotUiDecimalsForColumn(string col)
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0 || !_dgv.Columns.Contains(col)) return 4;
+
+            string s = Convert.ToString(_dgv.Rows[rSpot].Cells[col].Value ?? "").Trim();
+            if (string.IsNullOrEmpty(s)) return 4;
+
+            int MaxDp(string t)
+            {
+                t = t.Trim();
+                int idx = t.LastIndexOf('.');
+                if (idx < 0) return 0;
+                int dp = 0;
+                for (int i = idx + 1; i < t.Length; i++)
+                    if (char.IsDigit(t[i])) dp++;
+                return dp;
+            }
+
+            if (s.Contains("/"))
+            {
+                var parts = s.Split('/');
+                int d1 = MaxDp(parts[0]);
+                int d2 = (parts.Length > 1) ? MaxDp(parts[1]) : 0;
+                return Math.Max(d1, d2);
+            }
+
+            return MaxDp(s);
+        }
+
+        /// <summary>
+        /// Hämtar UI-Spot (numeriskt) för sidan (bid/ask) i angiven kolumn och kvantiserar till spotDp.
+        /// Vid Mid-visning används mid för båda sidorna.
+        /// Returnerar null om Spot saknas.
+        /// </summary>
+        private double? GetSpotUiRoundedSideForColumn(string col, bool isBid, int spotDp)
+        {
+            int rSpot = FindRow(L.Spot);
+            if (rSpot < 0 || !_dgv.Columns.Contains(col)) return null;
+
+            var tag = _dgv.Rows[rSpot].Cells[col].Tag as SpotCellData;
+            if (tag == null) return null;
+
+            double s = (_spotMode == SpotMode.Full || _spotMode == SpotMode.Live)
+                       ? (isBid ? tag.Bid : tag.Ask)
+                       : tag.Mid;
+
+            return Math.Round(s, Math.Max(0, spotDp), MidpointRounding.AwayFromZero);
+        }
 
         #endregion
 
-        #region === Autoswitch för Forward Points/Rate + event ===
-
-        public enum ForwardInputKind { Unknown = 0, Single = 1, TwoWay = 2 }
-
-        /// <summary>EventArgs för ForwardInputEdited.</summary>
-        public sealed class ForwardInputEditedEventArgs : EventArgs
-        {
-            public string RowLabel { get; private set; }
-            public string ColumnName { get; private set; }
-            public ForwardInputKind Kind { get; private set; }
-            public string Raw { get; private set; }
-            public ForwardInputEditedEventArgs(string rowLabel, string col, ForwardInputKind kind, string raw)
-            { RowLabel = rowLabel; ColumnName = col; Kind = kind; Raw = raw; }
-        }
-
-        /// <summary>NY: Eldas när användaren editerat Forward Rate/Points.</summary>
-        public event EventHandler<ForwardInputEditedEventArgs> ForwardInputEdited;
+        #region === Forward target (parsing & raise) ===
 
         /// <summary>
-        /// Känner igen singeltal vs "bid / ask" på raderna Forward Points/Rate
-        /// och växlar pill-läge automatiskt: Single → MID, TwoWay → FULL.
+        /// Försöker tolka en Forward-inmatning som singel eller bid/ask-par.
+        /// Stödjer separatorer: '/', mellanslag eller komma. Returnerar råtext och decimaler.
         /// </summary>
-        private void Dgv_CellEndEdit_ForwardAutoSwitch(object sender, DataGridViewCellEventArgs e)
+        private static bool TryParseForwardTargetInput(string raw, out bool isPair, out double? single, out double? bid, out double? ask, out int decimals)
+        {
+            isPair = false; single = null; bid = null; ask = null; decimals = 0;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+
+            string txt = raw.Trim();
+
+            // Dela på '/' eller whitespace (en eller fler)
+            var parts = txt.Split(new[] { '/', ' ', '\t', '\r', '\n' },
+                                  StringSplitOptions.RemoveEmptyEntries);
+
+            double ParseNum(string s, out int decs)
+            {
+                decs = 0;
+                s = s.Trim();
+                // Räkna decimaler i originalet (både ',' och '.')
+                int di = Math.Max(s.LastIndexOf('.'), s.LastIndexOf(','));
+                if (di >= 0 && di + 1 < s.Length)
+                {
+                    int count = 0;
+                    for (int i = di + 1; i < s.Length; i++)
+                        if (char.IsDigit(s[i])) count++;
+                    decs = count;
+                }
+                // Normalisera till invariant
+                var si = s.Replace(',', '.');
+                return double.Parse(si, CultureInfo.InvariantCulture);
+            }
+
+            try
+            {
+                if (parts.Length == 1)
+                {
+                    int d;
+                    var x = ParseNum(parts[0], out d);
+                    single = x;
+                    decimals = d;
+                    isPair = false;
+                    return true;
+                }
+                else if (parts.Length >= 2)
+                {
+                    int dB, dA;
+                    var b = ParseNum(parts[0], out dB);
+                    var a = ParseNum(parts[1], out dA);
+                    bid = b; ask = a;
+                    decimals = Math.Max(dB, dA);
+                    isPair = true;
+                    return true;
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Hämtar legId från en kolumnetikett via befintlig bindning. Returnerar Guid.Empty om okänd.
+        /// </summary>
+        private Guid TryGetLegIdByColumnName(string col)
+        {
+            if (string.IsNullOrWhiteSpace(col)) return Guid.Empty;
+            // _legIdToLabel: Guid -> "Vanilla N"
+            foreach (var kv in _legIdToLabel)
+            {
+                if (string.Equals(kv.Value, col, StringComparison.OrdinalIgnoreCase))
+                    return kv.Key;
+            }
+            return Guid.Empty;
+        }
+
+        /// <summary>
+        /// CellEndEdit för Forward-raderna: parsar användarens input och fire:ar ForwardTargetEdited.
+        /// Ingen autoswitch och ingen solver här (det görs i senare steg).
+        /// </summary>
+        private void Dgv_CellEndEdit_ForwardTarget(object sender, DataGridViewCellEventArgs e)
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
             if (!_dgv.Columns.Contains("FIELD")) return;
 
-            string rowLabel = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
-            if (!string.Equals(rowLabel, L.FwdPts, StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(rowLabel, L.FwdRate, StringComparison.OrdinalIgnoreCase))
+            var rowLabel = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(rowLabel)) return;
+
+            // Endast Forward Points / Forward Rate
+            int rPts = FindRow(L.FwdPts);
+            int rRate = FindRow(L.FwdRate);
+            var isPtsRow = (e.RowIndex == rPts);
+            var isRateRow = (e.RowIndex == rRate);
+            if (!isPtsRow && !isRateRow) return;
+
+            var colName = _dgv.Columns[e.ColumnIndex].Name;
+            if (colName == "Deal" || colName == "FIELD") return; // inte deal/fält-kolumner
+
+            var cell = _dgv.Rows[e.RowIndex].Cells[e.ColumnIndex];
+            var raw = Convert.ToString(cell.Value ?? string.Empty);
+
+            bool ok = TryParseForwardTargetInput(raw, out var isPair, out var single, out var bid, out var ask, out var decs);
+            if (!ok)
+            {
+                // Låt bli att fire:a event vid ogiltig input (tooltip/felhantering kan tillkomma senare steg)
                 return;
-
-            string col = _dgv.Columns[e.ColumnIndex].Name;
-            var raw = Convert.ToString(_dgv.Rows[e.RowIndex].Cells[e.ColumnIndex].EditedFormattedValue ?? "");
-            if (string.IsNullOrWhiteSpace(raw)) return;
-
-            var s = raw.Trim();
-
-            var twoWay = System.Text.RegularExpressions.Regex.IsMatch(
-                s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*/\s*[+-]?\d+(?:[.,]\d+)?\s*$");
-
-            var single = System.Text.RegularExpressions.Regex.IsMatch(
-                s, @"^\s*[+-]?\d+(?:[.,]\d+)?\s*$");
-
-            if (twoWay)
-            {
-                if (GetForwardMode() != 1) SetForwardMode(1); // FULL
-                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.TwoWay, raw));
             }
-            else if (single)
+
+            var args = new ForwardTargetEditedEventArgs
             {
-                if (GetForwardMode() != 0) SetForwardMode(0); // MID
-                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.Single, raw));
-            }
-            else
-            {
-                var h = ForwardInputEdited; if (h != null) h(this, new ForwardInputEditedEventArgs(rowLabel, col, ForwardInputKind.Unknown, raw));
-            }
+                LegId = TryGetLegIdByColumnName(colName),
+                ColumnName = colName,
+                TargetType = isPtsRow ? ForwardTargetType.Points : ForwardTargetType.Rate,
+                IsPair = isPair,
+                Single = isPair ? (double?)null : single,
+                Bid = isPair ? bid : (double?)null,
+                Ask = isPair ? ask : (double?)null,
+                RawDisplay = raw,       // bevara exakt display (ingen studs)
+                Decimals = decs,
+                WasMidStyle = !isPair
+            };
+
+            var h = ForwardTargetEdited;
+            if (h != null) h(this, args);
         }
 
+        /// <summary>
+        /// Returnerar true om någon Forward-cell (Rate eller Points) är PIN-låst
+        /// i någon synlig kolumn. Robust för både MID (singel) och FULL (bid/ask).
+        /// </summary>
+        public bool HasAnyForwardPins()
+        {
+            int rRate = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+
+            if (rRate < 0 && rPts < 0) return false;
+
+            foreach (DataGridViewColumn col in _dgv.Columns)
+            {
+                if (!col.Visible) continue;
+
+                if (rRate >= 0)
+                {
+                    var c = _dgv.Rows[rRate].Cells[col.Index];
+                    if (GetPinnedTextOrNull(c) != null)
+                        return true;
+                }
+
+                if (rPts >= 0)
+                {
+                    var c = _dgv.Rows[rPts].Cells[col.Index];
+                    if (GetPinnedTextOrNull(c) != null)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+
         #endregion
+
 
     }
 

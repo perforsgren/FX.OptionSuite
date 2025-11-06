@@ -169,13 +169,13 @@ namespace FX.Services
                         else { rfBid = b; rfAsk = a; }
                     }
 
-                    System.Diagnostics.Debug.WriteLine(
-                        "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
-                        "pair=" + pair6 + " legId=" + legId +
-                        " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
-                        " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6") +
-                        " rdUse=" + rdBid.ToString("F6") + "/" + rdAsk.ToString("F6") +
-                        " rfUse=" + rfBid.ToString("F6") + "/" + rfAsk.ToString("F6"));
+                    //System.Diagnostics.Debug.WriteLine(
+                    //    "[FxRuntime.Rates][T" + System.Threading.Thread.CurrentThread.ManagedThreadId + "] " +
+                    //    "pair=" + pair6 + " legId=" + legId +
+                    //    " rdEff=" + rdEff.Bid.ToString("F6") + "/" + rdEff.Ask.ToString("F6") +
+                    //    " rfEff=" + rfEff.Bid.ToString("F6") + "/" + rfEff.Ask.ToString("F6") +
+                    //    " rdUse=" + rdBid.ToString("F6") + "/" + rdAsk.ToString("F6") +
+                    //    " rfUse=" + rfBid.ToString("F6") + "/" + rfAsk.ToString("F6"));
 
 
                     // 5) Prissättning
@@ -223,6 +223,27 @@ namespace FX.Services
                     double? askDec = cmd.VolAskPct.HasValue ? (cmd.VolAskPct.Value / 100.0) : (double?)null;
                     domainReq.SetVol(new VolQuote(bidDec, askDec));
 
+
+                    // === DEBUG: radbruten sammanställning av den marknadsdata som används i prisningen ===
+                    try
+                    {
+                        bool spotIsMid = (spotField.ViewMode == ViewMode.Mid || spotField.Override == OverrideMode.Mid);
+                        bool rdIsMid = (rdFld.ViewMode == ViewMode.Mid || rdFld.Override == OverrideMode.Mid);
+                        bool rfIsMid = (rfFld.ViewMode == ViewMode.Mid || rfFld.Override == OverrideMode.Mid);
+
+                        string dbg = BuildMarketDebugBlock(
+                            pair6,
+                            legId,
+                            spotIsMid, spotBid, spotAsk,
+                            rdIsMid, rdBid, rdAsk,
+                            rfIsMid, rfBid, rfAsk,
+                            bidDec, askDec
+                        );
+                        System.Diagnostics.Debug.WriteLine(dbg);
+                    }
+                    catch { /* best-effort debug */ }
+
+
                     var unit = await _price.PriceAsync(domainReq, _cts.Token).ConfigureAwait(false);
 
                     string firstSide = ((cmd.Legs != null && cmd.Legs.Count > 0) ? cmd.Legs[0].Side : "BUY") ?? "BUY";
@@ -268,19 +289,6 @@ namespace FX.Services
         }
 
 
-        /// <summary>
-        /// Liten hjälpare: hämta/bygg rd/rf för (pair6, legId) med feedern en gång.
-        /// Anropa när du har today/spotDate/settlement från dina kalender-tjänster.
-        /// </summary>
-        //public void EnsureRdRfOnce(string pair6, string legId, DateTime today, DateTime spotDate, DateTime settlement)
-        //{
-        //    if (_marketStore == null) return;
-        //    using (var feeder = new UsdAnchoredRateFeeder(_marketStore))
-        //    {
-        //        feeder.EnsureRdRfFor(pair6, legId, today, spotDate, settlement);
-        //    }
-        //}
-
         private static BuySell ParseSide(string s)
         {
             var v = (s ?? "BUY").Trim().ToUpperInvariant();
@@ -300,5 +308,66 @@ namespace FX.Services
             _subscriptions.Clear();
             _cts.Dispose();
         }
+
+        /// <summary>
+        /// Bygger en radbruten debug-text som visar vilken marknadsdata som faktiskt används i prisningen.
+        /// Format:
+        /// Spot:  singel [MID]  eller  bid / ask [FULL]
+        /// RD/RF: singel [MID]  eller  bid / ask [FULL]   (värden i decimal, F6)
+        /// Vol:   singel [MID]  eller  bid / ask [FULL]   (värden i %)
+        /// </summary>
+        private static string BuildMarketDebugBlock(
+            string pair6, string legId,
+            bool spotIsMid, double spotBid, double spotAsk,
+            bool rdIsMid, double rdBid, double rdAsk,
+            bool rfIsMid, double rfBid, double rfAsk,
+            double? volBidDec, double? volAskDec)
+        {
+            var nl = Environment.NewLine;
+
+            string spotLine = spotIsMid
+                ? $"Spot:  {spotBid.ToString("F6")} [MID]"
+                : $"Spot:  {spotBid.ToString("F6")} / {spotAsk.ToString("F6")} [FULL]";
+
+            string rdLine = rdIsMid
+                ? $"RD:    {rdBid.ToString("F6")} [MID]"
+                : $"RD:    {rdBid.ToString("F6")} / {rdAsk.ToString("F6")} [FULL]";
+
+            string rfLine = rfIsMid
+                ? $"RF:    {rfBid.ToString("F6")} [MID]"
+                : $"RF:    {rfBid.ToString("F6")} / {rfAsk.ToString("F6")} [FULL]";
+
+            string volLine;
+            if (volBidDec.HasValue && volAskDec.HasValue && Math.Abs(volBidDec.Value - volAskDec.Value) > 1e-12)
+            {
+                volLine = $"Vol:   {ToPct(volBidDec.Value)} / {ToPct(volAskDec.Value)} [FULL]";
+            }
+            else
+            {
+                // om bara en sida finns, eller lika ⇒ behandla som MID
+                double mid = 0.0;
+                if (volBidDec.HasValue && volAskDec.HasValue)
+                    mid = 0.5 * (volBidDec.Value + volAskDec.Value);
+                else if (volBidDec.HasValue) mid = volBidDec.Value;
+                else if (volAskDec.HasValue) mid = volAskDec.Value;
+
+                volLine = (volBidDec.HasValue || volAskDec.HasValue)
+                    ? $"Vol:   {ToPct(mid)} [MID]"
+                    : "Vol:   –";
+            }
+
+            return "[FxRuntime.MarketUsed]" + nl +
+                   $"pair={pair6} leg={legId}" + nl +
+                   spotLine + nl + rdLine + nl + rfLine + nl + volLine;
+        }
+
+        /// <summary>
+        /// Formatterar decimal (0.0123) till procentsats med 4 d.p. → "1.2300%".
+        /// </summary>
+        private static string ToPct(double x)
+        {
+            return (x * 100.0).ToString("F4") + "%";
+        }
+
     }
 }

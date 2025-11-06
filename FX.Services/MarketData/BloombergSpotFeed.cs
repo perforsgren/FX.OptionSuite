@@ -44,8 +44,8 @@ namespace FX.Services.MarketData
                 ask = (double)dask;
 
                 // === Feed-normalisering: alltid 4 d.p. ===
-                bid = Math.Round(bid, 4, MidpointRounding.AwayFromZero);
-                ask = Math.Round(ask, 4, MidpointRounding.AwayFromZero);
+                //bid = Math.Round(bid, 4, MidpointRounding.AwayFromZero);
+                //ask = Math.Round(ask, 4, MidpointRounding.AwayFromZero);
 
                 return (bid > 0.0) || (ask > 0.0);
             }

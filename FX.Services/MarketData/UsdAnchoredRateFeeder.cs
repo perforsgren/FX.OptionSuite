@@ -234,11 +234,11 @@ namespace FX.Services.MarketData
                 _store.SetRdFromFeed(pair6, legId, new TwoWay<double>(rd_bid, rd_ask), now, stale);
                 _store.SetRfFromFeed(pair6, legId, new TwoWay<double>(rf_bid, rf_ask), now, stale);
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[RD/RF XCCY] pair={pair6} baseLeg={legBaseUsd.Pair6} quoteLeg={legUsdQuote.Pair6}  " +
-                    $"Sb={S_b:F6} F_b(b/m/a)=({Fb_b:F6}/{Fm_b:F6}/{Fa_b:F6}) Tb={Tb:F6}  " +
-                    $"Sq={S_q:F6} F_q(b/m/a)=({Fb_q:F6}/{Fm_q:F6}/{Fa_q:F6}) Tq={Tq:F6}  " +
-                    $"rd(b/m/a)=({rd_bid:P4}/{rd_mid:P4}/{rd_ask:P4})  rf(b/m/a)=({rf_bid:P4}/{rf_mid:P4}/{rf_ask:P4})  stale={stale}");
+                //System.Diagnostics.Debug.WriteLine(
+                //    $"[RD/RF XCCY] pair={pair6} baseLeg={legBaseUsd.Pair6} quoteLeg={legUsdQuote.Pair6}  " +
+                //    $"Sb={S_b:F6} F_b(b/m/a)=({Fb_b:F6}/{Fm_b:F6}/{Fa_b:F6}) Tb={Tb:F6}  " +
+                //    $"Sq={S_q:F6} F_q(b/m/a)=({Fb_q:F6}/{Fm_q:F6}/{Fa_q:F6}) Tq={Tq:F6}  " +
+                //    $"rd(b/m/a)=({rd_bid:P4}/{rd_mid:P4}/{rd_ask:P4})  rf(b/m/a)=({rf_bid:P4}/{rf_mid:P4}/{rf_ask:P4})  stale={stale}");
             }
         }
 
