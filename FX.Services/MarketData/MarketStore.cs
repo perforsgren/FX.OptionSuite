@@ -265,174 +265,112 @@ namespace FX.Services.MarketData
         #region RD & RF
 
         /// <summary>
-        /// Skriver rd (domestic rate) från feed för angivet ben.
-        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
-        ///   så att Store:s baseline exakt matchar UI:s precision.
-        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
-        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// Skriver RD (domestic rate) från feed för ett visst ben.
+        /// - Kvantiserar till 5 d.p. och normaliserar monotoni.
+        /// - Om fältet saknas skapas det med start-ViewMode baserat på aktuellt ForwardPricingMode:
+        ///   Mid → ViewMode.Mid, Full/Net → ViewMode.TwoWay (NET kräver bid/ask i underliggande).
+        /// - Behåller/ändrar inte Override-läge; markerar stale enligt inparametern och triggar Changed vid behov.
         /// </summary>
         public void SetRdFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
-            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---
             const int DEC = 5;
             var vq = new TwoWay<double>(
                 bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
                 ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
             );
-
-            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
             var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
-
             const double EPS = 1e-10;
 
             var cur = MarketSnapshot.TryGet(_current.RdByLeg, legId);
             if (cur == null)
             {
-                var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
-                _current.RdByLeg[legId] = fld;
+                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
 
-                if (DebugFlags.RatesWrite)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Store.WriteRd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={tw.Bid:F6}/{tw.Ask:F6} src=Feed vm=TwoWay ov=None stale={isStale}"
-                    );
-                }
+                var fld = new MarketField<double>(
+                    value: tw,
+                    source: MarketSource.Feed,
+                    viewMode: vm,
+                    ov: OverrideMode.None,
+                    tsUtc: nowUtc,
+                    version: 0,
+                    stale: isStale
+                );
+
+                _current.RdByLeg[legId] = fld;
 
                 RaiseChanged("FeedRd:" + legId);
                 return;
             }
 
-            var eff = cur.Effective; // TwoWay<double>
-            bool same;
-            switch (cur.Override)
-            {
-                case OverrideMode.Bid:
-                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
-                    if (same) return;
-                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                    break;
-
-                case OverrideMode.Ask:
-                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
-                    if (same) return;
-                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                    break;
-
-                case OverrideMode.Mid:
-                case OverrideMode.Both:
-                    // Låst – ingen feedpåverkan
-                    return;
-
-                case OverrideMode.None:
-                default:
-                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
-                    if (same) return;
-                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
-                    break;
-            }
+            var old = cur.Effective;
+            bool changed = Math.Abs(old.Bid - tw.Bid) > EPS || Math.Abs(old.Ask - tw.Ask) > EPS || cur.Source != MarketSource.Feed;
+            if (changed)
+                cur.Replace(tw, MarketSource.Feed, cur.ViewMode, cur.Override, nowUtc);
 
             cur.MarkStale(isStale, nowUtc);
 
-            if (DebugFlags.RatesWrite)
-            {
-                var ne = cur.Effective;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Store.WriteRd][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={ne.Bid:F6}/{ne.Ask:F6} src={cur.Source} vm={cur.ViewMode} ov={cur.Override} stale={cur.IsStale}"
-                );
-            }
-
-            RaiseChanged("FeedRd:" + legId);
+            if (changed || isStale)
+                RaiseChanged("FeedRd:" + legId);
         }
 
 
         /// <summary>
-        /// Skriver rf (foreign rate) från feed för angivet ben.
-        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
-        ///   så att Store:s baseline exakt matchar UI:s precision.
-        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
-        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
+        /// Skriver RF (foreign rate) från feed för ett visst ben.
+        /// - Kvantiserar till 5 d.p. och normaliserar monotoni.
+        /// - Om fältet saknas skapas det med start-ViewMode baserat på aktuellt ForwardPricingMode:
+        ///   Mid → ViewMode.Mid, Full/Net → ViewMode.TwoWay (NET kräver bid/ask i underliggande).
+        /// - Behåller/ändrar inte Override-läge; markerar stale enligt inparametern och triggar Changed vid behov.
         /// </summary>
         public void SetRfFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
-            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---   ////////////////////////////////   ska vi göra detta?
             const int DEC = 5;
             var vq = new TwoWay<double>(
                 bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
                 ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
             );
-
-            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
             var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
-
             const double EPS = 1e-10;
 
             var cur = MarketSnapshot.TryGet(_current.RfByLeg, legId);
             if (cur == null)
             {
-                var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
-                _current.RfByLeg[legId] = fld;
+                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
 
-                if (DebugFlags.RatesWrite)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Store.WriteRf][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={tw.Bid:F6}/{tw.Ask:F6} src=Feed vm=TwoWay ov=None stale={isStale}"
-                    );
-                }
+                var fld = new MarketField<double>(
+                    value: tw,
+                    source: MarketSource.Feed,
+                    viewMode: vm,
+                    ov: OverrideMode.None,
+                    tsUtc: nowUtc,
+                    version: 0,
+                    stale: isStale
+                );
+
+                _current.RfByLeg[legId] = fld;
 
                 RaiseChanged("FeedRf:" + legId);
                 return;
             }
 
-            var eff = cur.Effective;
-            bool same;
-            switch (cur.Override)
-            {
-                case OverrideMode.Bid:
-                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
-                    if (same) return;
-                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                    break;
-
-                case OverrideMode.Ask:
-                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
-                    if (same) return;
-                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
-                    break;
-
-                case OverrideMode.Mid:
-                case OverrideMode.Both:
-                    // Låst – ingen feedpåverkan
-                    return;
-
-                case OverrideMode.None:
-                default:
-                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
-                    if (same) return;
-                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
-                    break;
-            }
+            var old = cur.Effective;
+            bool changed = Math.Abs(old.Bid - tw.Bid) > EPS || Math.Abs(old.Ask - tw.Ask) > EPS || cur.Source != MarketSource.Feed;
+            if (changed)
+                cur.Replace(tw, MarketSource.Feed, cur.ViewMode, cur.Override, nowUtc);
 
             cur.MarkStale(isStale, nowUtc);
 
-            if (DebugFlags.RatesWrite)
-            {
-                var ne = cur.Effective;
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Store.WriteRf][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} eff={ne.Bid:F6}/{ne.Ask:F6} src={cur.Source} vm={cur.ViewMode} ov={cur.Override} stale={cur.IsStale}"
-                );
-            }
-
-            RaiseChanged("FeedRf:" + legId);
+            if (changed || isStale)
+                RaiseChanged("FeedRf:" + legId);
         }
 
 
@@ -581,9 +519,7 @@ namespace FX.Services.MarketData
 
             if (string.IsNullOrEmpty(legId))
             {
-                if (DebugFlags.RatesWrite)
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg=(null) SKIP – legId saknas");
+                System.Diagnostics.Debug.WriteLine($"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg=(null) SKIP – legId saknas");
                 return;
             }
 
@@ -593,11 +529,11 @@ namespace FX.Services.MarketData
             bool hadRd = _current.RdByLeg != null && _current.RdByLeg.ContainsKey(legId);
             bool hadRf = _current.RfByLeg != null && _current.RfByLeg.ContainsKey(legId);
 
-            if (DebugFlags.RatesWrite)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} before: hadRd={hadRd} hadRf={hadRf}");
-            }
+            //if (DebugFlags.RatesWrite)
+            //{
+            //    System.Diagnostics.Debug.WriteLine(
+            //        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} before: hadRd={hadRd} hadRf={hadRf}");
+            //}
 
             if (hadRd)
             {
@@ -611,16 +547,16 @@ namespace FX.Services.MarketData
                 RaiseChanged("InvalidateRf:" + legId);
             }
 
-            if (DebugFlags.RatesWrite)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} after: removedRd={hadRd} removedRf={hadRf}");
-                if (!hadRd && !hadRf)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} nothing to invalidate");
-                }
-            }
+            //if (DebugFlags.RatesWrite)
+            //{
+            //    System.Diagnostics.Debug.WriteLine(
+            //        $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} after: removedRd={hadRd} removedRf={hadRf}");
+            //    if (!hadRd && !hadRf)
+            //    {
+            //        System.Diagnostics.Debug.WriteLine(
+            //            $"[Store.InvalidateRates][T{System.Threading.Thread.CurrentThread.ManagedThreadId}] pair={p6} leg={legId} nothing to invalidate");
+            //    }
+            //}
         }
 
 
@@ -754,6 +690,23 @@ namespace FX.Services.MarketData
             var h = Changed;
             if (h != null)
                 h(this, new MarketChangedEventArgs(snap, aggReason));
+        }
+
+        /// <summary>
+        /// Mappar ForwardPricingMode till start-ViewMode för RD/RF-fält när de skapas från feed.
+        /// Mid → ViewMode.Mid (singel-vy); Full/Net → ViewMode.TwoWay (bid/ask i underliggande).
+        /// </summary>
+        private static ViewMode MapForwardPricingModeToRateViewMode(ForwardPricingMode fpm)
+        {
+            switch (fpm)
+            {
+                case ForwardPricingMode.Mid:
+                    return ViewMode.Mid;
+                case ForwardPricingMode.Full:
+                case ForwardPricingMode.Net:
+                default:
+                    return ViewMode.TwoWay;
+            }
         }
 
         #endregion

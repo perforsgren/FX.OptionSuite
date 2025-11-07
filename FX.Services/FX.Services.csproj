@@ -74,7 +74,6 @@
     <Compile Include="Calendars\SpotSetDateService.cs" />
     <Compile Include="Calendars\WeekendOnlyBusinessCalendar.cs" />
     <Compile Include="DayWeightService.cs" />
-    <Compile Include="Diagnostics\DebugFlags.cs" />
     <Compile Include="DtoMapper.cs" />
     <Compile Include="FlatVolInterpolator.cs" />
     <Compile Include="FxRuntime.cs" />

@@ -167,6 +167,8 @@ namespace FX.UI.WinForms
                         _view.ShowResolvedExpiryById(ls.LegId, r.ExpiryIso, wdEn, rawHint);
                         _view.ShowResolvedSettlementById(ls.LegId, r.SettlementIso);
 
+ 
+
                         // 1) Nolla ev. overrides för RD/RF på benet (återgå till baseline)
                         _mktStore.SetRdOverride(pair6, ls.LegId.ToString(), OverrideMode.None, nowUtc);
                         _mktStore.SetRfOverride(pair6, ls.LegId.ToString(), OverrideMode.None, nowUtc);
@@ -221,6 +223,8 @@ namespace FX.UI.WinForms
 
                 _view.ShowResolvedExpiryById(target.LegId, res.ExpiryIso, wd, hint);
                 _view.ShowResolvedSettlementById(target.LegId, res.SettlementIso);
+
+                string s = _mktStore.GetForwardPricingMode().ToString();
 
                 // 1) Nolla ev. overrides för RD/RF på benet
                 _mktStore.SetRdOverride(pair6, target.LegId.ToString(), OverrideMode.None, nowUtc);

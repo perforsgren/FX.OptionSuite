@@ -158,27 +158,29 @@ namespace FX.UI.WinForms
 
 
         private Rectangle _pricingBtnRect = Rectangle.Empty;
-        private bool _pricingBtnHover = false;
         private bool _pricingBtnPressed = false;
-        private int _pricingHeaderRow = -1; // sätts när du hittar Pricing-raden
+        private bool _pricingBtnHover = false;
+        private int _pricingHeaderRow = -1;
 
-        private bool _mktBtnPressed;
-        private bool _mktBtnInside;
-
-        // Fält i klassen (utöver de du redan har)
-        private int _mktHeaderRow = -1;
         private Rectangle _mktBtnRect = Rectangle.Empty;
+        private bool _mktBtnPressed = false;
+        private bool _mktBtnInside = false;
+        private int _mktHeaderRow = -1;
+
+        private Rectangle _fwdBtnRect = Rectangle.Empty;
+        private bool _fwdBtnPressed = false;
+        private bool _fwdBtnInside = false;
 
         private enum DisplayCcy { Quote, Base } // intern spegling
         private DisplayCcy _displayCcy = DisplayCcy.Quote; // default
 
-        /// <summary>
-        /// Visnings-/editeringsläge för SPOT i UI.
-        /// Endast för Spot (andra fält kan få egna modes senare).
-        /// </summary>
+        //Visnings-/editeringsläge för SPOT i UI.
         public enum SpotMode { Mid = 0, Full = 1, Live = 3 }
         private SpotMode _spotMode = SpotMode.Mid;
 
+        // Forward-lägen för hedge/forward-komponenten i UI.
+        private enum ForwardMode { Mid = 0, Full = 1, Net = 2 }
+        private ForwardMode _fwdMode = ForwardMode.Full; // default
 
         #endregion
 
@@ -632,11 +634,13 @@ namespace FX.UI.WinForms
             _dgv.CellMouseDown += Dgv_CellMouseDown_MktDataButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_MktDataButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_MktDataButton;
+            _dgv.CellMouseLeave += Dgv_CellMouseLeave_MktButton;
 
             // Forward-pill (MID/FULL) i "Forward Points"
             _dgv.CellMouseDown += Dgv_CellMouseDown_FwdButton;
             _dgv.CellMouseUp += Dgv_CellMouseUp_FwdButton;
             _dgv.CellMouseMove += Dgv_CellMouseMove_FwdButton;
+            _dgv.CellMouseLeave += Dgv_CellMouseLeave_FwdButton;
 
             //_dgv.CellEndEdit += Dgv_CellEndEdit_ForwardAutoSwitch;
             _dgv.CellEndEdit += Dgv_CellEndEdit_ForwardTarget;
@@ -1584,6 +1588,8 @@ namespace FX.UI.WinForms
             // Andra tangenter: inget specialfall här
         }
 
+        #region Mouse event buttons
+
         // ========= MouseDown: markera "pressed" + blockera att FIELD fäller sektionen =========
         private void Dgv_CellMouseDown_PricingButton(object sender, DataGridViewCellMouseEventArgs e)
         {
@@ -1663,7 +1669,7 @@ namespace FX.UI.WinForms
             if (over != _pricingBtnHover)
             {
                 _pricingBtnHover = over;
-                //_dgv.Cursor = over ? Cursors.Hand : Cursors.Default;
+                _dgv.Cursor = over ? Cursors.Hand : Cursors.Default;
                 _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, _pricingHeaderRow);
             }
         }
@@ -1683,7 +1689,6 @@ namespace FX.UI.WinForms
         }
 
 
-
         private void Dgv_CellMouseDown_MktDataButton(object sender, DataGridViewCellMouseEventArgs e)
         {
             // Reagera bara om trycket är inne i vår knapp (vänster eller höger)
@@ -1699,7 +1704,6 @@ namespace FX.UI.WinForms
         /// - Växlar internt _mktDataMode (endast för SPOT).
         /// - Fire:ar SpotModeChanged om läget faktiskt ändrats (Presenter uppdaterar MarketStore).
         /// - Ritar om knapp + spotrad och säkerställer tvåvägs-snapshots i FULL/LIVE.
-        /// OBS: Vi kallar inte längre RaisePriceRequestedForLeg här.
         /// </summary>
         private void Dgv_CellMouseUp_MktDataButton(object sender, DataGridViewCellMouseEventArgs e)
         {
@@ -1755,15 +1759,102 @@ namespace FX.UI.WinForms
 
         private void Dgv_CellMouseMove_MktDataButton(object sender, DataGridViewCellMouseEventArgs e)
         {
-            if (!_mktBtnPressed) return;
+            //if (!_mktBtnPressed) return;
 
             bool nowInside = IsInsideMktHeaderButton(e);
             if (_mktBtnInside != nowInside)
             {
+                _dgv.Cursor = nowInside ? Cursors.Hand : Cursors.Default;
                 _mktBtnInside = nowInside;
                 InvalidateSpotModeButton();
             }
         }
+
+        // ========= MouseLeave: släck hover/pressed och återställ cursor =========
+        private void Dgv_CellMouseLeave_MktButton(object sender, DataGridViewCellEventArgs e)
+        {
+            if (_mktBtnPressed)
+            {
+                _mktBtnInside = false;
+                _mktBtnPressed = false;
+                _dgv.Cursor = Cursors.Default;
+                InvalidateSpotModeButton();
+            }
+        }
+
+
+        /// <summary>
+        /// MouseDown på Forward-pill (MID⇆FULL).
+        /// Hindrar cellselektion och ritar pressed-state.
+        /// </summary>
+        private void Dgv_CellMouseDown_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (!IsInsideFwdButton(e)) return;
+            _fwdBtnPressed = true;
+            _fwdBtnInside = true;
+            InvalidateFwdButton();
+            this.BeginInvoke(new Action(() => _dgv.ClearSelection()));
+        }
+
+        /// <summary>
+        /// MouseMove – håll pressed-state bara när musen är kvar i knappen.
+        /// </summary>
+        private void Dgv_CellMouseMove_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            //if (!_fwdBtnPressed) return;
+            bool nowInside = IsInsideFwdButton(e);
+            if (nowInside != _fwdBtnInside)
+            {
+                _fwdBtnInside = nowInside;
+                _dgv.Cursor = nowInside ? Cursors.Hand : Cursors.Default;
+                InvalidateFwdButton();
+            }
+        }
+
+        /// <summary>
+        /// MouseUp på "Forward Points"-pill. Vänsterklick cyklar MID → FULL → NET → MID.
+        /// Högerklick används inte för NET (inget special-case).
+        /// </summary>
+        private void Dgv_CellMouseUp_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+
+            // Endast FIELD-cellen på raden "Forward Points" och om klicket var inne i pillen
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            string lbl = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
+            if (!string.Equals(lbl, L.FwdPts, StringComparison.OrdinalIgnoreCase)) return;
+            if (!IsInsideFwdButton(e)) return;
+
+            // Cykla tre lägen: Mid(0) → Full(1) → Net(2) → Mid(0)
+            var next = (ForwardMode)(((int)_fwdMode + 1) % 3);
+            _fwdMode = next;
+
+            _fwdBtnPressed = false;
+            _fwdBtnInside = false;
+
+            // Rita om pill
+            InvalidateFwdButton();
+
+            // Signalera uppåt att forward-läget ändrats (0/1/2)
+            ForwardModeChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        // ========= MouseLeave: släck hover/pressed och återställ cursor =========
+        private void Dgv_CellMouseLeave_FwdButton(object sender, DataGridViewCellEventArgs e)
+        {
+            if (_fwdBtnPressed)
+            {
+                _fwdBtnInside = false;
+                _fwdBtnPressed = false;
+                _dgv.Cursor = Cursors.Default;
+                InvalidateFwdButton();
+            }
+        }
+
+
+
+
+        #endregion
 
         #endregion
 
@@ -1870,8 +1961,6 @@ namespace FX.UI.WinForms
                     }
                 }
 
-                // ---- OBS: Gamla "Mkt Data"-headerknappen är BORTTAGEN här ----
-
                 e.Handled = true;
                 e.CellStyle.SelectionBackColor = oldSelBack;
                 e.CellStyle.SelectionForeColor = oldSelFore;
@@ -1949,7 +2038,9 @@ namespace FX.UI.WinForms
                 _mktHeaderRow = e.RowIndex;
                 _mktBtnRect = btnRectLocal;
 
-                Color fill = _mktBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
+                Color fill = _mktBtnPressed
+                    ? Color.FromArgb(220, 230, 238)
+                    : _mktBtnInside ? Color.FromArgb(240, 245, 250) : Color.FromArgb(235, 240, 245);
                 Color border = _mktBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
 
                 var btnRectAbs = new Rectangle(
@@ -2018,11 +2109,17 @@ namespace FX.UI.WinForms
                 var btnRectLocal = new Rectangle(btnAbsX - e.CellBounds.X, btnAbsY - e.CellBounds.Y, btnW, btnH);
 
                 // Viktigt: exponera "header"-state för befintliga mouse-handlers
-                //_mktHeaderRow = e.RowIndex;
+                //_fwdHeaderRow = e.RowIndex;
                 _fwdBtnRect = btnRectLocal;
 
-                Color fill = _fwdBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
+
+                Color fill = _fwdBtnPressed
+                   ? Color.FromArgb(220, 230, 238)
+                   : _fwdBtnInside ? Color.FromArgb(240, 245, 250) : Color.FromArgb(235, 240, 245);
                 Color border = _fwdBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
+
+                //Color fill = _fwdBtnPressed ? Color.FromArgb(220, 230, 238) : Color.FromArgb(235, 240, 245);
+                //Color border = _fwdBtnPressed ? Color.FromArgb(150, 170, 190) : Color.FromArgb(196, 204, 212);
 
                 var btnRectAbs = new Rectangle(
                     e.CellBounds.X + btnRectLocal.X,
@@ -2125,6 +2222,8 @@ namespace FX.UI.WinForms
                 e.CellStyle.SelectionForeColor = oldSelFore;
                 return;
             }
+
+
 
             // ===== 5) Overlay för Premium (per unit / total) i ben =====
             bool isPremUnit = string.Equals(rowLabel, L.PremUnit, StringComparison.OrdinalIgnoreCase);
@@ -5093,12 +5192,6 @@ namespace FX.UI.WinForms
 
         #region === Forward Points-knapp (MID/FULL) ===
 
-        // Forward-lägen för hedge/forward-komponenten i UI.
-        private enum ForwardMode { Mid = 0, Full = 1, Net = 2 }
-        private ForwardMode _fwdMode = ForwardMode.Full; // default enligt krav
-        private bool _fwdBtnPressed, _fwdBtnInside;
-        private Rectangle _fwdBtnRect = Rectangle.Empty;       // Senaste beräknade rect för pillen
-
         /// <summary>
         /// Exponerar forward-läget för Presenter/ritning.
         /// </summary>
@@ -5113,69 +5206,9 @@ namespace FX.UI.WinForms
             var m = (ForwardMode)Math.Max(0, Math.Min(2, mode));
             if (_fwdMode == m) return;
             _fwdMode = m;
-            InvalidateFwdRow();
             var h = ForwardModeChanged;
             if (h != null) h(this, EventArgs.Empty);
         }
-
-        /// <summary>
-        /// MouseDown på Forward-pill (MID⇆FULL).
-        /// Hindrar cellselektion och ritar pressed-state.
-        /// </summary>
-        private void Dgv_CellMouseDown_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
-        {
-            if (!IsInsideFwdButton(e)) return;
-            _fwdBtnPressed = true;
-            _fwdBtnInside = true;
-            InvalidateFwdButton();
-            this.BeginInvoke(new Action(() => _dgv.ClearSelection()));
-        }
-
-        /// <summary>
-        /// MouseMove – håll pressed-state bara när musen är kvar i knappen.
-        /// </summary>
-        private void Dgv_CellMouseMove_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
-        {
-            if (!_fwdBtnPressed) return;
-            bool nowInside = IsInsideFwdButton(e);
-            if (nowInside != _fwdBtnInside)
-            {
-                _fwdBtnInside = nowInside;
-                InvalidateFwdButton();
-            }
-        }
-
-        /// <summary>
-        /// MouseUp på "Forward Points"-pill. Vänsterklick cyklar MID → FULL → NET → MID.
-        /// Högerklick används inte för NET (inget special-case).
-        /// </summary>
-        private void Dgv_CellMouseUp_FwdButton(object sender, DataGridViewCellMouseEventArgs e)
-        {
-            if (e.Button != MouseButtons.Left) return;
-
-            // Endast FIELD-cellen på raden "Forward Points" och om klicket var inne i pillen
-            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            string lbl = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? "");
-            if (!string.Equals(lbl, L.FwdPts, StringComparison.OrdinalIgnoreCase)) return;
-            if (!IsInsideFwdButton(e)) return;
-
-            // Cykla tre lägen: Mid(0) → Full(1) → Net(2) → Mid(0)
-            var next = (ForwardMode)(((int)_fwdMode + 1) % 3);
-            _fwdMode = next;
-
-            _fwdBtnPressed = false;
-            _fwdBtnInside = false;
-
-            // Rita om pill + båda forward-raderna
-            InvalidateFwdButton();
-            InvalidateFwdRow();
-
-            // Signalera uppåt att forward-läget ändrats (0/1/2)
-            ForwardModeChanged?.Invoke(this, EventArgs.Empty);
-        }
-
-
-
 
         /// <summary>
         /// Hit-test för Forward-pill i "FIELD" på raden "Forward Points".
@@ -5217,17 +5250,6 @@ namespace FX.UI.WinForms
             int r = FindRow(L.FwdPts);
             if (r >= 0 && _dgv.Columns.Contains("FIELD"))
                 _dgv.InvalidateCell(_dgv.Columns["FIELD"].Index, r);
-        }
-
-        /// <summary>
-        /// Invaliderar Forward-raderna (Points + Rate).
-        /// </summary>
-        private void InvalidateFwdRow()
-        {
-            int rPts = FindRow(L.FwdPts);
-            int rRate = FindRow(L.FwdRate);
-            if (rPts >= 0) _dgv.InvalidateRow(rPts);
-            if (rRate >= 0) _dgv.InvalidateRow(rRate);
         }
 
         /// <summary>
