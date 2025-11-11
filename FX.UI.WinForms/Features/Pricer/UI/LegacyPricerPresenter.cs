@@ -140,12 +140,19 @@ namespace FX.UI.WinForms
 
         #region Expiry resolve
 
+
         /// <summary>
         /// Hanterar användarens editering av expiry (Deal eller specifikt ben).
-        /// - Deal: resolve + apply för samtliga ben, nolla RD/RF-overrides, invaliddera RD/RF och prissätt alla (cache/TTL; ingen force).
-        /// - Ben: resolve + apply för benet, nolla RD/RF-overrides, invaliddera RD/RF och prissätt bara det.
+        /// - Deal: resolve + apply för samtliga ben, nolla RD/RF-override, invaliddera räntor,
+        ///   avpinna forward-visning (Rate & Points) och uppdatera forward-celler omedelbart,
+        ///   därefter enkel (debouncad) prisning per ben.
+        /// - Enskilt ben: samma som ovan fast för det benet.
+        /// 
+        /// Nytt: Avpinnar aktiv PIN på Forward-celler (Rate/Points) vid expiry-byte så att gammal råtext
+        /// inte ligger kvar i UI. Efter override-reset + invalidation pushas forward-visningen direkt så att
+        /// UI omedelbart speglar aktuellt läge (utan att invänta nästa bus-prisning).
         /// </summary>
-        private void OnExpiryEditRequested(object sender, LegacyPricerView.ExpiryEditRequestedEventArgs e)
+        void OnExpiryEditRequested(object sender, LegacyPricerView.ExpiryEditRequestedEventArgs e)
         {
             var pair6 = (e.Pair6 ?? _view.ReadPair6() ?? "EURSEK").Replace("/", "").ToUpperInvariant();
             var holidays = LoadHolidaysForPair(pair6);
@@ -164,10 +171,9 @@ namespace FX.UI.WinForms
                                       ? r.Normalized?.ToUpperInvariant()
                                       : null;
 
+                        // Visa resolved expiry/settlement i UI
                         _view.ShowResolvedExpiryById(ls.LegId, r.ExpiryIso, wdEn, rawHint);
                         _view.ShowResolvedSettlementById(ls.LegId, r.SettlementIso);
-
- 
 
                         // 1) Nolla ev. overrides för RD/RF på benet (återgå till baseline)
                         _mktStore.SetRdOverride(pair6, ls.LegId.ToString(), OverrideMode.None, nowUtc);
@@ -176,10 +182,17 @@ namespace FX.UI.WinForms
                         // 2) Invaliddera RD/RF → cache-only re-derive vid prisning (ingen force)
                         _mktStore.InvalidateRatesForLeg(pair6, ls.LegId.ToString(), nowUtc);
 
-                        // 3) Skippa UI→Store i nästföljande prisanrop (engång)
+                        // 3) Avpinna forward-visning (Rate & Points) så att gammal råtext inte hänger kvar
+                        _view.UnpinForwardDisplay(ls.LegId, null);
+
+                        // 4) Uppdatera forward-celler direkt (bygger på resolved expiry i View + nuvarande Store)
+                        //    så UI slutar visa gammalt pinned-värde omedelbart.
+                        PushForwardUiForLeg(ls.LegId);
+
+                        // 5) Skippa UI→Store i nästföljande prisanrop (engång)
                         _suppressUiRatesWriteOnce = true;
 
-                        // 4) Prissätt benet (cache/TTL + ingen återinförd override)
+                        // 6) Prissätt benet (cache/TTL + ingen återinförd override)
                         PriceSingleLeg(ls.LegId, forceRefreshRates: false);
                     }
                     catch (Exception ex)
@@ -221,22 +234,27 @@ namespace FX.UI.WinForms
                            ? res.Normalized?.ToUpperInvariant()
                            : null;
 
+                // Visa resolved expiry/settlement i UI
                 _view.ShowResolvedExpiryById(target.LegId, res.ExpiryIso, wd, hint);
                 _view.ShowResolvedSettlementById(target.LegId, res.SettlementIso);
 
-                string s = _mktStore.GetForwardPricingMode().ToString();
-
-                // 1) Nolla ev. overrides för RD/RF på benet
+                // 1) Nolla ev. overrides för RD/RF (återgå till baseline)
                 _mktStore.SetRdOverride(pair6, target.LegId.ToString(), OverrideMode.None, nowUtc);
                 _mktStore.SetRfOverride(pair6, target.LegId.ToString(), OverrideMode.None, nowUtc);
 
-                // 2) Invaliddera RD/RF (cache-only)
+                // 2) Invaliddera RD/RF (ingen force)
                 _mktStore.InvalidateRatesForLeg(pair6, target.LegId.ToString(), nowUtc);
 
-                // 3) Skippa UI→Store i nästföljande prisanrop (engång)
+                // 3) Avpinna Forward (Rate & Points) för detta ben
+                _view.UnpinForwardDisplay(target.LegId, null);
+
+                // 4) Omedelbar UI-push av forward-värden (utan att vänta på bus-prisning)
+                PushForwardUiForLeg(target.LegId);
+
+                // 5) Nästa prisning ska inte skriva UI-rates → Store (engång)
                 _suppressUiRatesWriteOnce = true;
 
-                // 4) Prissätt benet (cache/TTL + ingen återinförd override)
+                // 6) Prissätt benet (cache/TTL)
                 PriceSingleLeg(target.LegId, forceRefreshRates: false);
             }
             catch (Exception ex)
@@ -250,7 +268,6 @@ namespace FX.UI.WinForms
                 });
             }
         }
-
 
         /// <summary>
         /// Laddar helgdagstabell för givna kalenderkoder kopplade till valutaparet (pair6).
@@ -382,11 +399,6 @@ namespace FX.UI.WinForms
                 var mid = snap.SpotMid > 0.0 ? snap.SpotMid : 0.0;
                 sb = mid; sa = mid;
             }
-
-            int dp = 4;
-            try { dp = _view.GetSpotUiDecimals(); } catch { dp = 4; }
-            sb = Math.Round(sb, dp, MidpointRounding.AwayFromZero);
-            sa = Math.Round(sa, dp, MidpointRounding.AwayFromZero);
 
             // Vol i procent
             double? volBidPct = (snap.VolBid > 0.0) ? (double?)(snap.VolBid * 100.0) : null;
@@ -1189,16 +1201,20 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// UI: F7 – Forced rate refresh för alla ben.
-        /// 1) Nolla RD/RF-override i Store för varje ben (så Effective inte blir kvar som User).
-        /// 2) Ingen direkt UI-push här; siffran byts när feed kommer.
-        /// 3) Prisa varje ben med ForceRefreshRates=true – runtime ensure:ar nya RD/RF innan läsning.
+        /// Hanterar forced refresh (F7) av räntor för alla ben.
+        /// Nytt: Återställer även alla manuella DP-preferenser för Forward-visningen i vyn
+        /// så att Points återgår till 1 dp och Rate till minst 5 dp innan vi hämtar nya RD/RF.
+        /// Därefter nollas RD/RF-overrides i Store och varje ben prissätts med forceRefreshRates=true.
         /// </summary>
         private void OnRatesRefreshRequested(object sender, EventArgs e)
         {
             try
             {
                 System.Diagnostics.Debug.WriteLine("[Presenter.F7] Force refresh rates for all legs…");
+
+                // 0) Återställ DP-preferenser för Forward before refresh (Points=1 dp, Rate≥5 dp).
+                //    Detta påverkar endast UI-visningen; Store/engine påverkas inte av detta anrop.
+                _view?.ResetForwardDpToDefaults();
 
                 var pair6 = NormalizePair6(_view.ReadPair6()) ?? _mktStore.Current?.Pair6 ?? "EURSEK";
                 var nowUtc = DateTime.UtcNow;
@@ -1233,114 +1249,112 @@ namespace FX.UI.WinForms
 
 
         /// <summary>
-        /// Tunn pill-toggle: sätter ForwardPricingMode. 
-        /// Om pins finns: unpinna och reset RD→feed; coalesca händelser så UI bara uppdateras en gång.
+        /// Hanterar byte av Forward-läge via UI-pill (0=Mid,1=Full,2=Net) utan att bryta user-input.
+        /// - Sätter endast policyn i Store.
+        /// - Visuell transform av pins (pair↔mid) i vyn.
+        /// - Därefter re-solve:ar vi RD mot det transformerade målet (per ben) så att prisningen matchar visningen.
+        /// - Debouncad reprice på slutet.
         /// </summary>
-        private void OnForwardModeChanged(object sender, EventArgs e)
+        void OnForwardModeChanged(object sender, EventArgs e)
         {
             try
             {
-                var p6 = NormalizePair6(_view.ReadPair6());
-                if (string.IsNullOrWhiteSpace(p6))
-                    return;
+                var p6 = (_view.ReadPair6() ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
-                // 0=Mid, 1=Full, 2=Net
-                int sel = _view.GetForwardMode();
+                int sel = _view.GetForwardMode(); // 0=Mid, 1=Full, 2=Net
                 var fpm = (sel == 0) ? ForwardPricingMode.Mid
                          : (sel == 1) ? ForwardPricingMode.Full
                                       : ForwardPricingMode.Net;
 
-                var hasPins = _view.HasAnyForwardPins();
-
-                if (hasPins)
-                {
-                    // Unpin i UI
-                    _view.UnpinAllForwardDisplays();
-
-                    // Reset RD→feed + invalidate RD (RF lämnas)
-                    var nowUtc = DateTime.UtcNow;
-                    if (_legStates != null)
-                    {
-                        for (int i = 0; i < _legStates.Count; i++)
-                        {
-                            var legIdStr = _legStates[i].LegId.ToString();
-                            _mktStore.SetRdOverride(p6, legIdStr, OverrideMode.None, nowUtc);
-                            _mktStore.InvalidateRatesForLeg(p6, legIdStr, nowUtc);
-                        }
-                    }
-                }
-
-                // Sätt Forward-läget sist så att den andra (enda synliga) UI-uppdateringen sker på nya läget
+                // Sätt policy i Store
                 _mktStore.SetForwardPricingMode(p6, fpm, DateTime.UtcNow);
-                // Ingen direkt reprice här; OnMarketChanged driver allt.
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("[ERR] Presenter.OnForwardModeChanged: " + ex.Message);
-            }
-        }
 
-        /// <summary>
-        /// Forward-mål från vyn (Points/Rate, singel/par).
-        /// 1) Autoswitchar policy enligt 5b, men låter NET vara sticky om det redan är valt.
-        /// 2) Pinnar forward-display i vyn för att undvika studs (5d).
-        /// 3) Kör solver enligt 5c: Hold RF, solve RD. Skriver ENDAST RD-override till Store.
-        /// 4) Triggar en debouncad reprice.
-        /// </summary>
-        private void OnForwardTargetEdited(object sender, LegacyPricerView.ForwardTargetEditedEventArgs e)
-        {
-            if (e == null) return;
+                // VISUELL transform av befintliga pins enligt 5d-C (bryter inte pin/override)
+                _view.TransformPinnedForwardDisplayForMode(sel);
 
-            var current = _mktStore.GetForwardPricingMode();
+                // VIKTIGT: re-solve efter transform så RD/forward följer nya målet (ej gamla pin)
+                ReSolvePinnedTargetsForMode(sel);
 
-            // 5b: NET ska vara "sticky": ändra inte läget vid manuell forward-input.
-            if (current != ForwardPricingMode.Net)
-            {
-                var desired = InferForwardModeForTarget(e); // Single->Mid, Pair->Full
-                if (desired != current)
-                {
-                    var pair6Set = _mktStore.Current?.Pair6 ?? "EURSEK";
-                    _mktStore.SetForwardPricingMode(pair6Set, desired, DateTime.UtcNow); // policy only
-                    OnUi(() => _view.SetForwardMode(desired == ForwardPricingMode.Mid ? 0 : 1));
-                }
-            }
-            else
-            {
-                // NET valt → håll kvar pillen på NET (2)
-                OnUi(() => _view.SetForwardMode(2));
-            }
-
-            try
-            {
-                // 5d: Pinna användarens råtext i forward-cellen för att undvika studs i UI
-                OnUi(() => _view.PinForwardDisplay(e.LegId, e.TargetType, e.RawDisplay));
-
-                // Viktigt: undvik att nästa prisning skriver tillbaka RD-mid från UI och
-                // därmed “klappar ihop” solverns two-way. Gäller en gång.
-                _suppressUiRatesWriteOnce = true;
-
-                // 5c: Lös RD från forward-målet (Hold RF)
-                SolveRdFromForwardTarget(e);
-
-                // En debouncad reprice räcker
+                // Debouncad reprice
                 ScheduleRepriceDebounced();
             }
             catch (Exception ex)
             {
-                _bus.Publish(new ErrorOccurred
-                {
-                    Source = "Presenter.OnForwardTargetEdited/Solve",
-                    Message = ex.Message,
-                    Detail = ex.ToString(),
-                    CorrelationId = Guid.Empty
-                });
+                Debug.WriteLine("[Presenter.OnForwardModeChanged] " + ex.Message);
             }
         }
 
 
 
 
+        /// <summary>
+        /// Reagerar på editering av Forward-target (Points/Rate) från vyn – utan autoswitch.
+        /// Lägget (FULL/MID/NET) är det som gäller; toggling hanteras separat.
+        /// 
+        /// Regler:
+        /// • FULL/NET + single  → behandla som value/value (lös RD lika på båda sidor).
+        /// • FULL/NET + pair    → lös RD per sida (bid/ask).
+        /// • MID + single       → lös RD för mid (engine använder bid=ask=mid).
+        /// • MID + pair         → ska inte nå hit (View rollbackar i 5b-1), men guard finns.
+        /// 
+        /// Endast solver och debouncad reprice. Inga mode-byten, inga unpins, ingen reset.
+        /// </summary>
+        void OnForwardTargetEdited(object sender, LegacyPricerView.ForwardTargetEditedEventArgs e)
+        {
+            if (e == null) return;
 
+            // Läs aktuellt UI-läge: 0=Mid, 1=Full, 2=Net
+            int sel = _view.GetForwardMode();
+            var mode = (sel == 0) ? ForwardPricingMode.Mid
+                     : (sel == 1) ? ForwardPricingMode.Full
+                                  : ForwardPricingMode.Net;
+
+            // Safety: i MID får par inte förekomma (View rollbackade redan i 5b-1)
+            if (mode == ForwardPricingMode.Mid && e.IsPair)
+            {
+                return;
+            }
+
+            // Förhindra att nästa marknadsuppdatering skriver tillbaka UI→Store (engång)
+            _suppressUiRatesWriteOnce = true;
+
+            // Transformera input enligt gällande mode innan vi löser RD
+            LegacyPricerView.ForwardTargetEditedEventArgs toSolve = e;
+
+            if (mode == ForwardPricingMode.Mid)
+            {
+                // MID + single: lös mid (engine kör bid=ask=mid). Låt e vara som den är (single).
+                // Inget att göra här.
+            }
+            else
+            {
+                // FULL eller NET
+                if (!e.IsPair)
+                {
+                    // Single ska tolkas som value/value (båda sidor lika) i FULL/NET.
+                    toSolve = new LegacyPricerView.ForwardTargetEditedEventArgs
+                    {
+                        LegId = e.LegId,
+                        ColumnName = e.ColumnName,
+                        TargetType = e.TargetType,
+                        IsPair = true,
+                        Bid = e.Single, // båda sidor lika
+                        Ask = e.Single,
+                        Single = null,
+                        RawDisplay = e.RawDisplay,
+                        Decimals = e.Decimals,
+                        WasMidStyle = true // single ursprungligen
+                    };
+                }
+                // FULL/NET + pair: använd e rakt av (lös per sida).
+            }
+
+            // Lös RD (Hold RF) enligt transformerad target
+            SolveRdFromForwardTarget(toSolve);
+
+            // Debouncad reprice
+            ScheduleRepriceDebounced();
+        }
 
 
         /// <summary>
@@ -1353,7 +1367,6 @@ namespace FX.UI.WinForms
             return e.IsPair ? ForwardPricingMode.Full
                             : ForwardPricingMode.Mid;
         }
-
 
         #endregion
 
@@ -1971,15 +1984,90 @@ namespace FX.UI.WinForms
         #region Forward Solver
 
         /// <summary>
-        /// Solver för Forward-target (Points eller Rate), Hold RF → solve RD.
-        /// - Single input (MID): löser rd_mid och skriver som User-override (mid).
-        /// - Pair input (FULL): löser rd_bid/rd_ask sida-för-sida och skriver TwoWay.
-        /// Rör inte RF/Spot/Forward i Store. Säkrar monotoni (F_bid ≤ F_ask, rd_bid ≤ rd_ask).
+        /// Läser transformerade pins (per ben) från vyn och löser RD på nytt mot dessa mål,
+        /// utan att bryta pin (ingen reset). Tolkning per läge:
+        /// - MID: singel förväntas (pair accepteras ej av vyn).
+        /// - FULL/NET: singel tolkas som value/value (båda sidor lika) inför solve.
+        /// Notering: RF-mid vid single i FULL (Alt B) införs i nästa steg i engine/adapter.
         /// </summary>
-        /// <param name="e">EventArgs från vyn med måltyp (Pts/Rate), värden och leg-id.</param>
+        private void ReSolvePinnedTargetsForMode(int modeIdx)
+        {
+            var ids = _view.GetAllLegIds();
+            if (ids == null || ids.Count == 0) return;
+
+            var mode = (modeIdx == 0) ? ForwardPricingMode.Mid
+                     : (modeIdx == 1) ? ForwardPricingMode.Full
+                                      : ForwardPricingMode.Net;
+
+            foreach (var legId in ids)
+            {
+                if (!_view.TryBuildForwardArgsFromPin(legId, modeIdx, out var arg) || arg == null)
+                    continue;
+
+                LegacyPricerView.ForwardTargetEditedEventArgs toSolve = arg;
+
+                if (mode == ForwardPricingMode.Mid)
+                {
+                    // MID ska vara singel (vyn har redan gjort pair→mid), inget att transformera.
+                    if (toSolve.IsPair)
+                    {
+                        // Säkerhetsvakt: kollapsa till mid om det ändå råkat bli pair.
+                        double mid = 0.5 * ((toSolve.Bid ?? 0.0) + (toSolve.Ask ?? 0.0));
+                        toSolve = new LegacyPricerView.ForwardTargetEditedEventArgs
+                        {
+                            LegId = arg.LegId,
+                            ColumnName = arg.ColumnName,
+                            TargetType = arg.TargetType,
+                            IsPair = false,
+                            Single = mid,
+                            Bid = null,
+                            Ask = null,
+                            RawDisplay = arg.RawDisplay,
+                            Decimals = arg.Decimals,
+                            WasMidStyle = true
+                        };
+                    }
+                }
+                else
+                {
+                    // FULL/NET: singel ska behandlas som value/value vid solve
+                    if (!toSolve.IsPair && toSolve.Single.HasValue)
+                    {
+                        toSolve = new LegacyPricerView.ForwardTargetEditedEventArgs
+                        {
+                            LegId = arg.LegId,
+                            ColumnName = arg.ColumnName,
+                            TargetType = arg.TargetType,
+                            IsPair = true,
+                            Bid = toSolve.Single,
+                            Ask = toSolve.Single,
+                            Single = null,
+                            RawDisplay = arg.RawDisplay,
+                            Decimals = arg.Decimals,
+                            WasMidStyle = true
+                        };
+                    }
+                }
+
+                // Lös RD mot det transformerade målet
+                SolveRdFromForwardTarget(toSolve);
+            }
+        }
+
+
+        /// <summary>
+        /// Löser RD från användarens forward-target (Hold RF) med policy inkl. Alternativ B.
+        /// Policy:
+        /// - MID + single: solve mot RF_mid, skriv RD lika (bid=ask).
+        /// - FULL/NET + single: tolka single som value/value, FRYS RF på mid (solve + prisning), skriv RD lika.
+        /// - FULL/NET + pair:
+        ///     * Om F_bid≈F_ask (inom tajt tolerans) → behandla som single (RF_mid, RD lika).
+        ///     * Annars lös sida-för-sida (sided) och släpp ev. tidigare RF-mid-override.
+        /// - Points i UI är pips → konverteras till rate-delta före addition till S_mid.
+        /// </summary>
         private void SolveRdFromForwardTarget(ForwardTargetEditedEventArgs e)
         {
-            // 0) Hämta legId och pair
+            // Guards
             var legId = e.LegId;
             if (legId == Guid.Empty) return;
 
@@ -1987,7 +2075,7 @@ namespace FX.UI.WinForms
             var baseCcy = pair6.Substring(0, 3);
             var quoteCcy = pair6.Substring(3, 3);
 
-            // 1) Datum/Tq/Tb (samma källa som i forward-renderingen)
+            // Datum/Tq/Tb
             var today = DateTime.Today;
             var expIso = _view.TryGetResolvedExpiryIsoById(legId);
             DateTime expiry = today;
@@ -1999,49 +2087,36 @@ namespace FX.UI.WinForms
 
             var Tq = YearFracMm(spotDate, settlement, quoteCcy);
             var Tb = YearFracMm(spotDate, settlement, baseCcy);
-            if (Tq <= 0.0)
-                throw new InvalidOperationException("Kan ej lösa RD: Tq≈0 (för kort tenor).");
+            if (Tq <= 0.0) throw new InvalidOperationException("Kan ej lösa RD: Tq≈0 (för kort tenor).");
 
-            // 2) Snapshot: Spot_mid och RF (sidat behövs för FULL)
+            // Snapshot
             var snap = _mktStore.Current;
             if (snap == null || !string.Equals(snap.Pair6, pair6, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("MarketSnapshot saknas eller fel par.");
 
-            var sf = snap.Spot;
-            var se = sf?.Effective ?? default;
+            // Spot: vi använder S_mid i solver (stabilt ihop med pips→rate)
+            var se = snap.Spot?.Effective ?? default(TwoWay<double>);
             var S_mid = 0.5 * (se.Bid + se.Ask);
-
-            // C# 7.3 saknar double.IsFinite => kontrollera NaN/Infinity manuellt
             if (double.IsNaN(S_mid) || double.IsInfinity(S_mid) || S_mid <= 0.0)
                 throw new InvalidOperationException("Ogiltig spot i snapshot.");
 
+            // RF two-way (kan frysas till mid i vissa fall)
             var key = legId.ToString();
-            var rfFld = snap.TryGetRf(key);
-            if (rfFld == null)
-                throw new InvalidOperationException("RF saknas i snapshot.");
-
-            var rfEff = rfFld.Effective;
+            var rfFd = snap.TryGetRf(key);
+            if (rfFd == null) throw new InvalidOperationException("RF saknas i snapshot.");
+            var rfEff = rfFd.Effective;
             var rf_mid = 0.5 * (rfEff.Bid + rfEff.Ask);
             var rf_bid = rfEff.Bid;
             var rf_ask = rfEff.Ask;
 
-            // 3) Bygg target-F från användarens input
-            //    Points tolkas som PIPS i UI → konvertera till rate-delta före addition.
+            // Bygg F-target
             double? F_single = null, F_bid = null, F_ask = null;
-
             if (!e.IsPair)
             {
                 if (!e.Single.HasValue) return;
-
-                if (e.TargetType == ForwardTargetType.Points)
-                {
-                    var dRate = PointsPipsToRateDelta(pair6, e.Single.Value);
-                    F_single = S_mid + dRate;
-                }
-                else // Rate
-                {
-                    F_single = e.Single.Value;
-                }
+                F_single = (e.TargetType == ForwardTargetType.Points)
+                    ? S_mid + PointsPipsToRateDelta(pair6, e.Single.Value)
+                    : e.Single.Value;
             }
             else
             {
@@ -2052,13 +2127,11 @@ namespace FX.UI.WinForms
                     if (e.Bid.HasValue) F_bid = S_mid + PointsPipsToRateDelta(pair6, e.Bid.Value);
                     if (e.Ask.HasValue) F_ask = S_mid + PointsPipsToRateDelta(pair6, e.Ask.Value);
                 }
-                else // Rate
+                else
                 {
-                    F_bid = e.Bid;
-                    F_ask = e.Ask;
+                    F_bid = e.Bid; F_ask = e.Ask;
                 }
 
-                // Monotoni på target-F: normalisera till F_bid ≤ F_ask om användaren skrev inverterat.
                 if (F_bid.HasValue && F_ask.HasValue)
                 {
                     var fb = F_bid.Value; var fa = F_ask.Value;
@@ -2067,73 +2140,137 @@ namespace FX.UI.WinForms
                 }
             }
 
-            // 4) Vakter på denominator: 1 + rf*Tb måste vara > 0
             double Denom(double rf) => 1.0 + rf * Tb;
-
-            // 5) Lös RD
             var nowUtc = DateTime.UtcNow;
+            var mode = _mktStore.GetForwardPricingMode();
+
+            // Hjälpare: skriv RD lika (bid=ask) + ev. RF-mid override
+            void WriteSingleLikeWithRfMid(double Fstar, bool freezeRfMid)
+            {
+                if (freezeRfMid)
+                {
+                    _mktStore.SetRfFromUser(
+                        pair6,
+                        key,
+                        new TwoWay<double>(rf_mid, rf_mid),
+                        /*wasMid*/ true,
+                        ViewMode.TwoWay,
+                        nowUtc
+                    );
+                }
+
+                var denom = Denom(rf_mid);
+                if (denom <= 0.0) throw new InvalidOperationException("Ogiltigt rf·Tb (denominator≤0).");
+
+                var rd_mid = ((Fstar / S_mid) * denom - 1.0) / Tq;
+
+                _mktStore.SetRdFromUser(
+                    pair6,
+                    key,
+                    new TwoWay<double>(rd_mid, rd_mid),
+                    /*wasMid*/ true,
+                    ViewMode.TwoWay,
+                    nowUtc
+                );
+            }
 
             if (!e.IsPair)
             {
-                // MID: rd_mid = [ (F*/S_mid)*(1 + rf_mid*Tb) - 1 ] / Tq
-                if (!F_single.HasValue) return;
-
-                var denom = Denom(rf_mid);
-                if (denom <= 0.0)
-                    throw new InvalidOperationException("Ogiltigt rf·Tb (denominator≤0).");
-
-                var rd_mid = ((F_single.Value / S_mid) * denom - 1.0) / Tq;
-
-                // Skriv RD som mid (TwoWay med samma värde), wasMid=true
-                var tw = new TwoWay<double>(rd_mid, rd_mid);
-                _mktStore.SetRdFromUser(pair6, key, tw, wasMid: true, viewMode: ViewMode.TwoWay, nowUtc: nowUtc);
+                // SINGLE target
+                bool freezeRf = (mode != ForwardPricingMode.Mid) && e.WasMidStyle; // FULL/NET + single
+                WriteSingleLikeWithRfMid(F_single.Value, freezeRf);
 
                 System.Diagnostics.Debug.WriteLine(
-                    $"[Solver] MID: pair={pair6} leg={legId} F*={F_single:F8} S_mid={S_mid:F8} rf_mid={rf_mid:F8} Tq={Tq:F6} Tb={Tb:F6} -> rd_mid={rd_mid:F8}");
+                    (mode == ForwardPricingMode.Mid ? "[Solver] MID/single" : "[Solver] FULL/NET single RF(mid)") +
+                    " pair=" + pair6 +
+                    " leg=" + legId +
+                    " F*=" + F_single.Value.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) +
+                    " rf_mid=" + rf_mid.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) +
+                    " Tq=" + Tq.ToString("F6", System.Globalization.CultureInfo.InvariantCulture) +
+                    " Tb=" + Tb.ToString("F6", System.Globalization.CultureInfo.InvariantCulture)
+                );
             }
             else
             {
-                // FULL: sida-för-sida med “motsatt” rf i denominatorn
-                double? rd_bid = null, rd_ask_res = null;
+                // PAIR target
+                // Om paren i praktiken är lika → behandla som single-ekvivalent (freeze RF mid i FULL/NET)
+                bool both = F_bid.HasValue && F_ask.HasValue;
+                bool effectivelySingle = both && Math.Abs(F_bid.Value - F_ask.Value) < 1e-12;
 
-                if (F_bid.HasValue)
+                if (mode != ForwardPricingMode.Mid && effectivelySingle)
                 {
-                    var denom_bid = Denom(rf_ask); // rf_ask i bid-denominator
-                    if (denom_bid <= 0.0)
-                        throw new InvalidOperationException("Ogiltigt rf_ask·Tb i bid-sida (denominator≤0).");
+                    // RF-mid + RD lika
+                    var Fstar = 0.5 * (F_bid.Value + F_ask.Value);
+                    WriteSingleLikeWithRfMid(Fstar, freezeRfMid: true);
 
-                    rd_bid = ((F_bid.Value / S_mid) * denom_bid - 1.0) / Tq;
+                    System.Diagnostics.Debug.WriteLine(
+                        "[Solver] FULL/NET pair(eq)→treat-as-single RF(mid)" +
+                        " pair=" + pair6 +
+                        " leg=" + legId +
+                        " Fbid=" + F_bid.Value.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) +
+                        " Fask=" + F_ask.Value.ToString("F8", System.Globalization.CultureInfo.InvariantCulture)
+                    );
                 }
-
-                if (F_ask.HasValue)
+                else if (mode == ForwardPricingMode.Mid)
                 {
-                    var denom_ask = Denom(rf_bid); // rf_bid i ask-denominator
-                    if (denom_ask <= 0.0)
-                        throw new InvalidOperationException("Ogiltigt rf_bid·Tb i ask-sida (denominator≤0).");
+                    // MID hamnar inte här (vyn avvisar pair), men säkerhetsmässigt: behandla som single på mid
+                    var Fstar = both ? 0.5 * (F_bid.Value + F_ask.Value) : (F_bid ?? F_ask ?? S_mid);
+                    WriteSingleLikeWithRfMid(Fstar, freezeRfMid: false);
 
-                    rd_ask_res = ((F_ask.Value / S_mid) * denom_ask - 1.0) / Tq;
+                    System.Diagnostics.Debug.WriteLine(
+                        "[Solver] MID/pair→treat-as-single" +
+                        " pair=" + pair6 +
+                        " leg=" + legId
+                    );
                 }
-
-                // Om bara ena sidan finns: skriv bara den (den andra behålls oförändrad av Store)
-                // Om båda finns: säkra rd_bid ≤ rd_ask (monotoni efter lösning)
-                if (rd_bid.HasValue && rd_ask_res.HasValue && rd_bid.Value > rd_ask_res.Value)
+                else
                 {
-                    rd_ask_res = rd_bid.Value;
+                    // FULL/NET med riktig tvåvägs-input (F_bid ≠ F_ask) → sided solve
+                    _mktStore.SetRfOverride(pair6, key, OverrideMode.None, nowUtc); // släpp ev. tidigare RF-mid-override
+
+                    double? rd_bid = null, rd_ask = null;
+
+                    if (F_bid.HasValue)
+                    {
+                        var denom_bid = Denom(rf_ask); // sided: rf_ask i bid-denominator
+                        if (denom_bid <= 0.0) throw new InvalidOperationException("Ogiltigt rf_ask·Tb i bid-sida.");
+                        rd_bid = ((F_bid.Value / S_mid) * denom_bid - 1.0) / Tq;
+                    }
+
+                    if (F_ask.HasValue)
+                    {
+                        var denom_ask = Denom(rf_bid); // sided: rf_bid i ask-denominator
+                        if (denom_ask <= 0.0) throw new InvalidOperationException("Ogiltigt rf_bid·Tb i ask-sida.");
+                        rd_ask = ((F_ask.Value / S_mid) * denom_ask - 1.0) / Tq;
+                    }
+
+                    var rdEff = snap.TryGetRd(key)?.Effective ?? new TwoWay<double>(0, 0);
+                    var outBid = rd_bid ?? rdEff.Bid;
+                    var outAsk = rd_ask ?? rdEff.Ask;
+
+                    _mktStore.SetRdFromUser(
+                        pair6,
+                        key,
+                        new TwoWay<double>(outBid, outAsk),
+                        /*wasMid*/ false,
+                        ViewMode.TwoWay,
+                        nowUtc
+                    );
+
+                    System.Diagnostics.Debug.WriteLine(
+                        "[Solver] FULL/NET pair(sided)" +
+                        " pair=" + pair6 +
+                        " leg=" + legId +
+                        " F_bid=" + (F_bid.HasValue ? F_bid.Value.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) : "null") +
+                        " F_ask=" + (F_ask.HasValue ? F_ask.Value.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) : "null") +
+                        " rf_bid=" + rf_bid.ToString("F8", System.Globalization.CultureInfo.InvariantCulture) +
+                        " rf_ask=" + rf_ask.ToString("F8", System.Globalization.CultureInfo.InvariantCulture)
+                    );
                 }
-
-                // Bygg TwoWay där saknad sida fylls med befintlig Effective (eller rd_bid om bara den finns)
-                var rdEff = snap.TryGetRd(key)?.Effective ?? new TwoWay<double>(0, 0);
-                var outBid = rd_bid ?? rdEff.Bid;
-                var outAsk = rd_ask_res ?? rdEff.Ask;
-
-                var tw = new TwoWay<double>(outBid, outAsk);
-                _mktStore.SetRdFromUser(pair6, key, tw, wasMid: false, viewMode: ViewMode.TwoWay, nowUtc: nowUtc);
-
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Solver] FULL: pair={pair6} leg={legId} F_bid*={(F_bid.HasValue ? F_bid.Value.ToString("F8") : "null")} F_ask*={(F_ask.HasValue ? F_ask.Value.ToString("F8") : "null")} " +
-                    $"S_mid={S_mid:F8} rf_bid={rf_bid:F8} rf_ask={rf_ask:F8} Tq={Tq:F6} Tb={Tb:F6} -> rd_bid={(rd_bid.HasValue ? rd_bid.Value.ToString("F8") : "null")} rd_ask={(rd_ask_res.HasValue ? rd_ask_res.Value.ToString("F8") : "null")}");
             }
         }
+
+
 
 
         /// <summary>

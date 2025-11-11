@@ -156,7 +156,6 @@ namespace FX.UI.WinForms
         private PricingCurrency _pricingCurrency = PricingCurrency.Quote;
         private bool _suppressNextSectionToggle; // hindra infällning när vi klickar knappen
 
-
         private Rectangle _pricingBtnRect = Rectangle.Empty;
         private bool _pricingBtnPressed = false;
         private bool _pricingBtnHover = false;
@@ -181,6 +180,9 @@ namespace FX.UI.WinForms
         // Forward-lägen för hedge/forward-komponenten i UI.
         private enum ForwardMode { Mid = 0, Full = 1, Net = 2 }
         private ForwardMode _fwdMode = ForwardMode.Full; // default
+
+        // Per-leg DP-preferens (består tills forced refresh)
+        private readonly Dictionary<Guid, (int? PointsDp, int? RateDp, bool ManualActive)> _forwardDpPref = new Dictionary<Guid, (int? PointsDp, int? RateDp, bool ManualActive)>();
 
         #endregion
 
@@ -422,7 +424,7 @@ namespace FX.UI.WinForms
                 EnableHeadersVisualStyles = false,
                 BackgroundColor = Color.White,
                 GridColor = Color.Gainsboro,
-                ColumnHeadersHeight = 34,
+                ColumnHeadersHeight = 30,
                 EditMode = DataGridViewEditMode.EditProgrammatically
             };
 
@@ -1004,7 +1006,7 @@ namespace FX.UI.WinForms
                 // *** SLUT NYTT ***
 
                 // 4) Normaliserad visning i Deal (minst 4 d.p., behåll fler om user skrev fler)
-                string display = FormatSpotWithMinDecimals(raw, mid, 4);
+                string display = FormatSpotWithMinDecimals(raw, mid, 5);
                 cell.Value = display;
 
                 // 5) Tag på Deal (snapshot med two-way)
@@ -1510,6 +1512,16 @@ namespace FX.UI.WinForms
                 PairChanged?.Invoke(this, EventArgs.Empty);
                 return;
             }
+
+            if (string.Equals(lbl, L.FwdPts, StringComparison.OrdinalIgnoreCase))
+            {
+                InvalidateFwdButton();
+            }
+
+            if (string.Equals(lbl, L.FwdRate, StringComparison.OrdinalIgnoreCase))
+            {
+                InvalidateFwdButton();
+            }
         }
 
 
@@ -1753,8 +1765,6 @@ namespace FX.UI.WinForms
                 if (h != null) h(this, EventArgs.Empty);
             }
 
-            // Håll sektionen ofälld (släpp spärren efter denna klick-loop)
-            //this.BeginInvoke((Action)(() => { _suppressNextSectionToggle = false; }));
         }
 
         private void Dgv_CellMouseMove_MktDataButton(object sender, DataGridViewCellMouseEventArgs e)
@@ -2189,11 +2199,11 @@ namespace FX.UI.WinForms
                 if (showTwoWay)
                 {
                     string bidTxt = isFeed
-                        ? bid.ToString("0.0000", CultureInfo.InvariantCulture)
+                        ? bid.ToString("0.00000", CultureInfo.InvariantCulture)
                         : FormatSpotWithMinDecimals(bid.ToString(CultureInfo.InvariantCulture), bid, 4);
 
                     string askTxt = isFeed
-                        ? ask.ToString("0.0000", CultureInfo.InvariantCulture)
+                        ? ask.ToString("0.00000", CultureInfo.InvariantCulture)
                         : FormatSpotWithMinDecimals(ask.ToString(CultureInfo.InvariantCulture), ask, 4);
 
                     string txt = bidTxt + "/" + askTxt;
@@ -2205,7 +2215,7 @@ namespace FX.UI.WinForms
                 else
                 {
                     string midTxt = isFeed
-                        ? mid.ToString("0.0000", CultureInfo.InvariantCulture)
+                        ? mid.ToString("0.00000", CultureInfo.InvariantCulture)
                         : (Convert.ToString(cellSpot.Value ?? "") is string sMid && !string.IsNullOrWhiteSpace(sMid)
                             ? sMid
                             : FormatSpotWithMinDecimals(mid.ToString(CultureInfo.InvariantCulture), mid, 4));
@@ -2977,36 +2987,6 @@ namespace FX.UI.WinForms
                 // Viktigt: legs ska inte bli lila när Deal editeras.
                 MarkOverride(L.Spot, lg, false);
             }
-        }
-
-
-        /// <summary>
-        /// Returnerar hur många decimaler som UI *visar* för Spot i Deal-kolumnen.
-        /// - Minst 4.
-        /// - Om användaren skrev fler än 4, returneras det högsta antalet d.p. som syns.
-        /// Robust mot både "mid"-visning och "bid/ask"-visning.
-        /// </summary>
-        public int GetSpotUiDecimals()
-        {
-            int rSpot = FindRow(L.Spot);
-            if (rSpot < 0) return 4;
-
-            var val = Convert.ToString(_dgv.Rows[rSpot].Cells["Deal"].Value ?? "");
-            if (string.IsNullOrWhiteSpace(val))
-            {
-                // Deal kan vara tom vid push till legs – ta första leg som finns
-                foreach (var lg in _legs)
-                {
-                    if (!_dgv.Columns.Contains(lg)) continue;
-                    var s = Convert.ToString(_dgv.Rows[rSpot].Cells[lg].Value ?? "");
-                    var d = CountDecimalsInSpotDisplay(s);
-                    if (d > 0) return Math.Max(4, d);
-                }
-                return 4;
-            }
-
-            var decs = CountDecimalsInSpotDisplay(val);
-            return Math.Max(4, decs);
         }
 
         /// <summary>
@@ -3844,10 +3824,15 @@ namespace FX.UI.WinForms
         #region === LegId ↔ UI-kolumn ===
 
         /// <summary>
-        /// Visar Forward Rate och Forward Points (singel) för ett ben.
-        /// - Respekterar ev. PIN i cell.Tag (för att undvika studs).
-        /// - Uppdaterar PREV (senast godkända visning).
-        /// - Decimalpolicy: Points = max(1, userPtsDp); Rate = max(5, userRateDp, 4 + userPtsDp).
+        /// Visar Forward i singelvisning för ett ben (används i MID-läge).
+        /// DP-policy:
+        /// - Finns pinnad text i Rate/Points → använd den och respektera användarens decimals (fromUser=true).
+        /// - Annars engine-fallback:
+        ///     * Rate: dp = max(spotDp+1, 5) (inkl. historik/korsregel om sådan finns).
+        ///     * Points: dp = minst 1, inkl. historik/korsregel (rateDp - spotDp).
+        /// Slutforcering:
+        /// - I FULL/NET ska syskonraden ändå renderas som "v / v". Här dupliceras texten utan att formattera om,
+        ///   så redan beräknade decimals bevaras (ingen nedklampning till 5/1 dp).
         /// </summary>
         public void ShowForwardById(Guid legId, double? fwd, double? pts)
         {
@@ -3859,58 +3844,119 @@ namespace FX.UI.WinForms
             if (rFwd < 0 && rPts < 0) return;
 
             var ci = System.Globalization.CultureInfo.InvariantCulture;
+            int spotDp = GetSpotUiDecimalsForColumn(col);
 
-            // ---- Rate (singel) ----
+            // Historik från Tag (om du använder den internt)
+            int userRateDp = GetUserRateDp(legId);
+            int userPointsDp = GetUserPointsDp(legId);
+
+            // ---- RATE (singel) ----
             if (rFwd >= 0)
             {
                 var c = _dgv.Rows[rFwd].Cells[col];
                 var pinned = GetPinnedTextOrNull(c);
                 if (pinned != null)
                 {
-                    c.Value = pinned;
-                    // PREV = pinned
-                    SetPrevText(c, pinned);
+                    // Respektera användarens decimals
+                    string txt = ApplyForwardDpForDisplay(ForwardTargetType.Rate, pinned, spotDp, fromUser: true);
+                    c.Value = txt;
+                    SetPrevText(c, txt);
                 }
                 else
                 {
-                    // bestäm dp för rate
-                    int userRateDp = GetUserRateDp(legId);         // default 0 → hanteras nedan
-                    int userPtsDp = GetUserPointsDp(legId);       // default 0
-                    int rateDp = Math.Max(5, Math.Max(userRateDp, 4 + Math.Max(1, userPtsDp)));
+                    // Engine-fallback (inkl. historik/korsregel)
+                    int baseDp = Math.Max(spotDp + 1, 5);
+                    int dp = Math.Max(baseDp, Math.Max(userRateDp, (userPointsDp > 0 ? 4 + userPointsDp : 0)));
 
-                    string txt = fwd.HasValue ? fwd.Value.ToString("F" + rateDp, ci) : "";
+                    string txt = "";
+                    if (fwd.HasValue)
+                        txt = fwd.Value.ToString("F" + dp, ci);
+
                     c.Value = txt;
                     SetPrevText(c, txt);
                 }
             }
 
-            // ---- Points (singel) ----
+            // ---- POINTS (singel) ----
             if (rPts >= 0)
             {
                 var c = _dgv.Rows[rPts].Cells[col];
                 var pinned = GetPinnedTextOrNull(c);
                 if (pinned != null)
                 {
-                    c.Value = pinned;
-                    SetPrevText(c, pinned);
+                    // Respektera användarens decimals
+                    string txt = ApplyForwardDpForDisplay(ForwardTargetType.Points, pinned, spotDp, fromUser: true);
+                    c.Value = txt;
+                    SetPrevText(c, txt);
                 }
                 else
                 {
-                    // dp för points
-                    int userPtsDp = GetUserPointsDp(legId);
-                    int ptsDp = Math.Max(1, userPtsDp);
+                    // Engine-fallback (inkl. historik/korsregel)
+                    int dp = Math.Max(1, Math.Max(userPointsDp, (userRateDp > 0 ? Math.Max(1, userRateDp - spotDp) : 0)));
 
                     string txt = "";
                     if (pts.HasValue)
                     {
-                        double scaled = pts.Value * 10000.0;
-                        txt = scaled.ToString("F" + ptsDp, ci);
+                        double scaled = pts.Value * 10000.0; // pips per 1 base
+                        txt = scaled.ToString("F" + dp, ci);
                     }
+
                     c.Value = txt;
                     SetPrevText(c, txt);
                 }
             }
+
+            // --- Slutlig visningsforcering i FULL/NET: duplicera VISAD text till "v / v" utan ny formatering ---
+            int modeIdx = GetForwardMode(); // 0=Mid, 1=Full, 2=Net
+            bool forcePairVisual = (modeIdx == 1 || modeIdx == 2);
+            if (forcePairVisual)
+            {
+                if (rFwd >= 0)
+                {
+                    var cR = _dgv.Rows[rFwd].Cells[col];
+                    var sR = Convert.ToString(cR.Value ?? string.Empty);
+                    if (!string.IsNullOrWhiteSpace(sR) && sR.IndexOf('/') < 0)
+                    {
+                        // Bevara exakt de decimals som redan finns – ingen ny dp-formatterare här!
+                        var norm = NormalizeForwardDisplayText(sR);
+                        var vv = string.IsNullOrEmpty(norm) ? norm : (norm + " / " + norm);
+                        cR.Value = vv;
+                        SetPrevText(cR, vv);
+                    }
+                }
+                if (rPts >= 0)
+                {
+                    var cP = _dgv.Rows[rPts].Cells[col];
+                    var sP = Convert.ToString(cP.Value ?? string.Empty);
+                    if (!string.IsNullOrWhiteSpace(sP) && sP.IndexOf('/') < 0)
+                    {
+                        var norm = NormalizeForwardDisplayText(sP);
+                        var vv = string.IsNullOrEmpty(norm) ? norm : (norm + " / " + norm);
+                        cP.Value = vv;
+                        SetPrevText(cP, vv);
+                    }
+                }
+            }
         }
+
+
+
+
+
+        /// <summary>
+        /// Returnerar alla legIds som är mappade till UI-kolumner i aktuell vy.
+        /// </summary>
+        public IReadOnlyList<Guid> GetAllLegIds()
+        {
+            var list = new List<Guid>();
+            foreach (var col in _legs)
+            {
+                var id = TryGetLegIdByColumnName(col);
+                if (id != Guid.Empty) list.Add(id);
+            }
+            return list;
+        }
+
 
 
 
@@ -4560,15 +4606,15 @@ namespace FX.UI.WinForms
             if (string.Equals(source, "Manual", StringComparison.OrdinalIgnoreCase))
             {
                 // Manuell input: behåll tidigare beteende (minst 4 d.p., men respekt för användarens fler d.p.)
-                rawForDisplay = mid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                rawForDisplay = mid.ToString(CultureInfo.InvariantCulture);
             }
             else
             {
                 // Feed: lås till exakt 4 d.p.
-                rawForDisplay = mid.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture);
+                rawForDisplay = mid.ToString("0.00000", CultureInfo.InvariantCulture);
             }
 
-            cell.Value = FormatSpotWithMinDecimals(rawForDisplay, mid, 4);
+            cell.Value = FormatSpotWithMinDecimals(rawForDisplay, mid, 5);
 
             // 3) Marknadsvärde → släck override + uppdatera feed-baseline (behåller double)
             SetFeedValue(L.Spot, col, mid);
@@ -5038,11 +5084,140 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
+        /// Säkerställer att en UI-kolumn för ett ben finns. Om den saknas skapas den och seedas från
+        /// <paramref name="seedFromLabel"/> (om angiven och giltig) annars från första benkolumnen.
+        /// Metoden kopierar Value/Tag rad-för-rad och applicerar ReadOnly/utseende för ben-kolumnen
+        /// så att nya ben omedelbart får samma låsning och grå-stil som övriga.
+        /// </summary>
+        private void EnsureLegColumnExists(string label, string seedFromLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(label)) return;
+
+            // Finns kolumnen redan? Registrera i _legs om den inte redan finns.
+            if (_dgv.Columns.Contains(label))
+            {
+                bool known = false;
+                for (int i = 0; i < _legs.Length; i++)
+                {
+                    if (string.Equals(_legs[i], label, StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+                }
+                if (!known)
+                {
+                    Array.Resize(ref _legs, _legs.Length + 1);
+                    _legs[_legs.Length - 1] = label;
+                }
+                return;
+            }
+
+            // Skapa ny ben-kolumn
+            var col = new DataGridViewTextBoxColumn
+            {
+                Name = label,
+                HeaderText = label,
+                Width = ColumnLegWidth,
+                ValueType = typeof(string),
+                DefaultCellStyle = new DataGridViewCellStyle
+                {
+                    Alignment = DataGridViewContentAlignment.MiddleRight,
+                    Padding = new Padding(0, 0, 10, 0)
+                }
+            };
+            _dgv.Columns.Add(col);
+
+            // Seed-källa: specifik kolumn om giltig ben-kolumn; annars första benkolumnen
+            string srcCol = null;
+            if (!string.IsNullOrWhiteSpace(seedFromLabel) &&
+                _dgv.Columns.Contains(seedFromLabel) &&
+                IsLegColumn(seedFromLabel))
+            {
+                srcCol = seedFromLabel;
+            }
+            else
+            {
+                var first = FirstLegColumn();
+                if (!string.IsNullOrEmpty(first) && IsLegColumn(first))
+                    srcCol = first;
+            }
+
+            // Kopiera innehåll och sätt ReadOnly/utseende rad-för-rad
+            for (int r = 0; r < _dgv.Rows.Count; r++)
+            {
+                var dst = _dgv.Rows[r].Cells[label];
+
+                if (!string.IsNullOrEmpty(srcCol) && _dgv.Columns.Contains(srcCol))
+                {
+                    var src = _dgv.Rows[r].Cells[srcCol];
+                    dst.Value = src?.Value; // inkl. formaterade värden (t.ex. "[1M] yyyy-mm-dd")
+                    dst.Tag = src?.Tag;   // metadata följer med
+                }
+                else
+                {
+                    dst.Value = null;
+                    dst.Tag = null;
+                }
+
+                // Läs radens "fält-namn" (FIELD-kolumnens visningstext)
+                var rowLabel = Convert.ToString(_dgv.Rows[r].Cells["FIELD"].Value ?? string.Empty);
+
+                // 1) ReadOnly-regler för nya benet (samma policy som vid init):
+                //    - Pair / Delivery / Spot
+                //    - Hela Pricing- & Risk-delen (explicit list nedan)
+                //    - Premium total (valutavariant) via StartsWith
+                //    - ***NYTT***: rd & rf (lås även på nya ben)
+                bool isPricingOrRiskExplicit =
+                       rowLabel == L.PremUnit
+                    || rowLabel == L.PremPct
+                    || rowLabel == L.PremPips
+                    || rowLabel == L.PremTot
+                    || rowLabel == L.Delta
+                    || rowLabel == L.DeltaPct
+                    || rowLabel == L.Vega
+                    || rowLabel == L.Gamma
+                    || rowLabel == L.Theta;
+
+                bool isPremiumTotalDynamic = rowLabel.StartsWith("Premium total (", StringComparison.OrdinalIgnoreCase);
+
+                bool lockCell =
+                       string.Equals(rowLabel, L.Pair, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(rowLabel, L.Delivery, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(rowLabel, L.Rd, StringComparison.OrdinalIgnoreCase)   // ← Lås rd i nya ben
+                    || string.Equals(rowLabel, L.Rf, StringComparison.OrdinalIgnoreCase)   // ← Lås rf i nya ben
+                    || isPricingOrRiskExplicit
+                    || isPremiumTotalDynamic; // ← Premium total (ccy) oavsett valutatext
+
+                if (lockCell)
+                {
+                    dst.ReadOnly = true;
+
+                    // 2) Grå-utseende för vissa rader i ben-kolumner:
+                    //    Pair / Delivery / Spot var gråa sedan tidigare; lägg till rd/rf här.
+                    if (string.Equals(rowLabel, L.Pair, StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(rowLabel, L.Delivery, StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(rowLabel, L.Spot, StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(rowLabel, L.Rd, StringComparison.OrdinalIgnoreCase)  // ← rd grå text
+                      || string.Equals(rowLabel, L.Rf, StringComparison.OrdinalIgnoreCase)) // ← rf grå text
+                    {
+                        dst.Style.ForeColor = Color.Gray;
+                        dst.Style.Format = "";
+                    }
+                }
+            }
+
+            // Registrera kolumnen i _legs
+            Array.Resize(ref _legs, _legs.Length + 1);
+            _legs[_legs.Length - 1] = label;
+
+            _dgv.Invalidate();
+        }
+
+
+        /// <summary>
         /// Säkerställer att en UI-kolumn med namn <paramref name="label"/> finns.
         /// Om den saknas skapas den och seedas från <paramref name="seedFromLabel"/> om angiven och giltig,
         /// annars från första ben-kolumnen. Kopierar både Value och Tag så format/hints följer med.
         /// </summary>
-        private void EnsureLegColumnExists(string label, string seedFromLabel = null)
+        private void EnsureLegColumnExistsOLD(string label, string seedFromLabel = null)
         {
             if (string.IsNullOrWhiteSpace(label)) return;
 
@@ -5190,6 +5365,8 @@ namespace FX.UI.WinForms
 
         #endregion
 
+
+
         #region === Forward Points-knapp (MID/FULL) ===
 
         /// <summary>
@@ -5266,15 +5443,12 @@ namespace FX.UI.WinForms
         #region === Forward Rate/Points: tvåvägsvisning (bid / ask) ===
 
         /// <summary>
-        /// Visar tvåvägs Forward Rate och Forward Points i cellerna för ett ben.
-        /// - Om cellen är pinnad (användartext) visas pinnad text oförändrad.
-        /// - Om Points finns (och cellen inte är pinnad) räknas Rate från UI-Spot som den visas:
-        ///     Full (two-way):  Rate_bid = Spot_bid_ui + P_bid, Rate_ask = Spot_ask_ui + P_ask
-        ///     Mid:             Rate_mid används för båda sidorna (Spot_mid_ui + P_side)
-        ///   där Spot_ui först kvantiseras till antalet decimals som faktiskt visas i Spot-raden.
-        /// - Rate-decimals: max(spotDp + 1, 5, userRateDp, 4 + userPointsDp)
-        /// - Points i pips (×10 000) med minst 1 d.p. (eller fler om användaren skrev fler).
-        /// - Om både ptsBid och ptsAsk är ~0 → rendera tomt i Points (undvik "0 / 0" vid init).
+        /// Visar Forward (two-way) för ett ben och respekterar pinning, DP-policy och valt läge.
+        /// Nytt/fix:
+        /// - I FULL/NET forceras alltid "v / v" i både Rate och Points (som tidigare).
+        /// - I MID kollapsas alltid pair-visning till singel (aritmetiskt medel) innan vi skriver till cellerna,
+        ///   även när pinnen råkar vara "v / v". Detta eliminerar "v / v" som läcker kvar i MID utan extra omskrivning.
+        /// - Syskonfält härleds numeriskt från UI-spot per sida (som tidigare), med DP enligt användarens preferens/historik.
         /// </summary>
         public void ShowForwardTwoWayById(Guid legId, double? fwdBid, double? fwdAsk, double? ptsBid, double? ptsAsk)
         {
@@ -5283,106 +5457,391 @@ namespace FX.UI.WinForms
 
             int rRate = FindRow(L.FwdRate);
             int rPts = FindRow(L.FwdPts);
-            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            if (rRate < 0 && rPts < 0) return;
 
-            // ---- Rates (two-way) ----
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            int modeIdx = GetForwardMode();                  // 0=Mid, 1=Full, 2=Net
+            bool forcePair = (modeIdx == 1 || modeIdx == 2);   // FULL/NET
+
+            // UI-spot (för syskon-derivering)
+            int spotDp = GetSpotUiDecimalsForColumn(col);
+            double? sBidUi = GetSpotUiRoundedSideForColumn(col, isBid: true, spotDp: spotDp);
+            double? sAskUi = GetSpotUiRoundedSideForColumn(col, isBid: false, spotDp: spotDp);
+            double? sMidUi = (sBidUi.HasValue && sAskUi.HasValue) ? 0.5 * (sBidUi.Value + sAskUi.Value) : (sBidUi ?? sAskUi);
+
+            // Användarens dp-historik
+            int userRateDp = GetUserRateDp(legId);
+            int userPointsDp = GetUserPointsDp(legId);
+
+            // Miniminivåer för engine/visning + user-aware
+            int rateDpEngineMin = Math.Max(spotDp + 1, 5);
+            int ptsDpEngineMin = 1;
+            int rateDpUserAware = Math.Max(rateDpEngineMin, userRateDp);
+            int ptsDpUserAware = Math.Max(ptsDpEngineMin, userPointsDp);
+
+            // ===== Rate =====
             if (rRate >= 0)
             {
-                var c = _dgv.Rows[rRate].Cells[col];
-                var pinned = GetPinnedTextOrNull(c);
-                if (pinned != null)
+                var cRate = _dgv.Rows[rRate].Cells[col];
+                var pinnedRate = GetPinnedTextOrNull(cRate);
+                var pinnedPts = (rPts >= 0) ? GetPinnedTextOrNull(_dgv.Rows[rPts].Cells[col]) : null;
+
+                if (!string.IsNullOrWhiteSpace(pinnedRate))
                 {
-                    c.Value = pinned;
-                    SetPrevText(c, pinned);
-                }
-                else
-                {
-                    // Läs användarpreferenser för decimals
-                    int userRateDp = GetUserRateDp(legId);
-                    int userPtsDp = GetUserPointsDp(legId);
+                    string rr = NormalizeForwardDisplayText(pinnedRate);
+                    int slashIx = rr.IndexOf('/');
 
-                    // Läs hur Spot faktiskt visas i UI (antal decimals) och hämta quantiserad spot per sida
-                    int spotDp = GetSpotUiDecimalsForColumn(col);
-                    var sBidUi = GetSpotUiRoundedSideForColumn(col, isBid: true, spotDp: spotDp);
-                    var sAskUi = GetSpotUiRoundedSideForColumn(col, isBid: false, spotDp: spotDp);
-
-                    // Rate-decimals enligt policy
-                    int rateDp = Math.Max(
-                        Math.Max(spotDp + 1, 5),
-                        Math.Max(userRateDp, 4 + Math.Max(1, userPtsDp))
-                    );
-
-                    string txt;
-                    bool havePts = ptsBid.HasValue && ptsAsk.HasValue &&
-                                   (Math.Abs(ptsBid.Value) > 1e-12 || Math.Abs(ptsAsk.Value) > 1e-12);
-
-                    if (havePts && sBidUi.HasValue && sAskUi.HasValue)
+                    if (modeIdx == 0 && slashIx >= 0) // MID: kollapsa pair -> singel
                     {
-                        // Räkna Rate från UI-Spot (som visas) + Points (rate-enhet)
+                        var parts = rr.Split('/');
                         double rb, ra;
-                        if (_spotMode == SpotMode.Full || _spotMode == SpotMode.Live)
+                        if (parts.Length == 2 &&
+                            double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out rb) &&
+                            double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out ra))
                         {
-                            rb = sBidUi.Value + ptsBid.Value;
-                            ra = sAskUi.Value + ptsAsk.Value;
+                            double mid = 0.5 * (rb + ra);
+                            string txt = mid.ToString("F" + rateDpUserAware, ci);
+                            cRate.Value = txt; SetPrevText(cRate, txt);
                         }
                         else
                         {
-                            // MID-visning: använd mid-spot för båda sidorna
-                            // (GetSpotUiRoundedSideForColumn ger mid när inte Full/Live)
-                            rb = sBidUi.Value + ptsBid.Value;
-                            ra = sAskUi.Value + ptsAsk.Value;
+                            // fallback: behåll som singel-formaterad text
+                            string txt = ApplyForwardDpForDisplay(ForwardTargetType.Rate, rr, spotDp, fromUser: true);
+                            cRate.Value = txt; SetPrevText(cRate, txt);
                         }
-
-                        // Monotoni & formatering
-                        if (rb > ra) { var t = rb; rb = ra; ra = t; }
-                        txt = $"{rb.ToString("F" + rateDp, ci)} / {ra.ToString("F" + rateDp, ci)}";
-                    }
-                    else if (fwdBid.HasValue && fwdAsk.HasValue)
-                    {
-                        // Fallback: använd forward-rate från presentern
-                        txt = $"{fwdBid.Value.ToString("F" + Math.Max(5, userRateDp), ci)} / {fwdAsk.Value.ToString("F" + Math.Max(5, userRateDp), ci)}";
                     }
                     else
                     {
-                        txt = "";
+                        // FULL/NET → ev. forcering till "v / v"; MID → lämna som är (singel/pair)
+                        if (forcePair) rr = ForceTwoWayVisualIfFullNet(rr); // behåller "v / v" i FULL/NET
+                        string txt = ApplyForwardDpForDisplay(ForwardTargetType.Rate, rr, spotDp, fromUser: true);
+                        cRate.Value = txt; SetPrevText(cRate, txt);
                     }
-
-                    c.Value = txt;
-                    SetPrevText(c, txt);
                 }
-            }
-
-            // ---- Points (two-way) ----
-            if (rPts >= 0)
-            {
-                var c = _dgv.Rows[rPts].Cells[col];
-                var pinned = GetPinnedTextOrNull(c);
-                if (pinned != null)
+                else if (!string.IsNullOrWhiteSpace(pinnedPts))
                 {
-                    c.Value = pinned;
-                    SetPrevText(c, pinned);
+                    // Härled Rate från Points-pin
+                    string pp = NormalizeForwardDisplayText(pinnedPts);
+                    int slashIx = pp.IndexOf('/');
+                    if (modeIdx == 0) // MID: kollapsa
+                    {
+                        // r = s_mid + pips/10000; pair -> medel
+                        double pMid;
+                        if (slashIx >= 0)
+                        {
+                            var parts = pp.Split('/');
+                            double pb, pa;
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out pb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out pa))
+                            {
+                                if (sBidUi.HasValue && sAskUi.HasValue)
+                                {
+                                    double rb = sBidUi.Value + pb / 10000.0;
+                                    double ra = sAskUi.Value + pa / 10000.0;
+                                    pMid = 0.5 * (rb + ra);
+                                }
+                                else
+                                {
+                                    double p = 0.5 * (pb + pa);
+                                    pMid = (sMidUi ?? 0.0) + p / 10000.0;
+                                }
+                            }
+                            else
+                            {
+                                // ogiltig pair → försök singel
+                                double p;
+                                if (!double.TryParse(pp, System.Globalization.NumberStyles.Float, ci, out p)) p = 0.0;
+                                pMid = (sMidUi ?? 0.0) + p / 10000.0;
+                            }
+                        }
+                        else
+                        {
+                            double p;
+                            if (!double.TryParse(pp, System.Globalization.NumberStyles.Float, ci, out p)) p = 0.0;
+                            pMid = (sMidUi ?? 0.0) + p / 10000.0;
+                        }
+                        string txt = pMid.ToString("F" + rateDpUserAware, ci);
+                        cRate.Value = txt; SetPrevText(cRate, txt);
+                    }
+                    else
+                    {
+                        // FULL/NET: härled sida för sida och visa som "v / v"
+                        string derived = null;
+                        if (slashIx < 0)
+                        {
+                            if (sBidUi.HasValue && sAskUi.HasValue && double.TryParse(pp, System.Globalization.NumberStyles.Float, ci, out var p))
+                            {
+                                double rb = sBidUi.Value + p / 10000.0;
+                                double ra = sAskUi.Value + p / 10000.0;
+                                derived = rb.ToString("F" + rateDpUserAware, ci) + " / " + ra.ToString("F" + rateDpUserAware, ci);
+                            }
+                            else if (sMidUi.HasValue && double.TryParse(pp, System.Globalization.NumberStyles.Float, ci, out var pm))
+                            {
+                                double r = sMidUi.Value + pm / 10000.0;
+                                derived = r.ToString("F" + rateDpUserAware, ci);
+                            }
+                        }
+                        else
+                        {
+                            var parts = pp.Split('/');
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var pb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var pa))
+                            {
+                                if (sBidUi.HasValue && sAskUi.HasValue)
+                                {
+                                    double rb = sBidUi.Value + pb / 10000.0;
+                                    double ra = sAskUi.Value + pa / 10000.0;
+                                    derived = rb.ToString("F" + rateDpUserAware, ci) + " / " + ra.ToString("F" + rateDpUserAware, ci);
+                                }
+                                else if (sMidUi.HasValue)
+                                {
+                                    double r = sMidUi.Value + 0.5 * (pb + pa) / 10000.0;
+                                    derived = r.ToString("F" + rateDpUserAware, ci);
+                                }
+                            }
+                        }
+
+                        string txt = derived ?? "";
+                        if (forcePair) txt = ForceTwoWayVisualIfFullNet(txt);
+                        txt = ApplyForwardDpForDisplay(ForwardTargetType.Rate, txt, spotDp, fromUser: !string.IsNullOrEmpty(derived));
+                        cRate.Value = txt; SetPrevText(cRate, txt);
+                    }
                 }
                 else
                 {
-                    int userPtsDp = GetUserPointsDp(legId);
-                    int ptsDp = Math.Max(1, userPtsDp);
-
+                    // Engine fallback
                     string txt = "";
-                    if (ptsBid.HasValue && ptsAsk.HasValue)
+                    if (modeIdx == 0)
                     {
-                        double b = ptsBid.Value * 10000.0;
-                        double a = ptsAsk.Value * 10000.0;
-
-                        // Undvik "0 / 0" vid init – visa tomt om båda är ~0
-                        if (Math.Abs(b) > 1e-9 || Math.Abs(a) > 1e-9)
-                            txt = $"{b.ToString("F" + ptsDp, ci)} / {a.ToString("F" + ptsDp, ci)}";
+                        // MID: visa singel (mid av tvåväg)
+                        if (fwdBid.HasValue && fwdAsk.HasValue)
+                            txt = (0.5 * (fwdBid.Value + fwdAsk.Value)).ToString("F" + rateDpEngineMin, ci);
+                        else if (fwdBid.HasValue) txt = fwdBid.Value.ToString("F" + rateDpEngineMin, ci);
+                        else if (fwdAsk.HasValue) txt = fwdAsk.Value.ToString("F" + rateDpEngineMin, ci);
                     }
-                    c.Value = txt;
-                    SetPrevText(c, txt);
+                    else
+                    {
+                        // FULL/NET: visa "v / v"
+                        if (fwdBid.HasValue && fwdAsk.HasValue)
+                            txt = fwdBid.Value.ToString("F" + rateDpEngineMin, ci) + " / " + fwdAsk.Value.ToString("F" + rateDpEngineMin, ci);
+                        else if (fwdBid.HasValue)
+                            txt = fwdBid.Value.ToString("F" + rateDpEngineMin, ci);
+                        else if (fwdAsk.HasValue)
+                            txt = fwdAsk.Value.ToString("F" + rateDpEngineMin, ci);
+                    }
+                    if (forcePair) txt = ForceTwoWayVisualIfFullNet(txt);
+                    txt = ApplyForwardDpForDisplay(ForwardTargetType.Rate, txt, spotDp, fromUser: false);
+                    cRate.Value = txt; SetPrevText(cRate, txt);
+                }
+            }
+
+            // ===== Points =====
+            if (rPts >= 0)
+            {
+                var cPts = _dgv.Rows[rPts].Cells[col];
+                var pinnedPts = GetPinnedTextOrNull(cPts);
+                var pinnedRate = (rRate >= 0) ? GetPinnedTextOrNull(_dgv.Rows[rRate].Cells[col]) : null;
+
+                if (!string.IsNullOrWhiteSpace(pinnedPts))
+                {
+                    string pp = NormalizeForwardDisplayText(pinnedPts);
+                    int slashIx = pp.IndexOf('/');
+
+                    if (modeIdx == 0 && slashIx >= 0) // MID: pair → singel (medel pips)
+                    {
+                        var parts = pp.Split('/');
+                        double pb, pa;
+                        if (parts.Length == 2 &&
+                            double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out pb) &&
+                            double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out pa))
+                        {
+                            double p = 0.5 * (pb + pa);
+                            string txt = p.ToString("F" + ptsDpUserAware, ci);
+                            cPts.Value = txt; SetPrevText(cPts, txt);
+                        }
+                        else
+                        {
+                            string txt = ApplyForwardDpForDisplay(ForwardTargetType.Points, pp, spotDp, fromUser: true);
+                            cPts.Value = txt; SetPrevText(cPts, txt);
+                        }
+                    }
+                    else
+                    {
+                        if (forcePair) pp = ForceTwoWayVisualIfFullNet(pp);
+                        string txt = ApplyForwardDpForDisplay(ForwardTargetType.Points, pp, spotDp, fromUser: true);
+                        cPts.Value = txt; SetPrevText(cPts, txt);
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(pinnedRate))
+                {
+                    // Härled Points från Rate-pin
+                    string rr = NormalizeForwardDisplayText(pinnedRate);
+                    int slashIx = rr.IndexOf('/');
+
+                    if (modeIdx == 0) // MID: kollapsa
+                    {
+                        double pMid;
+                        if (slashIx >= 0)
+                        {
+                            var parts = rr.Split('/');
+                            double rb, ra;
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out rb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out ra))
+                            {
+                                if (sBidUi.HasValue && sAskUi.HasValue)
+                                {
+                                    double pb = (rb - sBidUi.Value) * 10000.0;
+                                    double pa = (ra - sAskUi.Value) * 10000.0;
+                                    pMid = 0.5 * (pb + pa);
+                                }
+                                else
+                                {
+                                    double r = 0.5 * (rb + ra);
+                                    pMid = ((sMidUi ?? 0.0) == 0.0) ? 0.0 : (r - (sMidUi ?? 0.0)) * 10000.0;
+                                }
+                            }
+                            else
+                            {
+                                // ogiltig pair → försök singel
+                                double r;
+                                if (!double.TryParse(rr, System.Globalization.NumberStyles.Float, ci, out r)) r = 0.0;
+                                pMid = (sMidUi.HasValue ? (r - sMidUi.Value) * 10000.0 : 0.0);
+                            }
+                        }
+                        else
+                        {
+                            double r;
+                            if (!double.TryParse(rr, System.Globalization.NumberStyles.Float, ci, out r)) r = 0.0;
+                            pMid = (sMidUi.HasValue ? (r - sMidUi.Value) * 10000.0 : 0.0);
+                        }
+                        string txt = pMid.ToString("F" + ptsDpUserAware, ci);
+                        cPts.Value = txt; SetPrevText(cPts, txt);
+                    }
+                    else
+                    {
+                        // FULL/NET: härled sida för sida
+                        string derived = null;
+                        if (slashIx < 0)
+                        {
+                            if (sBidUi.HasValue && sAskUi.HasValue && double.TryParse(rr, System.Globalization.NumberStyles.Float, ci, out var r))
+                            {
+                                double pb = (r - sBidUi.Value) * 10000.0;
+                                double pa = (r - sAskUi.Value) * 10000.0;
+                                derived = pb.ToString("F" + ptsDpUserAware, ci) + " / " + pa.ToString("F" + ptsDpUserAware, ci);
+                            }
+                            else if (sMidUi.HasValue && double.TryParse(rr, System.Globalization.NumberStyles.Float, ci, out var rm))
+                            {
+                                double p = (rm - sMidUi.Value) * 10000.0;
+                                derived = p.ToString("F" + ptsDpUserAware, ci);
+                            }
+                        }
+                        else
+                        {
+                            var parts = rr.Split('/');
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var rb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var ra))
+                            {
+                                if (sBidUi.HasValue && sAskUi.HasValue)
+                                {
+                                    double pb = (rb - sBidUi.Value) * 10000.0;
+                                    double pa = (ra - sAskUi.Value) * 10000.0;
+                                    derived = pb.ToString("F" + ptsDpUserAware, ci) + " / " + pa.ToString("F" + ptsDpUserAware, ci);
+                                }
+                                else if (sMidUi.HasValue)
+                                {
+                                    double p = (0.5 * (rb + ra) - sMidUi.Value) * 10000.0;
+                                    derived = p.ToString("F" + ptsDpUserAware, ci);
+                                }
+                            }
+                        }
+
+                        string txt = derived ?? "";
+                        if (forcePair) txt = ForceTwoWayVisualIfFullNet(txt);
+                        txt = ApplyForwardDpForDisplay(ForwardTargetType.Points, txt, spotDp, fromUser: !string.IsNullOrEmpty(derived));
+                        cPts.Value = txt; SetPrevText(cPts, txt);
+                    }
+                }
+                else
+                {
+                    // Engine fallback
+                    string txt = "";
+                    if (modeIdx == 0)
+                    {
+                        // MID: singel pips mot s_mid
+                        if (ptsBid.HasValue && ptsAsk.HasValue)
+                            txt = (0.5 * (ptsBid.Value + ptsAsk.Value) * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                        else if (ptsBid.HasValue) txt = (ptsBid.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                        else if (ptsAsk.HasValue) txt = (ptsAsk.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                    }
+                    else
+                    {
+                        // FULL/NET: "v / v"
+                        if (ptsBid.HasValue && ptsAsk.HasValue)
+                            txt = (ptsBid.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci) + " / " +
+                                  (ptsAsk.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                        else if (ptsBid.HasValue)
+                            txt = (ptsBid.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                        else if (ptsAsk.HasValue)
+                            txt = (ptsAsk.Value * 10000.0).ToString("F" + ptsDpEngineMin, ci);
+                    }
+                    if (forcePair) txt = ForceTwoWayVisualIfFullNet(txt);
+                    txt = ApplyForwardDpForDisplay(ForwardTargetType.Points, txt, spotDp, fromUser: false);
+                    cPts.Value = txt; SetPrevText(cPts, txt);
+                }
+            }
+
+            // === Slutlig enforcement: i FULL/NET säkerställ "v / v" om någon cell råkade vara singel ===
+            if (forcePair)
+            {
+                if (rRate >= 0)
+                {
+                    var cR = _dgv.Rows[rRate].Cells[col];
+                    var sR = Convert.ToString(cR.Value ?? string.Empty);
+                    if (!string.IsNullOrWhiteSpace(sR) && sR.IndexOf('/') < 0)
+                    {
+                        sR = ForceTwoWayVisualIfFullNet(sR);
+                        sR = ApplyForwardDpForDisplay(ForwardTargetType.Rate, sR, spotDp, fromUser: false);
+                        cR.Value = sR; SetPrevText(cR, sR);
+                    }
+                }
+                if (rPts >= 0)
+                {
+                    var cP = _dgv.Rows[rPts].Cells[col];
+                    var sP = Convert.ToString(cP.Value ?? string.Empty);
+                    if (!string.IsNullOrWhiteSpace(sP) && sP.IndexOf('/') < 0)
+                    {
+                        sP = ForceTwoWayVisualIfFullNet(sP);
+                        sP = ApplyForwardDpForDisplay(ForwardTargetType.Points, sP, spotDp, fromUser: false);
+                        cP.Value = sP; SetPrevText(cP, sP);
+                    }
                 }
             }
         }
 
+        /// <summary>
+        /// Om läget är FULL/NET och texten saknar "/", forcerar vi two-way-visning som "value / value".
+        /// I MID lämnas texten orörd. Normaliserar även whitespace runt "/".
+        /// </summary>
+        private string ForceTwoWayVisualIfFullNet(string text)
+        {
+            int modeIdx = GetForwardMode(); // 0=Mid, 1=Full, 2=Net
+            string norm = NormalizeForwardDisplayText(text ?? string.Empty);
+            if (string.IsNullOrEmpty(norm)) return norm;
+
+            if (modeIdx == 1 || modeIdx == 2) // FULL eller NET
+            {
+                if (norm.IndexOf('/') < 0)
+                    return norm + " / " + norm;
+                return norm; // redan pair - behåll
+            }
+
+            // MID
+            return norm;
+        }
 
         /// <summary>
         /// Returnerar hur många decimaler Spot visas med i UI för en given kolumn.
@@ -5392,10 +5851,10 @@ namespace FX.UI.WinForms
         private int GetSpotUiDecimalsForColumn(string col)
         {
             int rSpot = FindRow(L.Spot);
-            if (rSpot < 0 || !_dgv.Columns.Contains(col)) return 4;
+            if (rSpot < 0 || !_dgv.Columns.Contains(col)) return 5;
 
             string s = Convert.ToString(_dgv.Rows[rSpot].Cells[col].Value ?? "").Trim();
-            if (string.IsNullOrEmpty(s)) return 4;
+            if (string.IsNullOrEmpty(s)) return 5;
 
             int MaxDp(string t)
             {
@@ -5442,6 +5901,289 @@ namespace FX.UI.WinForms
         #endregion
 
         #region === Forward target (parsing & raise) ===
+
+        /// <summary>
+        /// Sparar manuell DP-preferens efter user input. Regler:
+        /// - Vid input i Points: PointsDp = max(1, pointsDpInput); RateDp = max(5, 4 + PointsDp)
+        /// - Vid input i Rate  : RateDp = max(5, rateDpInput);     PointsDp = max(1, RateDp - spotDp)
+        /// - ManualActive = true tills forced refresh.
+        /// </summary>
+        private void SaveForwardManualDpFromInput(System.Guid legId, ForwardTargetType editedType, int inputDp, int spotDp)
+        {
+            // OBS: använd alltid NAMNGIVEN tupletyp (PointsDp, RateDp, ManualActive) så att .PointsDp/.RateDp fungerar.
+            (int? PointsDp, int? RateDp, bool ManualActive) rec;
+
+            if (!_forwardDpPref.TryGetValue(legId, out rec))
+                rec = (PointsDp: (int?)null, RateDp: (int?)null, ManualActive: false);
+
+            if (editedType == ForwardTargetType.Points)
+            {
+                int pointsDp = System.Math.Max(1, inputDp);
+                int rateDp = System.Math.Max(5, 4 + pointsDp);
+                rec.PointsDp = pointsDp;
+                rec.RateDp = rateDp;
+                rec.ManualActive = true;
+            }
+            else // editedType == Rate
+            {
+                int rateDp = System.Math.Max(5, inputDp);
+                int pointsDp = System.Math.Max(1, rateDp - System.Math.Max(0, spotDp));
+                rec.PointsDp = pointsDp;
+                rec.RateDp = rateDp;
+                rec.ManualActive = true;
+            }
+
+            _forwardDpPref[legId] = rec;
+        }
+
+        /// <summary>
+        /// Nollställer dp-regler för Forward-visning till default efter en forced refresh (F7).
+        /// Nytt: Förutom att rensa den interna preferensmappen (_forwardDpPref)
+        /// rensas även användarens dp-historik i cell.Tag (segmenten "DPP:" och "DPR:")
+        /// för alla legs på raderna Forward Rate och Forward Points.
+        /// Detta säkerställer att MID inte återanvänder gamla dp-värden efter F7.
+        /// </summary>
+        public void ResetForwardDpToDefaults()
+        {
+            // Töm in-memory-preferenser
+            _forwardDpPref.Clear();
+
+            // Rensa även dp-segment i Tag på Forward-cellerna (orsaken till "hängande" dp efter F7)
+            int rRate = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+
+            if (rRate >= 0 || rPts >= 0)
+            {
+                foreach (var leg in _legs)
+                {
+                    if (rRate >= 0)
+                    {
+                        var cRate = _dgv.Rows[rRate].Cells[leg];
+                        // Ta bort användarens Rate-dp (DPR) ur Tag
+                        WriteOrRemoveTagSegment(cRate, "\u0005DPR:", null);
+                    }
+                    if (rPts >= 0)
+                    {
+                        var cPts = _dgv.Rows[rPts].Cells[leg];
+                        // Ta bort användarens Points-dp (DPP) ur Tag
+                        WriteOrRemoveTagSegment(cPts, "\u0004DPP:", null);
+                    }
+                }
+
+                // Lätt invalidation av de berörda raderna så UI repaintrar snyggt
+                if (rRate >= 0) _dgv.InvalidateRow(rRate);
+                if (rPts >= 0) _dgv.InvalidateRow(rPts);
+            }
+            else
+            {
+                // Fallback: invalidation av hela gridden om raderna inte skulle hittas
+                _dgv.Invalidate();
+            }
+        }
+
+        /// <summary>
+        /// Transformerar pinnad visning när Forward-läge byts (MID ↔ FULL/NET) utan att röra Store.
+        /// Regler:
+        /// - FULL/NET: singel → "v / v" (samma värde på båda sidor) med dp enligt källfältet.
+        ///   * Om POINTS är pinnad: pointsDp = max(1, dpIn); rateDp = max(5, 4 + pointsDp).
+        ///   * Om RATE   är pinnad: rateDp   = max(5, dpIn); pointsDp = max(1, rateDp - spotDp).
+        /// - MID: pair → singel = aritmetiskt medel, dp enligt samma regler.
+        /// - Inga spök-overrides: endast UI-text formateras.
+        /// </summary>
+        public void TransformPinnedForwardDisplayForMode(int modeIdx)
+        {
+            // Iterera alla kolumner/ben
+            int rRate = FindRow(L.FwdRate);
+            int rPts = FindRow(L.FwdPts);
+            if (rRate < 0 && rPts < 0) return;
+
+            foreach (var lg in _legs)
+            {
+                var col = TryGetLabel(TryGetLegIdByColumnName(lg));
+                if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) continue;
+
+                var ci = CultureInfo.InvariantCulture;
+                int spotDp = GetSpotUiDecimalsForColumn(col);
+
+                var cRate = (rRate >= 0) ? _dgv.Rows[rRate].Cells[col] : null;
+                var cPts = (rPts >= 0) ? _dgv.Rows[rPts].Cells[col] : null;
+                string pinRate = (cRate != null) ? GetPinnedTextOrNull(cRate) : null;
+                string pinPts = (cPts != null) ? GetPinnedTextOrNull(cPts) : null;
+
+                // Bestäm dp-regler från vilken pin som finns
+                int rateDp, pointsDp;
+                if (!string.IsNullOrWhiteSpace(pinPts))
+                {
+                    var t = NormalizeForwardDisplayText(pinPts);
+                    int dpIn = (t.IndexOf('/') >= 0)
+                        ? Math.Max(DecimalsOfNumber(t.Split('/')[0]), DecimalsOfNumber(t.Split('/').Length > 1 ? t.Split('/')[1] : ""))
+                        : DecimalsOfNumber(t);
+                    pointsDp = Math.Max(1, dpIn);
+                    rateDp = Math.Max(5, 4 + pointsDp);
+                }
+                else if (!string.IsNullOrWhiteSpace(pinRate))
+                {
+                    var t = NormalizeForwardDisplayText(pinRate);
+                    int dpIn = (t.IndexOf('/') >= 0)
+                        ? Math.Max(DecimalsOfNumber(t.Split('/')[0]), DecimalsOfNumber(t.Split('/').Length > 1 ? t.Split('/')[1] : ""))
+                        : DecimalsOfNumber(t);
+                    rateDp = Math.Max(5, dpIn);
+                    pointsDp = Math.Max(1, rateDp - spotDp);
+                }
+                else
+                {
+                    rateDp = Math.Max(spotDp + 1, 5);
+                    pointsDp = 1;
+                }
+
+                // Rendera enligt nytt läge
+                bool toPair = (modeIdx == 1 || modeIdx == 2); // FULL/NET
+                if (toPair)
+                {
+                    if (cRate != null && !string.IsNullOrWhiteSpace(pinRate))
+                    {
+                        var t = NormalizeForwardDisplayText(pinRate);
+                        if (t.IndexOf('/') < 0 && double.TryParse(t, System.Globalization.NumberStyles.Float, ci, out var r))
+                            t = $"{r.ToString("F" + rateDp, ci)} / {r.ToString("F" + rateDp, ci)}";
+                        else if (t.IndexOf('/') >= 0)
+                        {
+                            var parts = t.Split('/');
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var rb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var ra))
+                                t = $"{rb.ToString("F" + rateDp, ci)} / {ra.ToString("F" + rateDp, ci)}";
+                        }
+                        cRate.Value = t; SetPrevText(cRate, t);
+                    }
+                    if (cPts != null && !string.IsNullOrWhiteSpace(pinPts))
+                    {
+                        var t = NormalizeForwardDisplayText(pinPts);
+                        if (t.IndexOf('/') < 0 && double.TryParse(t, System.Globalization.NumberStyles.Float, ci, out var p))
+                            t = $"{p.ToString("F" + pointsDp, ci)} / {p.ToString("F" + pointsDp, ci)}";
+                        else if (t.IndexOf('/') >= 0)
+                        {
+                            var parts = t.Split('/');
+                            if (parts.Length == 2 &&
+                                double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var pb) &&
+                                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var pa))
+                                t = $"{pb.ToString("F" + pointsDp, ci)} / {pa.ToString("F" + pointsDp, ci)}";
+                        }
+                        cPts.Value = t; SetPrevText(cPts, t);
+                    }
+                }
+                else // MID
+                {
+                    if (cRate != null && !string.IsNullOrWhiteSpace(pinRate) && pinRate.IndexOf('/') >= 0)
+                    {
+                        var parts = NormalizeForwardDisplayText(pinRate).Split('/');
+                        if (parts.Length == 2 &&
+                            double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var rb) &&
+                            double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var ra))
+                        {
+                            var m = 0.5 * (rb + ra);
+                            var t = m.ToString("F" + rateDp, ci);
+                            cRate.Value = t; SetPrevText(cRate, t);
+                        }
+                    }
+                    if (cPts != null && !string.IsNullOrWhiteSpace(pinPts) && pinPts.IndexOf('/') >= 0)
+                    {
+                        var parts = NormalizeForwardDisplayText(pinPts).Split('/');
+                        if (parts.Length == 2 &&
+                            double.TryParse(parts[0], System.Globalization.NumberStyles.Float, ci, out var pb) &&
+                            double.TryParse(parts[1], System.Globalization.NumberStyles.Float, ci, out var pa))
+                        {
+                            var m = 0.5 * (pb + pa);
+                            var t = m.ToString("F" + pointsDp, ci);
+                            cPts.Value = t; SetPrevText(cPts, t);
+                        }
+                    }
+                }
+            }
+
+            _dgv.Invalidate();
+        }
+
+        /// <summary>
+        /// Bygger ForwardTargetEditedEventArgs från befintlig PIN på benets Forward-celler,
+        /// efter att visningen redan transformerats för aktuellt mode.
+        /// Prioritet: Points-pin före Rate-pin. Returnerar false om ingen pin finns.
+        /// - Tolkar singel eller "bid / ask".
+        /// - Points: pips (visning) parsas som pips-värden (dvs samma skala som user-input).
+        /// - Rate: parsas i rate-enhet.
+        /// </summary>
+        public bool TryBuildForwardArgsFromPin(Guid legId, int modeIdx, out ForwardTargetEditedEventArgs args)
+        {
+            args = null;
+            var col = TryGetLabel(legId);
+            if (string.IsNullOrWhiteSpace(col) || !_dgv.Columns.Contains(col)) return false;
+
+            int rPts = FindRow(L.FwdPts);
+            int rRate = FindRow(L.FwdRate);
+
+            string pinnedPts = (rPts >= 0) ? GetPinnedTextOrNull(_dgv.Rows[rPts].Cells[col]) : null;
+            string pinnedRate = (rRate >= 0) ? GetPinnedTextOrNull(_dgv.Rows[rRate].Cells[col]) : null;
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+
+            // Hjälpare
+            ForwardTargetEditedEventArgs Build(string text, ForwardTargetType tgt)
+            {
+                string norm = NormalizeForwardDisplayText(text ?? string.Empty);
+                bool isPair = norm.IndexOf('/') >= 0;
+
+                if (isPair)
+                {
+                    var parts = norm.Split('/');
+                    if (parts.Length != 2) return null;
+                    if (!double.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Float, ci, out var b)) return null;
+                    if (!double.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Float, ci, out var a)) return null;
+
+                    return new ForwardTargetEditedEventArgs
+                    {
+                        LegId = legId,
+                        ColumnName = col,
+                        TargetType = tgt,
+                        IsPair = true,
+                        Bid = b,
+                        Ask = a,
+                        Single = null,
+                        RawDisplay = text,
+                        Decimals = Math.Max(DecimalsOfNumber(parts[0]), DecimalsOfNumber(parts[1])),
+                        WasMidStyle = false
+                    };
+                }
+                else
+                {
+                    if (!double.TryParse(norm, System.Globalization.NumberStyles.Float, ci, out var v)) return null;
+                    return new ForwardTargetEditedEventArgs
+                    {
+                        LegId = legId,
+                        ColumnName = col,
+                        TargetType = tgt,
+                        IsPair = false,
+                        Single = v,
+                        Bid = null,
+                        Ask = null,
+                        RawDisplay = text,
+                        Decimals = DecimalsOfNumber(norm),
+                        WasMidStyle = true
+                    };
+                }
+            }
+
+            // Prioritet: Points-pin → Rate-pin
+            if (!string.IsNullOrWhiteSpace(pinnedPts))
+            {
+                args = Build(pinnedPts, ForwardTargetType.Points);
+                return args != null;
+            }
+            if (!string.IsNullOrWhiteSpace(pinnedRate))
+            {
+                args = Build(pinnedRate, ForwardTargetType.Rate);
+                return args != null;
+            }
+            return false;
+        }
 
         /// <summary>
         /// Försöker tolka en Forward-inmatning som singel eller bid/ask-par.
@@ -5521,90 +6263,214 @@ namespace FX.UI.WinForms
         }
 
         /// <summary>
-        /// CellEndEdit för Forward-raderna: parsar användarens input och fire:ar ForwardTargetEdited.
-        /// Ingen autoswitch och ingen solver här (det görs i senare steg).
+        /// Hanterar avslutad editering i Forward-cellerna (Rate/Points).
+        /// Nytt: Beräknar antal decimals i user input och sparar manuell DP-preferens per ben, så att syskonfältet
+        /// och kommande renders följer reglerna (Points ≥ 1 dp; Rate ≥ 5 dp; Rate = 4+PointsDp när input var Points).
+        /// FULL/NET: forcerar alltid "v / v" i visningen. MID: pair avvisas.
         /// </summary>
         private void Dgv_CellEndEdit_ForwardTarget(object sender, DataGridViewCellEventArgs e)
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            if (!_dgv.Columns.Contains("FIELD")) return;
 
-            var rowLabel = Convert.ToString(_dgv.Rows[e.RowIndex].Cells["FIELD"].Value ?? string.Empty);
-            if (string.IsNullOrWhiteSpace(rowLabel)) return;
-
-            // Endast Forward Points / Forward Rate
             int rPts = FindRow(L.FwdPts);
             int rRate = FindRow(L.FwdRate);
-            var isPtsRow = (e.RowIndex == rPts);
-            var isRateRow = (e.RowIndex == rRate);
+            bool isPtsRow = (e.RowIndex == rPts);
+            bool isRateRow = (e.RowIndex == rRate);
             if (!isPtsRow && !isRateRow) return;
 
-            var colName = _dgv.Columns[e.ColumnIndex].Name;
-            if (colName == "Deal" || colName == "FIELD") return; // inte deal/fält-kolumner
-
+            string colName = _dgv.Columns[e.ColumnIndex].Name;
             var cell = _dgv.Rows[e.RowIndex].Cells[e.ColumnIndex];
-            var raw = Convert.ToString(cell.Value ?? string.Empty);
+            string raw = System.Convert.ToString(cell.Value ?? string.Empty);
 
-            bool ok = TryParseForwardTargetInput(raw, out var isPair, out var single, out var bid, out var ask, out var decs);
-            if (!ok)
+            // Parse input (single eller pair) – befintlig parser
+            bool isPair;
+            double? single, bid, ask; int decs;
+            if (!TryParseForwardTargetInput(raw, out isPair, out single, out bid, out ask, out decs))
             {
-                // Låt bli att fire:a event vid ogiltig input (tooltip/felhantering kan tillkomma senare steg)
+                var prev = GetPrevTextOrEmpty(cell);
+                ClearPinnedText(cell);
+                cell.Value = prev;
+                _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
                 return;
             }
 
-            var args = new ForwardTargetEditedEventArgs
+            int modeIdx = GetForwardMode(); // 0=Mid, 1=Full, 2=Net
+            if (modeIdx == 0 && isPair)
             {
-                LegId = TryGetLegIdByColumnName(colName),
-                ColumnName = colName,
-                TargetType = isPtsRow ? ForwardTargetType.Points : ForwardTargetType.Rate,
-                IsPair = isPair,
-                Single = isPair ? (double?)null : single,
-                Bid = isPair ? bid : (double?)null,
-                Ask = isPair ? ask : (double?)null,
-                RawDisplay = raw,       // bevara exakt display (ingen studs)
-                Decimals = decs,
-                WasMidStyle = !isPair
-            };
+                // MID: pair-input tillåts ej
+                var prev = GetPrevTextOrEmpty(cell);
+                ClearPinnedText(cell);
+                cell.Value = prev;
+                _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
+                return;
+            }
 
-            var h = ForwardTargetEdited;
-            if (h != null) h(this, args);
+            var targetType = isPtsRow ? ForwardTargetType.Points : ForwardTargetType.Rate;
+
+            // ---- DP-preferens från user input ----
+            // Räkna “input dp” för det fält som redigerats:
+            //  - Points: max dp över båda sidor om pair, annars dp i single. Minst 1.
+            //  - Rate  : dp i input (pair → max över sidor). Minst 5 appliceras senare i Save*.
+            int inputDp;
+            if (isPair && raw.IndexOf('/') >= 0)
+            {
+                var ci = System.Globalization.CultureInfo.InvariantCulture;
+                var parts = raw.Split('/');
+                int d1 = DecimalsOfNumber(parts[0]);
+                int d2 = (parts.Length > 1 ? DecimalsOfNumber(parts[1]) : 0);
+                inputDp = System.Math.Max(d1, d2);
+            }
+            else
+            {
+                inputDp = DecimalsOfNumber(raw);
+            }
+            if (targetType == ForwardTargetType.Points)
+                inputDp = System.Math.Max(1, inputDp); // Points ≥ 1 dp
+
+            // Spara preferensen på benet
+            var legId = TryGetLegIdByColumnName(colName);
+            int spotDp = GetSpotUiDecimalsForColumn(colName);
+            if (legId != System.Guid.Empty)
+                SaveForwardManualDpFromInput(legId, targetType, inputDp, spotDp);
+
+            // ----- Befintlig visnings- och pin-logik (kortfattat) -----
+            bool forcePairVisual = (modeIdx == 1 || modeIdx == 2); // FULL/NET
+            string displayRaw = raw;
+            if (forcePairVisual) displayRaw = ForceTwoWayVisualIfFullNet(displayRaw);
+            string formatted = ApplyForwardDpForDisplay(targetType, displayRaw, spotDp, fromUser: true);
+
+            // Deal-kolumn → broadcast (oförändrat)
+            if (string.Equals(colName, "Deal", System.StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var lg in _legs)
+                {
+                    var id = TryGetLegIdByColumnName(lg);
+                    if (id == System.Guid.Empty) continue;
+
+                    PinForwardDisplay(id, targetType, formatted);
+
+                    // Tvåvägs visning nu direkt
+                    ShowForwardTwoWayById(id, null, null, null, null);
+
+                    var argsLeg = new ForwardTargetEditedEventArgs
+                    {
+                        LegId = id,
+                        ColumnName = lg,
+                        TargetType = targetType,
+                        IsPair = isPair,
+                        Single = single,
+                        Bid = bid,
+                        Ask = ask,
+                        RawDisplay = raw,
+                        Decimals = inputDp,
+                        WasMidStyle = !isPair
+                    };
+                    ForwardTargetEdited?.Invoke(this, argsLeg);
+                }
+
+                ClearPinnedText(cell);
+                SetPrevText(cell, string.Empty);
+                cell.Value = string.Empty;
+                _dgv.InvalidateRow(e.RowIndex);
+                return;
+            }
+
+            // Ben-kolumn → pin + raise
+            if (legId != System.Guid.Empty)
+            {
+                PinForwardDisplay(legId, targetType, formatted);
+
+                // Syskonfält + “v / v” renderas direkt
+                ShowForwardTwoWayById(legId, null, null, null, null);
+
+                var args = new ForwardTargetEditedEventArgs
+                {
+                    LegId = legId,
+                    ColumnName = colName,
+                    TargetType = targetType,
+                    IsPair = isPair,
+                    Single = single,
+                    Bid = bid,
+                    Ask = ask,
+                    RawDisplay = raw,
+                    Decimals = inputDp,
+                    WasMidStyle = !isPair
+                };
+                ForwardTargetEdited?.Invoke(this, args);
+            }
+
+            _dgv.InvalidateCell(e.ColumnIndex, e.RowIndex);
         }
 
         /// <summary>
-        /// Returnerar true om någon Forward-cell (Rate eller Points) är PIN-låst
-        /// i någon synlig kolumn. Robust för både MID (singel) och FULL (bid/ask).
+        /// Formaterar en forward-text (single eller "bid / ask") enligt DP-policy och spot-dp.
+        /// Nytt: parametern <paramref name="fromUser"/> styr om vi ska beakta användarens decimals
+        /// eller klampa till minimi-dp för engine-värden.
+        /// - Points (fromUser=true): dp = max(1, userDp)
+        /// - Points (fromUser=false): dp = 1
+        /// - Rate   (fromUser=true): dp = max(max(spotDp+1, 5), userDp)
+        /// - Rate   (fromUser=false): dp = max(spotDp+1, 5)
+        /// Returnerar normaliserad och formaterad sträng.
         /// </summary>
-        public bool HasAnyForwardPins()
+        private string ApplyForwardDpForDisplay(ForwardTargetType targetType, string text, int spotDp, bool fromUser)
         {
-            int rRate = FindRow(L.FwdRate);
-            int rPts = FindRow(L.FwdPts);
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            string norm = NormalizeForwardDisplayText(text ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(norm)) return string.Empty;
 
-            if (rRate < 0 && rPts < 0) return false;
+            bool isPair = norm.IndexOf('/') >= 0;
 
-            foreach (DataGridViewColumn col in _dgv.Columns)
+            // Hjälpare för att formatta ett tal med dp
+            string Fmt(string token, int dp)
             {
-                if (!col.Visible) continue;
+                if (double.TryParse(token.Trim(), System.Globalization.NumberStyles.Float, ci, out var v))
+                    return v.ToString("F" + dp, ci);
+                return token.Trim();
+            }
 
-                if (rRate >= 0)
+            // userDp = högsta antal decimals i token(s), endast om fromUser=true
+            int UserDpOf(string token) => DecimalsOfNumber(token);
+            int userDp = 0;
+            if (fromUser)
+            {
+                if (isPair)
                 {
-                    var c = _dgv.Rows[rRate].Cells[col.Index];
-                    if (GetPinnedTextOrNull(c) != null)
-                        return true;
+                    var parts = norm.Split('/');
+                    if (parts.Length == 2)
+                        userDp = Math.Max(UserDpOf(parts[0]), UserDpOf(parts[1]));
                 }
-
-                if (rPts >= 0)
+                else
                 {
-                    var c = _dgv.Rows[rPts].Cells[col.Index];
-                    if (GetPinnedTextOrNull(c) != null)
-                        return true;
+                    userDp = UserDpOf(norm);
                 }
             }
-            return false;
+
+            if (targetType == ForwardTargetType.Points)
+            {
+                int dp = fromUser ? Math.Max(1, userDp) : 1;
+                if (isPair)
+                {
+                    var parts = norm.Split('/');
+                    if (parts.Length == 2)
+                        return $"{Fmt(parts[0], dp)} / {Fmt(parts[1], dp)}";
+                }
+                return Fmt(norm, dp);
+            }
+            else
+            {
+                int baseDp = Math.Max(spotDp + 1, 5);
+                int dp = fromUser ? Math.Max(baseDp, userDp) : baseDp;
+                if (isPair)
+                {
+                    var parts = norm.Split('/');
+                    if (parts.Length == 2)
+                        return $"{Fmt(parts[0], dp)} / {Fmt(parts[1], dp)}";
+                }
+                return Fmt(norm, dp);
+            }
         }
 
-
         #endregion
-
 
     }
 

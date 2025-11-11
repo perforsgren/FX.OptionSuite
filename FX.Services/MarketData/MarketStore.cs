@@ -265,32 +265,38 @@ namespace FX.Services.MarketData
         #region RD & RF
 
         /// <summary>
-        /// Skriver RD (domestic rate) från feed för ett visst ben.
-        /// - Kvantiserar till 5 d.p. och normaliserar monotoni.
-        /// - Om fältet saknas skapas det med start-ViewMode baserat på aktuellt ForwardPricingMode:
-        ///   Mid → ViewMode.Mid, Full/Net → ViewMode.TwoWay (NET kräver bid/ask i underliggande).
-        /// - Behåller/ändrar inte Override-läge; markerar stale enligt inparametern och triggar Changed vid behov.
+        /// Skriver rd (domestic rate) från feed för angivet ben.
+        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
+        ///   så att Store:s baseline exakt matchar UI:s precision.
+        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
+        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
         /// </summary>
         public void SetRdFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
+            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---
             const int DEC = 5;
             var vq = new TwoWay<double>(
                 bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
                 ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
             );
+
+            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
             var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
+
             const double EPS = 1e-10;
 
             var cur = MarketSnapshot.TryGet(_current.RdByLeg, legId);
             if (cur == null)
             {
-                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
+                //var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
 
+                //----
+                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
                 var fld = new MarketField<double>(
                     value: tw,
                     source: MarketSource.Feed,
@@ -300,6 +306,7 @@ namespace FX.Services.MarketData
                     version: 0,
                     stale: isStale
                 );
+                //----
 
                 _current.RdByLeg[legId] = fld;
 
@@ -307,45 +314,75 @@ namespace FX.Services.MarketData
                 return;
             }
 
-            var old = cur.Effective;
-            bool changed = Math.Abs(old.Bid - tw.Bid) > EPS || Math.Abs(old.Ask - tw.Ask) > EPS || cur.Source != MarketSource.Feed;
-            if (changed)
-                cur.Replace(tw, MarketSource.Feed, cur.ViewMode, cur.Override, nowUtc);
+            var eff = cur.Effective; // TwoWay<double>
+            bool same;
+            switch (cur.Override)
+            {
+                case OverrideMode.Bid:
+                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Ask:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Mid:
+                case OverrideMode.Both:
+                    // Låst – ingen feedpåverkan
+                    return;
+
+                case OverrideMode.None:
+                default:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
+                    break;
+            }
 
             cur.MarkStale(isStale, nowUtc);
 
-            if (changed || isStale)
-                RaiseChanged("FeedRd:" + legId);
+            RaiseChanged("FeedRd:" + legId);
         }
 
 
         /// <summary>
-        /// Skriver RF (foreign rate) från feed för ett visst ben.
-        /// - Kvantiserar till 5 d.p. och normaliserar monotoni.
-        /// - Om fältet saknas skapas det med start-ViewMode baserat på aktuellt ForwardPricingMode:
-        ///   Mid → ViewMode.Mid, Full/Net → ViewMode.TwoWay (NET kräver bid/ask i underliggande).
-        /// - Behåller/ändrar inte Override-läge; markerar stale enligt inparametern och triggar Changed vid behov.
+        /// Skriver rf (foreign rate) från feed för angivet ben.
+        /// - Kvantiserar bid/ask till 5 d.p. i decimal (≈ 3 d.p. i %) innan normalisering/lagring,
+        ///   så att Store:s baseline exakt matchar UI:s precision.
+        /// - Idempotent mot Effective-värden (ingen ändring/Changed om oförändrat).
+        /// - Respekterar Override-läge. Loggar write om DebugFlags.RatesWrite=true. Triggar Changed (batchas).
         /// </summary>
         public void SetRfFromFeed(string pair6, string legId, TwoWay<double> value, DateTime nowUtc, bool isStale = false)
         {
             if (string.IsNullOrEmpty(legId)) throw new ArgumentNullException(nameof(legId));
             var p6 = (pair6 ?? "EURSEK").Replace("/", "").ToUpperInvariant();
 
+            // --- Kvantisering till UI-precision: 5 d.p. i decimal ---   ////////////////////////////////   ska vi göra detta?
             const int DEC = 5;
             var vq = new TwoWay<double>(
                 bid: Math.Round(value.Bid, DEC, MidpointRounding.AwayFromZero),
                 ask: Math.Round(value.Ask, DEC, MidpointRounding.AwayFromZero)
             );
+
+            // Normalisera (säkerställa monotoni) på de kvantiserade värdena
             var tw = NormalizeMonotone(vq);
 
             EnsureSnapshotPair(p6);
+
             const double EPS = 1e-10;
 
             var cur = MarketSnapshot.TryGet(_current.RfByLeg, legId);
             if (cur == null)
             {
-                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
+                //var fld = new MarketField<double>(tw, MarketSource.Feed, ViewMode.TwoWay, OverrideMode.None, nowUtc, 0, isStale);
 
+
+                //----
+                var vm = MapForwardPricingModeToRateViewMode(_forwardMode); // Mid→Mid, Full/Net→TwoWay
                 var fld = new MarketField<double>(
                     value: tw,
                     source: MarketSource.Feed,
@@ -355,6 +392,8 @@ namespace FX.Services.MarketData
                     version: 0,
                     stale: isStale
                 );
+                //----
+
 
                 _current.RfByLeg[legId] = fld;
 
@@ -362,18 +401,39 @@ namespace FX.Services.MarketData
                 return;
             }
 
-            var old = cur.Effective;
-            bool changed = Math.Abs(old.Bid - tw.Bid) > EPS || Math.Abs(old.Ask - tw.Ask) > EPS || cur.Source != MarketSource.Feed;
-            if (changed)
-                cur.Replace(tw, MarketSource.Feed, cur.ViewMode, cur.Override, nowUtc);
+            var eff = cur.Effective;
+            bool same;
+            switch (cur.Override)
+            {
+                case OverrideMode.Bid:
+                    same = Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithAsk(tw.Ask), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Ask:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS;
+                    if (same) return;
+                    cur.Replace(eff.WithBid(tw.Bid), cur.Source, cur.ViewMode, cur.Override, nowUtc);
+                    break;
+
+                case OverrideMode.Mid:
+                case OverrideMode.Both:
+                    // Låst – ingen feedpåverkan
+                    return;
+
+                case OverrideMode.None:
+                default:
+                    same = Math.Abs(eff.Bid - tw.Bid) <= EPS && Math.Abs(eff.Ask - tw.Ask) <= EPS;
+                    if (same) return;
+                    cur.Replace(tw, MarketSource.Feed, cur.ViewMode, OverrideMode.None, nowUtc);
+                    break;
+            }
 
             cur.MarkStale(isStale, nowUtc);
 
-            if (changed || isStale)
-                RaiseChanged("FeedRf:" + legId);
+            RaiseChanged("FeedRf:" + legId);
         }
-
-
 
         /// <summary>
         /// User → rd. wasMid=true ⇒ lås Mid (bid=ask=mid). wasMid=false ⇒ lås båda sidor (Override=Both).
