@@ -2,6 +2,7 @@ using FX.Infrastructure;
 using System;
 using Microsoft.Extensions.DependencyInjection;
 using CoreI = FX.Core.Interfaces;
+using FX.Infrastructure.VolDb;
 
 namespace FX.Services
 {
@@ -22,15 +23,35 @@ namespace FX.Services
             // NY: Tenor/Datum-parser (UI-input -> riktiga datum)
             services.AddSingleton<CoreI.IExpiryInputResolver>(sp => new LegacyExpiryInputResolverAdapter(sp.GetRequiredService<CoreI.ICalendarResolver>(), conn));
 
-            // Vol/Engine (MVP)
+            // Vol/Engine (MVP)    REMOVE LATER
             services.AddSingleton<CoreI.IVolInterpolator, FlatVolInterpolator>(); 
             services.AddSingleton<CoreI.IVolService, VolService>();
-            services.AddSingleton<CoreI.IDayWeightService, DayWeightService>();
 
             services.AddSingleton<CoreI.IPriceEngine, LegacyPriceEngineAdapter>(); 
 
             // Runtime (subscribar på RequestPrice)
             services.AddSingleton<FxRuntime>();
+
+            // NY: VolRepository (MySQL, endast läsning i detta skede)
+            //var fxvolConn =
+            //    Environment.GetEnvironmentVariable("FXVOL_CONN")
+            //    ?? Environment.GetEnvironmentVariable("MYSQL_FXVOL_CONN")
+            //    ?? "Server=localhost;Database=fxvol;Uid=fx;Pwd=fx;TreatTinyAsBoolean=false;";
+
+            string username = "fxopt";
+            string password = "fxopt987";
+
+            // Rekommenderad MySQL-sträng (ersätt "fxvol" med din faktiska DB, t.ex. "fxoptions" om det är den du använder)
+            var fxvolConn =
+                "Server=srv78506;Port=3306;Database=fxvol;" +
+                "User Id=" + username + ";" +
+                "Password=" + password + ";" +
+                "Connection Timeout=15;SslMode=None;TreatTinyAsBoolean=false;";
+
+
+
+
+            services.AddSingleton<CoreI.IVolRepository>(_ => new MySqlVolRepository(fxvolConn));
 
             return services;
         }

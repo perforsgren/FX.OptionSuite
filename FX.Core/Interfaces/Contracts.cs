@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using FX.Core.Domain;
 
 namespace FX.Core.Interfaces
 {
@@ -13,9 +14,7 @@ namespace FX.Core.Interfaces
     // och returnerar FX.Core.Domain.TwoSidedPriceResult (Bid/Mid/Ask + greker på Mid).
     public interface IPriceEngine
     {
-        Task<FX.Core.Domain.TwoSidedPriceResult> PriceAsync(
-            FX.Core.Domain.PricingRequest request,
-            CancellationToken ct = default(CancellationToken));
+        Task<TwoSidedPriceResult> PriceAsync(PricingRequest request, CancellationToken ct = default(CancellationToken));
     }
 
     // ============================
@@ -29,14 +28,6 @@ namespace FX.Core.Interfaces
     public interface IVolInterpolator
     {
         double Interpolate(FX.Core.VolSurface surface, DateTime expiry, double strike, bool strikeIsDelta);
-    }
-
-    // ============================
-    // DAGVIKTER
-    // ============================
-    public interface IDayWeightService
-    {
-        double Weight(DateTime today, DateTime expiry);
     }
 
     // ============================
@@ -90,4 +81,38 @@ namespace FX.Core.Interfaces
     {
         FX.Core.SpotSetDates Compute(string pair6, DateTime today, DateTime expiry);
     }
+
+
+
+
+    /// <summary>
+    /// Repository-kontrakt för att läsa volytor ur databasen, frikopplat från UI och motor.
+    /// </summary>
+    public interface IVolRepository
+    {
+        /// <summary>
+        /// Hämtar snapshot-id för den senaste volytan för ett valutapar (MAX(ts_utc)).
+        /// Returnerar null om inget snapshot finns.
+        /// </summary>
+        /// <param name="pairSymbol">Par som "EUR/USD", "USD/SEK" etc.</param>
+        /// <returns>Senaste snapshot-id eller null om saknas.</returns>
+        long? GetLatestVolSnapshotId(string pairSymbol);
+
+        /// <summary>
+        /// Hämtar samtliga tenor-rader (ATM och RR/BF på mid) för ett givet snapshot.
+        /// Resultatet är sorterat på tenor_days_nominal (om finns) och därefter tenor-kod.
+        /// </summary>
+        /// <param name="snapshotId">Id från vol_surface_snapshot.</param>
+        /// <returns>Enumerable av VolSurfaceRow.</returns>
+        IEnumerable<VolSurfaceRow> GetVolExpiries(long snapshotId);
+
+        /// <summary>
+        /// Hämtar header (konventioner + tidsstämpel + källa) för ett snapshot-id.
+        /// </summary>
+        /// <param name="snapshotId">Id från vol_surface_snapshot.</param>
+        /// <returns>Header-objekt, eller null om snapshot saknas.</returns>
+        VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId);
+    }
+
+
 }

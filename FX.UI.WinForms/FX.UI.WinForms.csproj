@@ -85,7 +85,14 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Diagnostics\DebugFlags.cs" />
+    <Compile Include="App\VolAppInstance.cs" />
+    <Compile Include="Features\VolManager\VolManagerPresenter.cs" />
+    <Compile Include="Features\VolManager\VolManagerView.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Include="Features\VolManager\VolSessionControl.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
     <Compile Include="Shell\Form1.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -93,29 +100,29 @@
       <DependentUpon>Form1.cs</DependentUpon>
     </Compile>
     <Compile Include="App\IAppInstance.cs" />
-    <Compile Include="Features\Pricer\UI\LegacyPricerPresenter.cs" />
-    <Compile Include="Features\Pricer\UI\LegacyPricerView.cs">
+    <Compile Include="Features\Pricer\LegacyPricerPresenter.cs" />
+    <Compile Include="Features\Pricer\LegacyPricerView.cs">
       <SubType>UserControl</SubType>
     </Compile>
-    <Compile Include="Features\Pricer\Formatting\LegPricingDisplay.cs" />
+    <Compile Include="Features\Pricer\LegPricingDisplay.cs" />
     <Compile Include="App\PricerAppInstance.cs" />
-    <Compile Include="Features\Pricer\UI\PricerSessionControl.cs">
+    <Compile Include="Features\Pricer\PricerSessionControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
     <Compile Include="Shell\Workspace\PricerWorkspaceControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
-    <Compile Include="Features\Pricer\Formatting\PricingFormatter.cs" />
+    <Compile Include="Features\Pricer\PricingFormatter.cs" />
     <Compile Include="App\Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Shell\Docking\CustomFloatWindow.cs">
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Shell\Docking\CustomFloatWindowFactory.cs" />
-    <Compile Include="Features\Surface\SurfaceView.cs">
+    <Compile Include="Features\Blotter\BlotterView.cs">
       <SubType>UserControl</SubType>
     </Compile>
-    <Compile Include="Features\Blotter\BlotterView.cs">
+    <Compile Include="Shell\Workspace\VolWorkspaceControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
     <EmbeddedResource Include="Shell\Form1.resx">
@@ -190,5 +197,6 @@
   <ItemGroup>
     <EmbeddedResource Include="Features\Resources\CloneLeg.svg" />
   </ItemGroup>
+  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

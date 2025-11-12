@@ -34,6 +34,8 @@ namespace FX.UI.WinForms
             // Registrera själva app-instansen (IAppInstance) för Pricer
             services.AddTransient<PricerAppInstance>();
 
+            services.AddTransient<VolAppInstance>();
+
             // Registrera EN global MarketStore för hela appen
             services.AddSingleton<IMarketStore, MarketStore>();
 

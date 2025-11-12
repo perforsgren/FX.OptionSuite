@@ -45,7 +45,6 @@
     <Compile Include="Conventions\MarketConventions.cs" />
     <Compile Include="Domain\BookedTrade.cs" />
     <Compile Include="Domain\CurrencyPair.cs" />
-    <Compile Include="Domain\DayWeightCurve.cs" />
     <Compile Include="Domain\Enums.cs" />
     <Compile Include="Domain\Expiry.cs" />
     <Compile Include="Domain\MarketData\BackSolveService.cs" />
@@ -68,6 +67,8 @@
     <Compile Include="Domain\VolNode.cs" />
     <Compile Include="Domain\VolQuote.cs" />
     <Compile Include="Domain\VolSurface.cs" />
+    <Compile Include="Domain\VolSurfaceRow.cs" />
+    <Compile Include="Domain\VolSurfaceSnapshotHeader.cs" />
     <Compile Include="ExpiryResolution.cs" />
     <Compile Include="Interfaces\Contracts.cs" />
     <Compile Include="Interfaces\IExpiryInputResolver.cs" />

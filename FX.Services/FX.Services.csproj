@@ -73,7 +73,6 @@
     <Compile Include="Calendars\Legacy\HolidaySet.cs" />
     <Compile Include="Calendars\SpotSetDateService.cs" />
     <Compile Include="Calendars\WeekendOnlyBusinessCalendar.cs" />
-    <Compile Include="DayWeightService.cs" />
     <Compile Include="DtoMapper.cs" />
     <Compile Include="FlatVolInterpolator.cs" />
     <Compile Include="FxRuntime.cs" />
@@ -99,6 +98,10 @@
     <ProjectReference Include="..\FX.Core\FX.Core.csproj">
       <Project>{5279732b-1a94-4b23-8ac2-299302d14dc6}</Project>
       <Name>FX.Core</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\FX.Infrastructure\FX.Infrastructure.csproj">
+      <Project>{2abc0fd4-03bb-48be-b0dd-4e6b30e7347d}</Project>
+      <Name>FX.Infrastructure</Name>
     </ProjectReference>
     <ProjectReference Include="..\FX.Messages\FX.Messages.csproj">
       <Project>{d484d46a-e2e6-48f5-8258-329fde043700}</Project>

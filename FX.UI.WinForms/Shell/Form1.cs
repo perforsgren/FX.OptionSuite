@@ -276,10 +276,36 @@ namespace FX.UI.WinForms
                 return doc;
             }
 
-            // === Placeholders: Blotter / Gamma Hedger / Volatility Management =======
+            // === Volatility Management ============================================================
+            if (string.Equals(persistString, "Volatility Management", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(persistString, typeof(VolDockContent).FullName, StringComparison.Ordinal))
+            {
+                var vol = _sp.GetRequiredService<VolAppInstance>();
+                var view = vol.View;
+                if (view == null)
+                    return null;
+
+                var doc = new VolDockContent
+                {
+                    Text = vol.Title ?? "Volatility Management"
+                };
+
+                try { doc.Icon = GetAppIcon("Volatility Management"); } catch { /* best effort */ }
+
+                view.Dock = DockStyle.Fill;
+                doc.Controls.Add(view);
+
+                doc.Activated += (s, e) => Safe(vol.OnActivated);
+                doc.Deactivate += (s, e) => Safe(vol.OnDeactivated);
+                doc.FormClosed += (s, e) => Safe(vol.Dispose);
+
+                _apps["Volatility Management"] = (doc, vol);
+                return doc;
+            }
+
+            // === Placeholders: Blotter / Gamma Hedger =======
             if (string.Equals(persistString, "Blotter", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(persistString, "Gamma Hedger", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(persistString, "Volatility Management", StringComparison.OrdinalIgnoreCase))
+                string.Equals(persistString, "Gamma Hedger", StringComparison.OrdinalIgnoreCase))
             {
                 var title = persistString;
 
@@ -323,10 +349,12 @@ namespace FX.UI.WinForms
             // Text sätts via UpdateWindowModeMenuText()
 
             var miOpenPricer = new ToolStripMenuItem("Open Pricer", null, (s, e) => OpenOrFocusPricer());
+            var miOpenVolatilityManager = new ToolStripMenuItem("Open Volatility Management", null, (s, e) => OpenOrFocusVolManager());
 
             mFile.DropDownItems.Add(_miWindowModeToggle);
             mFile.DropDownItems.Add(new ToolStripSeparator());
             mFile.DropDownItems.Add(miOpenPricer);
+            mFile.DropDownItems.Add(miOpenVolatilityManager);
 
             ms.Items.Add(mFile);
             return ms;
@@ -419,7 +447,7 @@ namespace FX.UI.WinForms
                 Height = 28,
                 Margin = new Padding(0, 0, 4, 0)
             };
-            bVol.Click += (s, e) => OpenPlaceholderOnce("Volatility Management");
+            bVol.Click += (s, e) => OpenOrFocusVolManager();
 
             ts.Items.Add(bPricer);
             ts.Items.Add(bBlotter);
@@ -685,6 +713,47 @@ namespace FX.UI.WinForms
 
         #endregion
 
+        #region === Volatility Management (en-instans via DI) ===
+
+        /// <summary>Öppnar eller fokuserar Vol Manager-appen (en instans), med samma mönster som Pricer.</summary>
+        private void OpenOrFocusVolManager()
+        {
+            const string key = "Volatility Management";
+            if (_apps.TryGetValue(key, out var existing))
+            {
+                existing.Doc.Activate();
+                return;
+            }
+
+            // Resolve VolAppInstance via DI (registrera som Singleton i composition root)
+            var vol = _sp.GetRequiredService<VolAppInstance>();
+            var view = vol.View ?? throw new InvalidOperationException("VolAppInstance.View saknas.");
+
+            // Använd egen DockContent med stabil persist-sträng, precis som för pricer
+            var doc = new VolDockContent { Text = vol.Title ?? key };
+
+            // (valfritt) ikon – återanvänd din metod om du har en ikon märkt "Vol" eller "VolManager"
+            // Om du saknar ikon-nyckel, kommentera raden nedan.
+            doc.Icon = GetAppIcon("Volatility Management");
+
+            view.Dock = DockStyle.Fill;
+            doc.Controls.Add(view);
+
+            // Livscykel-wire
+            doc.Activated += (s, e) => Safe(vol.OnActivated);
+            doc.Deactivate += (s, e) => Safe(vol.OnDeactivated);
+            doc.FormClosed += (s, e) =>
+            {
+                if (_apps.ContainsKey(key)) _apps.Remove(key);
+                Safe(vol.Dispose);
+            };
+
+            _apps[key] = (doc, vol);
+            ShowInCurrentMode(doc);
+        }
+
+        #endregion
+
         #region === Placeholder (en-instans per knapp) ===
 
         /// <summary>Öppnar (eller fokuserar) en placeholder-app som enkel tab/fönster.</summary>
@@ -842,12 +911,27 @@ namespace FX.UI.WinForms
 
         #region === DockContent-typer (persistens-nycklar) ===
 
-        /// <summary>DockContent för Pricer (stabil persist-sträng).</summary>
+        /// <summary>
+        /// DockContent för Pricer med stabil persist-sträng.
+        /// Gör att sparad layout öppnar riktiga Pricer-appen vid återladdning.
+        /// </summary>
         private sealed class PricerDockContent : DockContent
         {
             protected override string GetPersistString()
             {
                 return "Pricer";
+            }
+        }
+
+        /// <summary>
+        /// DockContent för Volatility Management med stabil persist-sträng.
+        /// Gör att sparad layout öppnar riktiga Vol-appen vid återladdning.
+        /// </summary>
+        private sealed class VolDockContent : DockContent
+        {
+            protected override string GetPersistString()
+            {
+                return "Volatility Management";
             }
         }
 
