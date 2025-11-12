@@ -46,7 +46,7 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region === Ctor & initialization ===
+        #region === Constructor & initialization ===
 
         /// <summary>
         /// Skapar arbetsytan. <paramref name="sessionFactory"/> används för att skapa nya sessioner/flikar.
