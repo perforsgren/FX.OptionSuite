@@ -120,6 +120,226 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Public API (presenter, laddning)
 
         /// <summary>
+        /// Fired när sessionens UI-state (Pinned/Recent/View/TileColumns) har ändrats,
+        /// så att workspace kan persistenta direkt.
+        /// </summary>
+        public event EventHandler UiStateChanged;
+
+        /// <summary>
+        /// Helper för att raisa <see cref="UiStateChanged"/> säkert.
+        /// </summary>
+        private void OnUiStateChanged()
+        {
+            var h = UiStateChanged;
+            if (h != null) h(this, EventArgs.Empty);
+        }
+
+
+        /// <summary>
+        /// Representerar minsta UI-state för en session (Pinned/Recent + vyläge/tiles).
+        /// </summary>
+        public sealed class VolManagerUiState
+        {
+            public List<string> Pinned { get; set; } = new List<string>();
+            public List<string> Recent { get; set; } = new List<string>();
+            public string View { get; set; } = "Tabs";          // "Tabs" | "Tiles"
+            public string TileColumns { get; set; } = "Compact"; // "Compact" | "AtmOnly"
+        }
+
+        /// <summary>
+        /// Exporterar UI-state direkt från kontrollerna (LstPinned/LstRecent + vy/tiles).
+        /// </summary>
+        public VolManagerUiState ExportUiState()
+        {
+            var lstPinned = FindChild<ListBox>(this, "LstPinned");
+            var lstRecent = FindChild<ListBox>(this, "LstRecent");
+
+            var pinned = (lstPinned != null)
+                ? lstPinned.Items.Cast<object>()
+                    .Select(x => x as string)
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+
+            var recent = (lstRecent != null)
+                ? lstRecent.Items.Cast<object>()
+                    .Select(x => x as string)
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+
+            var isTiles = _tilesPanel != null && _tilesPanel.Visible;
+            var tileCols = (_tileColumnsMode == TileColumnsMode.AtmOnly) ? "AtmOnly" : "Compact";
+
+            return new VolManagerUiState
+            {
+                Pinned = pinned,
+                Recent = recent,
+                View = isTiles ? "Tiles" : "Tabs",
+                TileColumns = tileCols
+            };
+        }
+
+
+        /// <summary>
+        /// Applicerar sparat UI-state till kontrollerna (LstPinned/LstRecent + vy/tiles).
+        /// </summary>
+        public void ApplyUiState(VolManagerUiState state)
+        {
+            if (state == null) return;
+
+            // Tile-kolumner först (så rebuild blir rätt ifall Tiles är aktivt)
+            _tileColumnsMode = string.Equals(state.TileColumns, "AtmOnly", StringComparison.OrdinalIgnoreCase)
+                ? TileColumnsMode.AtmOnly
+                : TileColumnsMode.Compact;
+
+            var rbAtmOnly = FindChild<RadioButton>(this, "RbTileAtmOnly");
+            var rbCompact = FindChild<RadioButton>(this, "RbTileCompact");
+            if (rbAtmOnly != null) rbAtmOnly.Checked = (_tileColumnsMode == TileColumnsMode.AtmOnly);
+            if (rbCompact != null) rbCompact.Checked = (_tileColumnsMode == TileColumnsMode.Compact);
+
+            // Listor
+            var lstPinned = FindChild<ListBox>(this, "LstPinned");
+            var lstRecent = FindChild<ListBox>(this, "LstRecent");
+            if (lstPinned != null)
+            {
+                lstPinned.Items.Clear();
+                foreach (var p in state.Pinned ?? Enumerable.Empty<string>())
+                    if (!string.IsNullOrWhiteSpace(p)) lstPinned.Items.Add(p);
+            }
+            if (lstRecent != null)
+            {
+                lstRecent.Items.Clear();
+                foreach (var r in state.Recent ?? Enumerable.Empty<string>())
+                    if (!string.IsNullOrWhiteSpace(r)) lstRecent.Items.Add(r);
+            }
+
+            // Skapa flikar för Pinned (utan “force load” från DB – bara UI)
+            if (lstPinned != null)
+            {
+                foreach (var it in lstPinned.Items.Cast<object>())
+                {
+                    var pair = it as string;
+                    if (!string.IsNullOrWhiteSpace(pair))
+                        PinPair(pair);
+                }
+            }
+
+            // Vy
+            if (string.Equals(state.View, "Tiles", StringComparison.OrdinalIgnoreCase))
+                ShowTilesView(forceInitialLoad: false);
+            else
+                ShowTabsView();
+
+            // Rebuild tiles om aktiv
+            if (_tilesPanel != null && _tilesPanel.Visible)
+                RebuildTilesFromPinned(force: false);
+        }
+
+
+        /// <summary>
+        /// Läser state från presenter och applicerar på UI (Pinned/Recent, vy-läge, Tiles-kolumnläge).
+        /// Kallas efter att layout och kontroller är skapade.
+        /// </summary>
+        private void TryApplyLoadedState()
+        {
+            if (_presenter == null) return;
+
+            var state = _presenter.LoadUiState();
+
+            // Fyll Pinned/Recent
+            var lstPinned = FindChild<ListBox>(this, "LstPinned");
+            var lstRecent = FindChild<ListBox>(this, "LstRecent");
+
+            if (lstPinned != null)
+            {
+                lstPinned.Items.Clear();
+                foreach (var p in state.Pinned) lstPinned.Items.Add(p);
+            }
+            if (lstRecent != null)
+            {
+                lstRecent.Items.Clear();
+                foreach (var p in state.Recent) lstRecent.Items.Add(p);
+            }
+
+            // Tiles-kolumnläge
+            _tileColumnsMode = string.Equals(state.TileColumns, "AtmOnly", StringComparison.OrdinalIgnoreCase)
+                ? TileColumnsMode.AtmOnly
+                : TileColumnsMode.Compact;
+
+            var rbAtmOnly = FindChild<RadioButton>(this, "RbTileAtmOnly");
+            var rbCompact = FindChild<RadioButton>(this, "RbTileCompact");
+            if (rbAtmOnly != null) rbAtmOnly.Checked = (_tileColumnsMode == TileColumnsMode.AtmOnly);
+            if (rbCompact != null) rbCompact.Checked = (_tileColumnsMode == TileColumnsMode.Compact);
+
+            // Skapa flikar för alla pinnade (utan force)
+            if (lstPinned != null)
+            {
+                foreach (var it in lstPinned.Items.Cast<object>())
+                {
+                    var pair = it as string;
+                    if (!string.IsNullOrWhiteSpace(pair))
+                        PinPair(pair);
+                }
+            }
+
+            // Växla vy
+            if (string.Equals(state.View, "Tiles", StringComparison.OrdinalIgnoreCase))
+                ShowTilesView(forceInitialLoad: false);
+            else
+                ShowTabsView();
+
+            // Spara normaliserat läge direkt (valfritt)
+            SaveUiStateFromControls();
+        }
+
+        /// <summary>
+        /// Läser Pinned/Recent/View/TileColumns från UI, sparar till presentern
+        /// och signalerar till workspace att persist sker (UiStateChanged).
+        /// </summary>
+        private void SaveUiStateFromControls()
+        {
+            if (_presenter == null)
+            {
+                // Även om presenter saknas kan vi åtminstone meddela workspace om förändring.
+                OnUiStateChanged();
+                return;
+            }
+
+            var lstPinned = FindChild<ListBox>(this, "LstPinned");
+            var lstRecent = FindChild<ListBox>(this, "LstRecent");
+
+            var pinned = (lstPinned != null)
+                ? lstPinned.Items.Cast<object>()
+                    .Select(x => x as string)
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+
+            var recent = (lstRecent != null)
+                ? lstRecent.Items.Cast<object>()
+                    .Select(x => x as string)
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+
+            var view = (_tilesPanel != null && _tilesPanel.Visible) ? "Tiles" : "Tabs";
+            var tileCols = (_tileColumnsMode == TileColumnsMode.AtmOnly) ? "AtmOnly" : "Compact";
+
+            // 1) spara till presenter (intern kopia om du använder den)
+            _presenter.SaveUiState(pinned, recent, view, tileCols);
+
+            // 2) signalera workspace → SaveWorkspaceStateToDisk() (via VolWorkspaceControl-subscribe)
+            OnUiStateChanged();
+        }
+
+
+
+        /// <summary>
         /// Triggar en Refresh från hotkey: i Tiles-läge uppdateras ALLA tiles,
         /// i Tabs-läge uppdateras enbart den aktiva pair-fliken.
         /// <paramref name="force"/> = true bypassar cachen (Ctrl+F5).
@@ -528,9 +748,27 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Pair Tabs – vänsterpanel (Pin, Pinned, Recent)
 
         /// <summary>
+        /// Klick på "Unpin" => ta bort från listan + stäng underflik + spara state.
+        /// </summary>
+        private void OnClickUnpin(object sender, EventArgs e)
+        {
+            var lb = FindChild<ListBox>(this, "LstPinned");
+            var sel = lb?.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(sel)) return;
+
+            RemovePinnedAndCloseTab(sel);
+            SaveUiStateFromControls();
+        }
+
+
+        /// <summary>
         /// Växlar vyn till flikläge ("Pair Tabs") och sätter upp vänsterpanelen
         /// med Pin, Pinned, Recent, Refresh, vy-toggle (Tabs/Tiles) och kolumn-toggle för Tiles.
         /// Initierar även Tiles-containern (dold) så vi kan växla vy utan att förstöra layouten.
+        ///
+        /// Viktigt: Denna metod applicerar INTE längre något presenter-lagrat UI-state automatiskt.
+        /// Workspace (VolWorkspaceControl) äger per-session-state och anropar ApplyUiState(...) själv
+        /// vid uppstart/öppning. Nya sessioner startar därför tomma tills workspace sätter state.
         /// </summary>
         public void InitializeTabbedLayout()
         {
@@ -555,6 +793,7 @@ namespace FX.UI.WinForms.Features.VolManager
                 AddToPinned(p);
                 AddToRecent(p, 10);
                 if (_tilesPanel != null && _tilesPanel.Visible) RebuildTilesFromPinned(force: false);
+                SaveUiStateFromControls(); // persist (till presenter om man vill behålla global fallback)
             };
             txtPair.KeyDown += (s, e) =>
             {
@@ -568,12 +807,29 @@ namespace FX.UI.WinForms.Features.VolManager
             // Pinned
             var lblPinned = new Label { Text = "— Pinned —", Dock = DockStyle.Top, Height = 16 };
             var lstPinned = new ListBox { Name = "LstPinned", Dock = DockStyle.Top, Height = 140, IntegralHeight = false };
-            lstPinned.DoubleClick += OnPinnedDoubleClick;
+            lstPinned.DoubleClick += (s, e) =>
+            {
+                OnPinnedDoubleClick(s, e);
+                SaveUiStateFromControls();
+            };
+            // NY: Delete = Unpin & stäng tab om öppen
+            lstPinned.KeyDown += OnPinnedKeyDown;
+
+            // Unpin-knapp under Pinned
+            var btnUnpin = new Button { Name = "BtnUnpin", Dock = DockStyle.Top, Text = "Unpin" };
+            btnUnpin.Click += OnClickUnpin;
+            pnlLeft.Controls.Add(btnUnpin);
+
+
 
             // Recent
             var lblRecent = new Label { Text = "— Recent —", Dock = DockStyle.Top, Height = 16 };
             var lstRecent = new ListBox { Name = "LstRecent", Dock = DockStyle.Top, Height = 140, IntegralHeight = false };
-            lstRecent.DoubleClick += OnRecentDoubleClick;
+            lstRecent.DoubleClick += (s, e) =>
+            {
+                OnRecentDoubleClick(s, e);
+                SaveUiStateFromControls();
+            };
 
             // Actions
             var lblActions = new Label { Text = "— Actions —", Dock = DockStyle.Top, Height = 16 };
@@ -583,9 +839,17 @@ namespace FX.UI.WinForms.Features.VolManager
             // View (Tabs / Tiles)
             var lblView = new Label { Text = "— View —", Dock = DockStyle.Top, Height = 16 };
             var btnTabs = new Button { Name = "BtnTabsView", Dock = DockStyle.Top, Text = "Tabs View" };
-            btnTabs.Click += (s, e) => ShowTabsView();
+            btnTabs.Click += (s, e) =>
+            {
+                ShowTabsView();
+                SaveUiStateFromControls();
+            };
             var btnTiles = new Button { Name = "BtnTilesView", Dock = DockStyle.Top, Text = "Tiles View" };
-            btnTiles.Click += (s, e) => ShowTilesView(forceInitialLoad: false);
+            btnTiles.Click += (s, e) =>
+            {
+                ShowTilesView(forceInitialLoad: false);
+                SaveUiStateFromControls();
+            };
 
             // Tile Columns (ATM-only / Compact)
             var lblTileCols = new Label { Text = "— Tile Columns —", Dock = DockStyle.Top, Height = 16 };
@@ -602,6 +866,7 @@ namespace FX.UI.WinForms.Features.VolManager
                 if (!rbAtmOnly.Checked) return;
                 _tileColumnsMode = TileColumnsMode.AtmOnly;
                 if (_tilesPanel != null && _tilesPanel.Visible) RebuildTilesFromPinned(force: false);
+                SaveUiStateFromControls();
             };
 
             var rbCompact = new RadioButton
@@ -617,6 +882,7 @@ namespace FX.UI.WinForms.Features.VolManager
                 if (!rbCompact.Checked) return;
                 _tileColumnsMode = TileColumnsMode.Compact;
                 if (_tilesPanel != null && _tilesPanel.Visible) RebuildTilesFromPinned(force: false);
+                SaveUiStateFromControls();
             };
 
             // Lägg upp i omvänd ordning (Dock=Top staplar uppåt)
@@ -669,7 +935,70 @@ namespace FX.UI.WinForms.Features.VolManager
             Controls.Add(_tilesPanel);
             Controls.Add(_pairTabs);
             Controls.Add(pnlLeft);
+
+            // OBS: Ingen TryApplyLoadedState här längre – workspace applicerar per-session-state.
         }
+
+        /// <summary>
+        /// Delete på Pinned => Unpin + stäng underflik (om finns) + spara state.
+        /// </summary>
+        private void OnPinnedKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Delete) return;
+
+            var lb = sender as ListBox;
+            var sel = lb?.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(sel)) return;
+
+            RemovePinnedAndCloseTab(sel);
+            SaveUiStateFromControls();
+            e.Handled = true;
+        }
+
+
+        /// <summary>
+        /// Tar bort ett par från Pinned och stänger motsvarande underflik (om existerar).
+        /// </summary>
+        private void RemovePinnedAndCloseTab(string pair)
+        {
+            var target = (pair ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(target)) return;
+
+            // 1) Ta bort från Pinned
+            var lb = FindChild<ListBox>(this, "LstPinned");
+            if (lb != null)
+            {
+                int idx = -1;
+                for (int i = 0; i < lb.Items.Count; i++)
+                {
+                    var s = lb.Items[i] as string;
+                    if (string.Equals(s, target, StringComparison.OrdinalIgnoreCase)) { idx = i; break; }
+                }
+                if (idx >= 0) lb.Items.RemoveAt(idx);
+            }
+
+            // 2) Stäng flik om den finns
+            if (_pairTabs != null)
+            {
+                TabPage toRemove = null;
+                foreach (TabPage p in _pairTabs.TabPages)
+                {
+                    var ui = p.Tag as PairTabUi;
+                    var existing = ui?.PairSymbol ?? p.Text;
+                    if (string.Equals(existing, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        toRemove = p; break;
+                    }
+                }
+                if (toRemove != null)
+                    _pairTabs.TabPages.Remove(toRemove);
+            }
+
+            // 3) Om Tiles-vy är aktiv: bygg om tiles (så rutan försvinner)
+            if (_tilesPanel != null && _tilesPanel.Visible)
+                RebuildTilesFromPinned(force: false);
+        }
+
 
 
 

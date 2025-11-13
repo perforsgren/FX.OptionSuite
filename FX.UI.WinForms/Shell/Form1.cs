@@ -62,7 +62,7 @@ namespace FX.UI.WinForms
 
         #endregion
 
-        #region === Ctor & init ===
+        #region === Constructor & init ===
 
         public Form1(IServiceProvider serviceProvider)
         {
@@ -242,67 +242,24 @@ namespace FX.UI.WinForms
 
         #region === Deserialize: skapa IDockContent från persist-string ===
 
-        // Skapa IDockContent från persist-string (Pricer eller kända placeholders)
+        /// <summary>
+        /// Callback som DockPanel använder när sparad layout återladdas.
+        /// Returnerar korrekt DockContent för en given persist-sträng.
+        /// </summary>
         private IDockContent DeserializeContent(string persistString)
         {
-            if (string.IsNullOrEmpty(persistString))
-                return null;
-
-            // === Pricer ============================================================
-            if (string.Equals(persistString, "Pricer", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(persistString, typeof(PricerDockContent).FullName, StringComparison.Ordinal))
+            if (string.Equals(persistString, "Pricer", StringComparison.Ordinal))
             {
-                var pricer = _sp.GetRequiredService<PricerAppInstance>();
-                var view = pricer.View;
-                if (view == null)
-                    return null;
-
-                var doc = new PricerDockContent
-                {
-                    Text = pricer.Title ?? "Pricer"
-                };
-
-                try { doc.Icon = GetAppIcon("Pricer"); } catch { /* best effort */ }
-
-                view.Dock = DockStyle.Fill;
-                doc.Controls.Add(view);
-
-                doc.Activated += (s, e) => Safe(pricer.OnActivated);
-                doc.Deactivate += (s, e) => Safe(pricer.OnDeactivated);
-                doc.FormClosed += (s, e) => Safe(pricer.Dispose);
-
-                _apps["Pricer"] = (doc, pricer);
-
-                return doc;
+                // Återskapa/fokusera Pricer via vår launcher (den sätter även ikon, events, etc.)
+                OpenOrFocusPricer();
+                return _apps.TryGetValue("Pricer", out var pricer) ? pricer.Doc : null;
             }
-
-            // === Volatility Management ============================================================
-            if (string.Equals(persistString, "Volatility Management", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(persistString, typeof(VolDockContent).FullName, StringComparison.Ordinal))
+            if (string.Equals(persistString, "Volatility Management", StringComparison.Ordinal))
             {
-                var vol = _sp.GetRequiredService<VolAppInstance>();
-                var view = vol.View;
-                if (view == null)
-                    return null;
-
-                var doc = new VolDockContent
-                {
-                    Text = vol.Title ?? "Volatility Management"
-                };
-
-                try { doc.Icon = GetAppIcon("Volatility Management"); } catch { /* best effort */ }
-
-                view.Dock = DockStyle.Fill;
-                doc.Controls.Add(view);
-
-                doc.Activated += (s, e) => Safe(vol.OnActivated);
-                doc.Deactivate += (s, e) => Safe(vol.OnDeactivated);
-                doc.FormClosed += (s, e) => Safe(vol.Dispose);
-
-                _apps["Volatility Management"] = (doc, vol);
-                return doc;
+                // Återskapa/fokusera Vol via vår launcher (samma mönster som Pricer)
+                OpenOrFocusVolManager();
+                return _apps.TryGetValue("Volatility Management", out var vol) ? vol.Doc : null;
             }
-
             // === Placeholders: Blotter / Gamma Hedger =======
             if (string.Equals(persistString, "Blotter", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(persistString, "Gamma Hedger", StringComparison.OrdinalIgnoreCase))
@@ -334,6 +291,7 @@ namespace FX.UI.WinForms
 
             // Okänd typ – låt DockPanel ignorera
             return null;
+
         }
 
         #endregion
@@ -731,10 +689,7 @@ namespace FX.UI.WinForms
 
             // Använd egen DockContent med stabil persist-sträng, precis som för pricer
             var doc = new VolDockContent { Text = vol.Title ?? key };
-
-            // (valfritt) ikon – återanvänd din metod om du har en ikon märkt "Vol" eller "VolManager"
-            // Om du saknar ikon-nyckel, kommentera raden nedan.
-            doc.Icon = GetAppIcon("Volatility Management");
+            doc.Icon = GetAppIcon("Volatility Management");  // samma ikon som menyn använder
 
             view.Dock = DockStyle.Fill;
             doc.Controls.Add(view);
@@ -950,5 +905,6 @@ namespace FX.UI.WinForms
         }
 
         #endregion
+
     }
 }

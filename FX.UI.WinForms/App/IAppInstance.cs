@@ -11,6 +11,7 @@ namespace FX.UI.WinForms
 
         void OnActivated();
         void OnDeactivated();
+
     }
 
     /// <summary>Kontrakt som Form1 implementerar för att kunna ta emot app-instanser.</summary>
@@ -19,4 +20,6 @@ namespace FX.UI.WinForms
         void Attach(IAppInstance app);     // visa/aktivera i shell
         void Close(IAppInstance app);      // stäng specifik instans
     }
+
+
 }

@@ -53,10 +53,21 @@ namespace FX.UI.WinForms
         /// <summary>Kallas av Shell när dokumentet blir inaktivt.</summary>
         public void OnDeactivated() => _workspace.OnDeactivated();
 
-        /// <summary>Disposar workspace (stänger alla sessions och underliggande vy/presenter).</summary>
+        /// <summary>
+        /// Disposar workspace. Ingen tvingad save här, för på stängning kan TabPages redan vara tömda
+        /// och då skulle vi skriva över workspace.json med "Sessions=[]".
+        /// </summary>
         public void Dispose()
         {
-            _workspace?.Dispose();
+            try
+            {
+                _workspace?.Dispose();
+            }
+            catch
+            {
+                // best effort
+            }
         }
+
     }
 }

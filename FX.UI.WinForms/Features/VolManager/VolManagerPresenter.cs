@@ -1,8 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using System.Linq;
 using FX.Core.Domain;
 using FX.Core.Interfaces;
+
 
 namespace FX.UI.WinForms.Features.VolManager
 {
@@ -74,6 +78,175 @@ namespace FX.UI.WinForms.Features.VolManager
         {
             if (string.IsNullOrWhiteSpace(pair)) return;
             _cache.Remove(pair);
+        }
+
+
+        #endregion
+
+        #region Persistens (UI-state))
+
+        /// <summary>
+        /// Laddar UI-state för VolManager (pinned, recent, view, tileCols) från en JSON-fil i %APPDATA%.
+        /// Saknas fil returneras tomma listor och standardlägen.
+        /// </summary>
+        public (List<string> Pinned, List<string> Recent, string View, string TileColumns) LoadUiState()
+        {
+            try
+            {
+                var path = GetUiStatePath();
+                if (!File.Exists(path))
+                    return (new List<string>(), new List<string>(), "Tabs", "Compact");
+
+                using (var fs = File.OpenRead(path))
+                {
+                    var ser = new DataContractJsonSerializer(typeof(UiStateDto));
+                    var dto = (UiStateDto)ser.ReadObject(fs);
+                    return (
+                        dto?.Pinned ?? new List<string>(),
+                        dto?.Recent ?? new List<string>(),
+                        string.IsNullOrWhiteSpace(dto?.View) ? "Tabs" : dto.View,
+                        string.IsNullOrWhiteSpace(dto?.TileColumns) ? "Compact" : dto.TileColumns
+                    );
+                }
+            }
+            catch
+            {
+                // Fail safe
+                return (new List<string>(), new List<string>(), "Tabs", "Compact");
+            }
+        }
+
+        /// <summary>
+        /// Sparar UI-state (pinned, recent, view, tileCols) till en JSON-fil i %APPDATA%.
+        ///</summary>
+        public void SaveUiState(List<string> pinned, List<string> recent, string view, string tileColumns)
+        {
+            try
+            {
+                var path = GetUiStatePath();
+                var dir = Path.GetDirectoryName(path);
+                if (!Directory.Exists(dir))
+                    Directory.CreateDirectory(dir ?? ".");
+
+                var dto = new UiStateDto
+                {
+                    Pinned = (pinned ?? new List<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                    Recent = (recent ?? new List<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                    View = string.IsNullOrWhiteSpace(view) ? "Tabs" : view,
+                    TileColumns = string.IsNullOrWhiteSpace(tileColumns) ? "Compact" : tileColumns
+                };
+
+                using (var fs = File.Create(path))
+                {
+                    var ser = new DataContractJsonSerializer(typeof(UiStateDto));
+                    ser.WriteObject(fs, dto);
+                }
+            }
+            catch
+            {
+                // Best effort – inga throw i UI-flöde.
+            }
+        }
+
+        /// <summary>
+        /// Fullständig sökväg till UI-state-filen, per användare.
+        /// %APPDATA%\FX.OptionSuite\VolManager\session_ui_state.json
+        /// </summary>
+        private string GetUiStatePath()
+        {
+            var root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return Path.Combine(root, "FX.OptionSuite", "VolManager", "session_ui_state.json");
+        }
+
+        [DataContract]
+        private sealed class UiStateDto
+        {
+            [DataMember] public List<string> Pinned { get; set; }
+            [DataMember] public List<string> Recent { get; set; }
+            [DataMember] public string View { get; set; }          // "Tabs" | "Tiles"
+            [DataMember] public string TileColumns { get; set; }   // "AtmOnly" | "Compact"
+        }
+
+
+
+        #endregion
+
+        #region Public API – Refresh & Load
+
+        /// <summary>
+        /// Hämtar senaste volyta för ett valutapar med enhetlig cache-policy.
+        /// Delegerar till den befintliga laddaren (LoadLatestWithHeaderTagged).
+        /// </summary>
+        /// <param name="pairSymbol">Valutapar, t.ex. "EUR/USD".</param>
+        /// <param name="force">
+        /// true = bypassa mjuk cache och hämta från repo nu (t.ex. F5).
+        /// false = tillåt cache enligt presenter-policy.
+        /// </param>
+        /// <returns>
+        /// (FromCache, SnapshotId, Header, Rows) – Rows är tom lista om inget data finns.
+        /// </returns>
+        public (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)
+            RefreshPair(string pairSymbol, bool force = false)
+        {
+            // Normalisera input
+            if (string.IsNullOrWhiteSpace(pairSymbol))
+                return (false, null, null, new List<VolSurfaceRow>());
+
+            pairSymbol = pairSymbol.Trim();
+
+            // Delegera till din existerande laddare som redan hanterar cache/taggning
+            return LoadLatestWithHeaderTagged(pairSymbol, force);
+        }
+
+        /// <summary>
+        /// Async-wrapper för <see cref="RefreshPair(string, bool)"/>.
+        /// Implementeras via Task.Run i detta steg (kan bytas till äkta async repo senare).
+        /// </summary>
+        public System.Threading.Tasks.Task<(bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)>
+            RefreshPairAsync(string pairSymbol, bool force = false)
+        {
+            return System.Threading.Tasks.Task.Run(() => RefreshPair(pairSymbol, force));
+        }
+
+        /// <summary>
+        /// Hämtar senaste volyta för flera valutapar, med deduplicering och samma cache-policy
+        /// som <see cref="RefreshPair(string, bool)"/>.
+        /// </summary>
+        /// <param name="pairs">Uppräknare av valutapar. Null/whitespace filtreras bort. Duplicat ignoreras (case-insensitivt).</param>
+        /// <param name="force">true för att bypassa cache; annars presenter-policy.</param>
+        /// <returns>
+        /// Dictionary per par:
+        ///   Key = pairSymbol,
+        ///   Value = (FromCache, SnapshotId, Header, Rows).
+        /// </returns>
+        public Dictionary<string, (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)>
+            RefreshPinned(IEnumerable<string> pairs, bool force = false)
+        {
+            var result = new Dictionary<string, (bool, long?, VolSurfaceSnapshotHeader, List<VolSurfaceRow>)>(StringComparer.OrdinalIgnoreCase);
+            if (pairs == null) return result;
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var p in pairs)
+            {
+                var key = (p ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(key)) continue;
+                if (!seen.Add(key)) continue; // dedupe
+
+                result[key] = LoadLatestWithHeaderTagged(key, force);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Async-wrapper för <see cref="RefreshPinned(IEnumerable{string}, bool)"/>.
+        /// Implementeras via Task.Run i detta steg.
+        /// </summary>
+        public System.Threading.Tasks.Task<Dictionary<string, (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)>>
+            RefreshPinnedAsync(IEnumerable<string> pairs, bool force = false)
+        {
+            return System.Threading.Tasks.Task.Run(() => RefreshPinned(pairs, force));
         }
 
 
