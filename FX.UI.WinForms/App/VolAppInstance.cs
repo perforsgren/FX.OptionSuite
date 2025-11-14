@@ -18,28 +18,31 @@ namespace FX.UI.WinForms
         private readonly VolWorkspaceControl _workspace;
 
         /// <summary>
-        /// Skapar en VolAppInstance som Shell kan hosta i ett dokumentfönster.
+        /// Initierar Volatility Manager-appinstansen och bygger ett Workspace med session-fabrik.
         /// </summary>
-        /// <param name="sp">DI-container med IVolRepository registrerad.</param>
         public VolAppInstance(IServiceProvider sp)
         {
             _sp = sp ?? throw new ArgumentNullException(nameof(sp));
 
-            // SessionFactory: identiskt mönster som pricer – skapa presenter och vy via DI
+            // SessionFactory: identiskt mönster som Pricer – skapa presenter och vy via DI
             Func<int, VolSessionControl> factory = (idx) =>
             {
                 var repo = _sp.GetRequiredService<IVolRepository>();
                 var presenter = new VolManagerPresenter(repo);
                 var view = new VolManagerView();
+
+                // Koppling mellan vy och presenter (behåll SetPresenter om du använder den internt i vyn)
                 view.SetPresenter(presenter);
                 view.InitializeTabbedLayout(); // flikläge med pinned pairs
 
                 var tabTitle = $"Vol Session {idx}";
-                return new VolSessionControl(tabTitle, view, presenter);
+                // VIKTIGT: rätt ordning på argumenten → (view, presenter, title)
+                return new VolSessionControl(view, presenter, tabTitle);
             };
 
             _workspace = new VolWorkspaceControl(factory);
         }
+
 
         /// <summary>Titel som Shell använder på dokumentet (kan bytas i workspace om du vill).</summary>
         public string Title => "Volatility Manager";

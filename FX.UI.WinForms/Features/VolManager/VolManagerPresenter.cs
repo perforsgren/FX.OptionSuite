@@ -6,6 +6,8 @@ using System.Runtime.Serialization.Json;
 using System.Linq;
 using FX.Core.Domain;
 using FX.Core.Interfaces;
+using System.Threading;
+using System.Threading.Tasks;
 
 
 namespace FX.UI.WinForms.Features.VolManager
@@ -13,7 +15,6 @@ namespace FX.UI.WinForms.Features.VolManager
     /// <summary>
     /// Presenter för att läsa volytor från databasen via IVolRepository.
     /// Den hanterar endast läsning: "senaste snapshot" och dess tenor-rader.
-    /// Ingen koppling till prismotorn i detta steg.
     /// </summary>
     public sealed class VolManagerPresenter
     {
@@ -21,6 +22,11 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Fields
 
         private readonly IVolRepository _repo;
+        // vy-referens för UI-bindningar (BeginInvoke, BindPairSurface/UpdateTile)
+        private VolManagerView _view;
+
+        // CTS per valutapar för att kunna avbryta pågående laddningar (debounce)
+        private readonly Dictionary<string, CancellationTokenSource> _loadCtsByPair = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
 
         #endregion
 
@@ -33,6 +39,16 @@ namespace FX.UI.WinForms.Features.VolManager
         public VolManagerPresenter(IVolRepository repo)
         {
             _repo = repo ?? throw new ArgumentNullException(nameof(repo));
+        }
+
+        /// <summary>
+        /// Kopplar vy-instansen till presentern för UI-bindningar och marshalling till UI-tråd.
+        /// Måste anropas av sessionen efter att vyn har skapats.
+        /// </summary>
+        /// <param name="view">Aktuell <see cref="VolManagerView"/> för sessionen.</param>
+        public void AttachView(VolManagerView view)
+        {
+            _view = view ?? throw new ArgumentNullException(nameof(view));
         }
 
         #endregion
@@ -174,6 +190,126 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Public API – Refresh & Load
 
         /// <summary>
+        /// Hämtar en yta för ett par och binder den i vyn (Tabs/Tiles) med debounce.
+        /// Visar busy, hanterar cancel tyst och sätter status (Fresh/Cached). Kompletterar saknade tenorer.
+        /// </summary>
+        public async Task RefreshPairAndBindAsync(string pairSymbol, bool force = false)
+        {
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return;
+            pairSymbol = pairSymbol.Trim();
+
+            var (cts, token) = ReplaceCts(pairSymbol);
+
+            _view?.BeginInvoke((Action)(() => _view.ShowPairBusy(pairSymbol, true)));
+
+            try
+            {
+                var r = await Task.Run(() =>
+                {
+                    if (token.IsCancellationRequested)
+                        return default(ValueTuple<bool, long?, VolSurfaceSnapshotHeader, List<VolSurfaceRow>>);
+
+                    var tmp = RefreshPair(pairSymbol, force);
+
+                    if (token.IsCancellationRequested)
+                        return default(ValueTuple<bool, long?, VolSurfaceSnapshotHeader, List<VolSurfaceRow>>);
+
+                    return tmp;
+                }).ConfigureAwait(false);
+
+                if (token.IsCancellationRequested || !IsCurrentCts(pairSymbol, cts))
+                {
+                    _view?.BeginInvoke((Action)(() => _view.ShowPairBusy(pairSymbol, false)));
+                    return;
+                }
+
+                var fromCache = r.Item1;
+                var header = r.Item3;
+                var rows = r.Item4 ?? new List<VolSurfaceRow>();
+                var rowsFull = CompleteWithStandardTenors(rows); // ← NY: alltid visa standard-tenorer
+                var tsUtc = header != null ? header.TsUtc : DateTime.UtcNow;
+
+                _view?.BeginInvoke((Action)(() =>
+                {
+                    try
+                    {
+                        if (_view.IsTabsModeActive())
+                            _view.BindPairSurface(pairSymbol, tsUtc, rowsFull, fromCache);
+                        else if (_view.IsTilesModeActive())
+                            _view.UpdateTile(pairSymbol, tsUtc, rowsFull, fromCache);
+                    }
+                    catch
+                    {
+                        _view.ShowPairError(pairSymbol, "Bind failed.");
+                    }
+                    finally
+                    {
+                        _view.ShowPairBusy(pairSymbol, false);
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                if (IsCurrentCts(pairSymbol, cts))
+                {
+                    _view?.BeginInvoke((Action)(() =>
+                    {
+                        try { _view.ShowPairError(pairSymbol, ex.Message); }
+                        finally { _view.ShowPairBusy(pairSymbol, false); }
+                    }));
+                }
+            }
+            finally
+            {
+                ClearCtsIfCurrent(pairSymbol, cts);
+                try { cts.Dispose(); } catch { /* best effort */ }
+            }
+        }
+
+
+
+
+
+        /// <summary>
+        /// Hämtar/binder flera par (sekventiellt, enkel och robust). force=true bypassar cachen.
+        /// </summary>
+        public async System.Threading.Tasks.Task RefreshPinnedAndBindAsync(IEnumerable<string> pairs, bool force = false)
+        {
+            if (pairs == null) return;
+
+            foreach (var p in pairs.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase))
+                await RefreshPairAndBindAsync(p.Trim(), force).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Anropas när ett par pinnas (eller reaktiveras). Binder direkt mot aktuell vy.
+        /// </summary>
+        public void OnPairPinned(string pairSymbol)
+        {
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return;
+            _ = RefreshPairAndBindAsync(pairSymbol, force: false);
+        }
+
+        /// <summary>
+        /// Anropas när vy-läget byts (Tabs &lt;→ Tiles). Binder om alla pinned från cache.
+        /// </summary>
+        public void OnViewModeChanged()
+        {
+            var pinned = _view?.SnapshotPinnedPairs() ?? Array.Empty<string>();
+            _ = RefreshPinnedAndBindAsync(pinned, force: false);
+        }
+
+        /// <summary>
+        /// Anropas när användaren byter aktiv par-flik i Tabs-läget. Binder om just den.
+        /// </summary>
+        public void OnActivePairTabChanged(string pairSymbol)
+        {
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return;
+            _ = RefreshPairAndBindAsync(pairSymbol, force: false);
+        }
+
+
+        /// <summary>
         /// Hämtar senaste volyta för ett valutapar med enhetlig cache-policy.
         /// Delegerar till den befintliga laddaren (LoadLatestWithHeaderTagged).
         /// </summary>
@@ -249,8 +385,6 @@ namespace FX.UI.WinForms.Features.VolManager
             return System.Threading.Tasks.Task.Run(() => RefreshPinned(pairs, force));
         }
 
-
-        #endregion
 
         /// <summary>
         /// Hämtar senaste snapshot-id för angivet valutapar och laddar samtliga tenor-rader.
@@ -389,7 +523,138 @@ namespace FX.UI.WinForms.Features.VolManager
             return (false, freshCore.Item1, freshCore.Item2, freshCore.Item3);
         }
 
+        #endregion
 
+        #region Privata hjälpare
+
+        /// <summary>
+        /// Skapa ny CTS för paret och avbryt/avyttra tidigare CTS om den fanns.
+        /// </summary>
+        private (CancellationTokenSource cts, CancellationToken token) ReplaceCts(string pair)
+        {
+            CancellationTokenSource old = null;
+            var cts = new CancellationTokenSource();
+            lock (_loadCtsByPair)
+            {
+                if (_loadCtsByPair.TryGetValue(pair, out old))
+                {
+                    try { old.Cancel(); } catch { }
+                    try { old.Dispose(); } catch { }
+                }
+                _loadCtsByPair[pair] = cts;
+            }
+            return (cts, cts.Token);
+        }
+
+        /// <summary>True om angiven CTS fortfarande är den aktiva för paret.</summary>
+        private bool IsCurrentCts(string pair, CancellationTokenSource cts)
+        {
+            lock (_loadCtsByPair)
+                return _loadCtsByPair.TryGetValue(pair, out var cur) && ReferenceEquals(cur, cts);
+        }
+
+        /// <summary>Rensa CTS för paret om samma instans är aktiv.</summary>
+        private void ClearCtsIfCurrent(string pair, CancellationTokenSource cts)
+        {
+            lock (_loadCtsByPair)
+            {
+                if (_loadCtsByPair.TryGetValue(pair, out var cur) && ReferenceEquals(cur, cts))
+                    _loadCtsByPair.Remove(pair);
+            }
+        }
+
+
+        #endregion
+
+        #region Privata hjälpare – transform/merge
+
+        /// <summary>
+        /// Returnerar true om paret ska betraktas som ankrat (ATM justeras som Offset).
+        /// Just nu endast USD/SEK enligt din setup.
+        /// </summary>
+        public bool IsAnchoredPair(string pairSymbol)
+        {
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return false;
+            var p = pairSymbol.Trim().ToUpperInvariant();
+
+            // Tillåt både "USD/SEK" och "USDSEK" för robusthet
+            return p == "USD/SEK" || p == "USDSEK";
+        }
+
+        /// <summary>
+        /// Försöker slå upp ankare för ett target-par. Nu: USD/SEK → EUR/USD.
+        /// </summary>
+        public bool TryGetAnchorPair(string pairSymbol, out string anchorPair)
+        {
+            anchorPair = null;
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return false;
+
+            var p = pairSymbol.Trim().ToUpperInvariant();
+            if (p == "USD/SEK" || p == "USDSEK")
+            {
+                anchorPair = "EUR/USD";
+                return true;
+            }
+            return false;
+        }
+
+
+        /// <summary>
+        /// Standardtenorer som alltid ska visas i UI, även om DB saknar datapunkt.
+        /// Ordningen styr hur griden/tiles renderas.
+        /// </summary>
+        private static readonly string[] _stdTenors = new[]
+        {
+            "ON","1W","2W","1M","2M","3M","6M","9M","1Y","2Y","3Y"
+        };
+
+        /// <summary>
+        /// Tar in DB-rader och kompletterar med "tomma" rader för saknade standardtenorer.
+        /// Används för att tillåta editering när data inte finns sedan tidigare.
+        /// </summary>
+        private List<VolSurfaceRow> CompleteWithStandardTenors(IList<VolSurfaceRow> rows)
+        {
+            var byTenor = new Dictionary<string, VolSurfaceRow>(StringComparer.OrdinalIgnoreCase);
+            if (rows != null)
+            {
+                foreach (var r in rows)
+                {
+                    var key = (r?.TenorCode ?? "").Trim();
+                    if (string.IsNullOrEmpty(key)) continue;
+                    if (!byTenor.ContainsKey(key)) byTenor[key] = r;
+                }
+            }
+
+            var merged = new List<VolSurfaceRow>(_stdTenors.Length);
+            foreach (var t in _stdTenors)
+            {
+                if (byTenor.TryGetValue(t, out var have))
+                {
+                    merged.Add(have);
+                }
+                else
+                {
+                    // Skapa "tom" rad för tenorn: editerbar (draft) i UI
+                    merged.Add(new VolSurfaceRow
+                    {
+                        TenorCode = t,
+                        TenorDaysNominal = null,
+                        AtmBid = null,
+                        AtmMid = null,
+                        AtmAsk = null,
+                        Rr25Mid = null,
+                        Bf25Mid = null,
+                        Rr10Mid = null,
+                        Bf10Mid = null
+                    });
+                }
+            }
+            return merged;
+        }
+
+
+
+        #endregion
 
     }
 }

@@ -24,14 +24,36 @@ namespace FX.UI.WinForms
         /// <param name="tabTitle">Förvald fliktitel, t.ex. "Vol Session 1".</param>
         /// <param name="view">VolManagerView som huserar UI.</param>
         /// <param name="presenter">VolManagerPresenter som läser från DB.</param>
-        public VolSessionControl(string tabTitle, VolManagerView view, VolManagerPresenter presenter)
+        //public VolSessionControlOLD(string tabTitle, VolManagerView view, VolManagerPresenter presenter)
+        //{
+        //    if (view == null) throw new ArgumentNullException(nameof(view));
+        //    if (presenter == null) throw new ArgumentNullException(nameof(presenter));
+
+        //    TabTitle = tabTitle ?? "Vol Session";
+        //    _view = view;
+        //    _presenter = presenter;
+
+        //    Dock = DockStyle.Fill;
+
+        //    _view.Dock = DockStyle.Fill;
+        //    Controls.Add(_view);
+        //}
+
+        /// <summary>
+        /// Skapar en vol-session (vy + presenter) och dockar vyn i denna kontroll.
+        /// </summary>
+        public VolSessionControl(VolManagerView view, VolManagerPresenter presenter, string tabTitle)
         {
             if (view == null) throw new ArgumentNullException(nameof(view));
             if (presenter == null) throw new ArgumentNullException(nameof(presenter));
 
-            TabTitle = tabTitle ?? "Vol Session";
+            TabTitle = string.IsNullOrWhiteSpace(tabTitle) ? "Vol Session" : tabTitle;
+
             _view = view;
             _presenter = presenter;
+
+            // NY: koppla vy-instansen till presentern (krävs för RefreshPairAndBindAsync m.fl.)
+            _presenter.AttachView(_view);
 
             Dock = DockStyle.Fill;
 
@@ -52,5 +74,36 @@ namespace FX.UI.WinForms
             }
             base.Dispose(disposing);
         }
+
+        /// <summary>
+        /// Refreshar alla pinned par i den här sessionen och binder mot aktuell vy.
+        /// force=true bypassar presenter-cachen (t.ex. F5).
+        /// </summary>
+        public async System.Threading.Tasks.Task RefreshAllAsync(bool force)
+        {
+            if (_presenter == null || _view == null) return;
+            var pairs = _view.SnapshotPinnedPairs();
+            await _presenter.RefreshPinnedAndBindAsync(pairs, force).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Bör anropas när användaren byter vy-läge (Tabs &lt;→ Tiles) inom sessionen.
+        /// Rebinder alla pinned mot det nya läget (från cache).
+        /// </summary>
+        public void NotifyViewModeChanged()
+        {
+            _presenter?.OnViewModeChanged();
+        }
+
+        /// <summary>
+        /// Bör anropas när aktiv par-flik byts i Tabs-läget.
+        /// </summary>
+        public void NotifyActivePairTabChanged()
+        {
+            var sym = _view?.GetActivePairTabSymbolOrNull();
+            if (!string.IsNullOrWhiteSpace(sym))
+                _presenter?.OnActivePairTabChanged(sym);
+        }
+
     }
 }

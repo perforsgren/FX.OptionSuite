@@ -319,6 +319,17 @@ namespace FX.UI.WinForms
 
         #region === Sessions & tabs ===
 
+        /// <summary>
+        /// Returnerar aktiv Vol-session baserat på vald flik i workspace.
+        /// </summary>
+        private VolSessionControl GetActiveSession()
+        {
+            if (_tabs == null) return null;
+            var page = _tabs.SelectedTab;
+            return page?.Tag as VolSessionControl;
+        }
+
+
         // NY — koppla vyns UiStateChanged en gång (idempotent)
         private void SubscribeViewUiEvents(Features.VolManager.VolManagerView view)
         {
@@ -1001,6 +1012,22 @@ namespace FX.UI.WinForms
                 if (found != null) return found;
             }
             return null;
+        }
+
+
+        #endregion
+
+        #region === Hotkeys & commands ===
+
+        /// <summary>
+        /// Kör "Refresh all" för aktiv session (force=true → bypass cache, F5).
+        /// </summary>
+        private async void RefreshActiveSessionAsync()
+        {
+            var ses = GetActiveSession(); // din befintliga hjälpare som hämtar vald VolSessionControl
+            if (ses == null) return;
+            try { await ses.RefreshAllAsync(force: true).ConfigureAwait(false); }
+            catch { /* best effort */ }
         }
 
 
