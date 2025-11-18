@@ -175,5 +175,10 @@ namespace FX.Infrastructure.VolDb
         {
             return new MySqlConnection(_connectionString);
         }
+
+
+
+
+
     }
 }

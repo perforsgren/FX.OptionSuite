@@ -21,9 +21,10 @@ namespace FX.UI.WinForms.Features.VolManager
 
         #region Fields
 
-        private readonly IVolRepository _repo;
-        // vy-referens för UI-bindningar (BeginInvoke, BindPairSurface/UpdateTile)
         private VolManagerView _view;
+
+        private readonly IVolRepository _repo;
+        private IVolWriteRepository _writeRepo;
 
         // CTS per valutapar för att kunna avbryta pågående laddningar (debounce)
         private readonly Dictionary<string, CancellationTokenSource> _loadCtsByPair = new Dictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
@@ -33,12 +34,29 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Constructor & Init
 
         /// <summary>
-        /// Skapar en ny presenter för volytehantering.
+        /// Skapar en presenter för volytehantering med endast läs-repository.
+        /// Använd denna när publicering till DB inte behövs ännu.
         /// </summary>
         /// <param name="repo">Repository som läser från fxvol-schemat.</param>
         public VolManagerPresenter(IVolRepository repo)
         {
-            _repo = repo ?? throw new ArgumentNullException(nameof(repo));
+            if (repo == null) throw new ArgumentNullException(nameof(repo));
+            _repo = repo;
+            _writeRepo = null; // ingen publicering i denna väg
+        }
+
+        /// <summary>
+        /// Skapar en presenter för volytehantering med både läs- och skriv-repository,
+        /// möjliggörande publicering (Publish) till databasen.
+        /// </summary>
+        /// <param name="repo">Läs-repository (fxvol-schemat).</param>
+        /// <param name="writeRepo">Skriv-repository för publicering.</param>
+        public VolManagerPresenter(IVolRepository repo, IVolWriteRepository writeRepo)
+        {
+            if (repo == null) throw new ArgumentNullException(nameof(repo));
+            if (writeRepo == null) throw new ArgumentNullException(nameof(writeRepo));
+            _repo = repo;
+            _writeRepo = writeRepo;
         }
 
         /// <summary>
@@ -187,7 +205,46 @@ namespace FX.UI.WinForms.Features.VolManager
 
         #endregion
 
-        #region Public API – Refresh & Load
+        #region Public APIs
+
+
+        // using FX.Core.Domain;
+        // using FX.Core.Interfaces;
+        // using System.Threading;
+        // using System.Threading.Tasks;
+
+        public void SetWriteRepository(IVolWriteRepository repo)
+        {
+            _writeRepo = repo; // _writeRepo: lägg privat fält i klassen om det saknas: private IVolWriteRepository _writeRepo;
+        }
+
+        /// <summary>
+        /// Publicerar ändringar för ett par via IVolWriteRepository.
+        /// Returnerar true om publicering lyckades (audit-id > 0).
+        /// </summary>
+        /// <param name="user">Användarnamn (kan vara null/tomt – ersätts med Environment.UserName).</param>
+        /// <param name="pair">Valutapar, t.ex. "EUR/USD".</param>
+        /// <param name="tsUtc">Publiceringstid (UTC).</param>
+        /// <param name="rows">Rader att publicera.</param>
+        /// <param name="ct">Avbryt-token.</param>
+        public async Task<bool> PublishAsync(
+            string user,
+            string pair,
+            DateTime tsUtc,
+            IReadOnlyList<VolPublishRow> rows,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(pair)) return false;
+            if (rows == null || rows.Count == 0) return false;
+            if (_writeRepo == null) return false; // borde inte ske efter 6d-3
+
+            var u = string.IsNullOrWhiteSpace(user) ? Environment.UserName : user;
+            var auditId = await _writeRepo.UpsertSurfaceRowsAsync(u, pair, tsUtc, rows, ct).ConfigureAwait(false);
+
+            return auditId > 0;
+        }
+
+
 
         /// <summary>
         /// Hämtar en yta för ett par och binder den i vyn (Tabs/Tiles) med debounce.
@@ -655,6 +712,23 @@ namespace FX.UI.WinForms.Features.VolManager
 
 
         #endregion
+
+
+
+
+
+        /// <summary>
+        /// Publish-stub: ingen DB-skrivning. Returnerar true om det finns något att publicera.
+        /// </summary>
+        public Task<bool> PublishDraftAsync(string pair, int draftCount)
+        {
+            // Här kommer 6d senare att göra riktig persistens + audit.
+            return Task.FromResult(draftCount > 0);
+        }
+
+
+
+
 
     }
 }

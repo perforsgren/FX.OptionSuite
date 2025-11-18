@@ -3,8 +3,12 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.Linq;
+using System.Threading.Tasks;
+using System.Threading;
 using System.Windows.Forms;
 using FX.Core.Domain;
+using FX.Core.Interfaces;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.Window;
 
 namespace FX.UI.WinForms.Features.VolManager
 {
@@ -52,6 +56,7 @@ namespace FX.UI.WinForms.Features.VolManager
             public decimal? Bf10Mid { get; set; }
             public decimal? AtmSpread { get; set; } // icke-ankrat
             public decimal? AtmOffset { get; set; } // ankrat
+            public decimal? AtmMid { get; set; }
         }
 
         /// <summary>
@@ -160,7 +165,6 @@ namespace FX.UI.WinForms.Features.VolManager
             if (h != null) h(this, EventArgs.Empty);
         }
 
-
         /// <summary>
         /// Representerar minsta UI-state för en session (Pinned/Recent + vyläge/tiles).
         /// </summary>
@@ -264,63 +268,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 RebuildTilesFromPinned(force: false);
         }
 
-
-        /// <summary>
-        /// Läser state från presenter och applicerar på UI (Pinned/Recent, vy-läge, Tiles-kolumnläge).
-        /// Kallas efter att layout och kontroller är skapade.
-        /// </summary>
-        private void TryApplyLoadedState()
-        {
-            if (_presenter == null) return;
-
-            var state = _presenter.LoadUiState();
-
-            // Fyll Pinned/Recent
-            var lstPinned = FindChild<ListBox>(this, "LstPinned");
-            var lstRecent = FindChild<ListBox>(this, "LstRecent");
-
-            if (lstPinned != null)
-            {
-                lstPinned.Items.Clear();
-                foreach (var p in state.Pinned) lstPinned.Items.Add(p);
-            }
-            if (lstRecent != null)
-            {
-                lstRecent.Items.Clear();
-                foreach (var p in state.Recent) lstRecent.Items.Add(p);
-            }
-
-            // Tiles-kolumnläge
-            _tileColumnsMode = string.Equals(state.TileColumns, "AtmOnly", StringComparison.OrdinalIgnoreCase)
-                ? TileColumnsMode.AtmOnly
-                : TileColumnsMode.Compact;
-
-            var rbAtmOnly = FindChild<RadioButton>(this, "RbTileAtmOnly");
-            var rbCompact = FindChild<RadioButton>(this, "RbTileCompact");
-            if (rbAtmOnly != null) rbAtmOnly.Checked = (_tileColumnsMode == TileColumnsMode.AtmOnly);
-            if (rbCompact != null) rbCompact.Checked = (_tileColumnsMode == TileColumnsMode.Compact);
-
-            // Skapa flikar för alla pinnade (utan force)
-            if (lstPinned != null)
-            {
-                foreach (var it in lstPinned.Items.Cast<object>())
-                {
-                    var pair = it as string;
-                    if (!string.IsNullOrWhiteSpace(pair))
-                        PinPair(pair);
-                }
-            }
-
-            // Växla vy
-            if (string.Equals(state.View, "Tiles", StringComparison.OrdinalIgnoreCase))
-                ShowTilesView(forceInitialLoad: false);
-            else
-                ShowTabsView();
-
-            // Spara normaliserat läge direkt (valfritt)
-            SaveUiStateFromControls();
-        }
-
         /// <summary>
         /// Läser Pinned/Recent/View/TileColumns från UI, sparar till presentern
         /// och signalerar till workspace att persist sker (UiStateChanged).
@@ -363,8 +310,6 @@ namespace FX.UI.WinForms.Features.VolManager
             OnUiStateChanged();
         }
 
-
-
         /// <summary>
         /// Triggar en Refresh från hotkey: i Tiles-läge uppdateras ALLA tiles,
         /// i Tabs-läge uppdateras enbart den aktiva pair-fliken.
@@ -381,7 +326,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 RefreshActivePair(force);
             }
         }
-
 
         /// <summary>
         /// Uppdaterar alla tiles i Tiles-vyn (om den är aktiv).
@@ -400,7 +344,6 @@ namespace FX.UI.WinForms.Features.VolManager
             }
         }
 
-
         /// <summary>
         /// Laddar om aktiv pair-flik via presentern. force=true bypassar cache (Ctrl+F5).
         /// </summary>
@@ -417,7 +360,6 @@ namespace FX.UI.WinForms.Features.VolManager
 
             AddToRecent(pair, 10);
         }
-
 
         /// <summary>
         /// Laddar om data (senaste snapshot) för den aktiva pair-fliken.
@@ -471,9 +413,9 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Public API – Databindning (från Presenter)
 
         /// <summary>
-        /// Binder ytrader i Tabs för ett visst par. Lägger även en baseline per rad (Before),
-        /// applicerar draft-värden, och uppdaterar header + edits-räknare.
-        /// För icke-ankrade par beräknas ATM_adj(Before) = ATM_ask − ATM_bid.
+        /// Binder en volyta till parflikens grid. Sätter cellvärden *per kolumnnamn* (inte via index)
+        /// för att undvika kolumnförskjutningar när ATM-justeringskolumnen (Spread/Offset) finns.
+        /// Bygger även baseline-kartan (row.Tag) för Review (ATM_bid/ask/mid, RR/BF, ATM_adj).
         /// </summary>
         public void BindPairSurface(string pair, DateTime tsUtc, IList<VolSurfaceRow> rows, bool fromCache)
         {
@@ -497,25 +439,40 @@ namespace FX.UI.WinForms.Features.VolManager
             grid.Rows.Clear();
             if (rows == null) rows = Array.Empty<VolSurfaceRow>();
 
+            // Lokal hjälp: sätt cell via kolumnnamn (Name eller HeaderText). Ingen throw vid saknad kolumn.
+            int ColIndexByNameOrHeader(DataGridView g, string nameOrHeader)
+            {
+                foreach (DataGridViewColumn c in g.Columns)
+                    if (string.Equals(c.Name, nameOrHeader, StringComparison.OrdinalIgnoreCase)) return c.Index;
+                foreach (DataGridViewColumn c in g.Columns)
+                    if (string.Equals(c.HeaderText, nameOrHeader, StringComparison.OrdinalIgnoreCase)) return c.Index;
+                return -1;
+            }
+            void SetCell(DataGridViewRow r, string colKey, object value)
+            {
+                var idx = ColIndexByNameOrHeader(grid, colKey);
+                if (idx >= 0) r.Cells[idx].Value = value ?? "";
+            }
+
             foreach (var r in rows)
             {
                 var ri = grid.Rows.Add();
                 var row = grid.Rows[ri];
 
-                // 0–1: Tenor + nominal days
-                row.Cells[0].Value = r.TenorCode ?? "";
-                row.Cells[1].Value = r.TenorDaysNominal.HasValue ? (object)r.TenorDaysNominal.Value : "";
+                // Tenor + nominal days
+                SetCell(row, "Tenor", r.TenorCode ?? "");
+                SetCell(row, "DaysNom", r.TenorDaysNominal.HasValue ? (object)r.TenorDaysNominal.Value : "");
 
-                // 2–4: ATM Bid / Ask / Mid
-                row.Cells[2].Value = r.AtmBid;
-                row.Cells[3].Value = r.AtmAsk;
-                row.Cells[4].Value = r.AtmMid;
+                // ATM Bid / Ask / Mid
+                SetCell(row, "ATM_bid", r.AtmBid);
+                SetCell(row, "ATM_ask", r.AtmAsk);
+                SetCell(row, "ATM_mid", r.AtmMid);
 
-                // 5–8: RR25, RR10, BF25, BF10 (mid)
-                row.Cells[5].Value = r.Rr25Mid;
-                row.Cells[6].Value = r.Rr10Mid;
-                row.Cells[7].Value = r.Bf25Mid;
-                row.Cells[8].Value = r.Bf10Mid;
+                // RR/BF mids
+                SetCell(row, "RR25_mid", r.Rr25Mid);
+                SetCell(row, "RR10_mid", r.Rr10Mid);
+                SetCell(row, "BF25_mid", r.Bf25Mid);
+                SetCell(row, "BF10_mid", r.Bf10Mid);
 
                 // DB-baseline (“Before”) för Review
                 // För icke-ankrat par: ATM_adj = ask − bid; för ankrat: null (hanteras i senare steg).
@@ -548,10 +505,6 @@ namespace FX.UI.WinForms.Features.VolManager
             // Uppdatera "Edits: n"
             UpdateDraftEditsCounter(pair);
         }
-
-
-
-
 
 
         /// <summary>
@@ -590,7 +543,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 }
             }
         }
-
 
         /// <summary>
         /// Visar ett felmeddelande för ett visst par i aktuell vy (Tabs eller Tiles) som overlay.
@@ -666,7 +618,6 @@ namespace FX.UI.WinForms.Features.VolManager
             };
         }
 
-
         /// <summary>
         /// True om Tabs-läget är aktivt (pair-flikar ska visas/bindas).
         /// </summary>
@@ -697,28 +648,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 ? _pairTabs.SelectedTab?.Text
                 : null;
         }
-
-
-        #endregion
-
-        #region Public API – Kommandon (vy)
-
-        /// <summary>
-        /// Tar bort alla draft-ändringar för aktivt par.
-        /// </summary>
-        public void DiscardAllDraftForActivePair()
-        {
-            var page = _pairTabs?.SelectedTab;
-            var pair = page?.Text?.Trim().ToUpperInvariant();
-            if (string.IsNullOrEmpty(pair)) return;
-
-            if (_draftStore.ContainsKey(pair))
-                _draftStore.Remove(pair);
-
-            var grid = FindChild<DataGridView>(page);
-            grid?.Invalidate(); // ta bort gul markering
-        }
-
 
         #endregion
 
@@ -820,7 +749,6 @@ namespace FX.UI.WinForms.Features.VolManager
             }
         }
 
-
         /// <summary>
         /// Superkompakt kolumnuppsättning för Tiles: endast Tenor och ATM Mid (4 dp).
         /// </summary>
@@ -860,7 +788,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 DefaultCellStyle = new DataGridViewCellStyle { Format = "0.0000", Alignment = DataGridViewContentAlignment.MiddleRight }
             });
         }
-
 
         /// <summary>
         /// Kompakt tile-layout: Tenor + ATM/RR25/BF25 (4 dp).
@@ -918,7 +845,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 DefaultCellStyle = volStyle
             });
         }
-
 
         /// <summary>
         /// Sätter upp kolumner för huvudgrid i Tabs-läget.
@@ -1010,48 +936,402 @@ namespace FX.UI.WinForms.Features.VolManager
         #region Tabs-läge (grid & header)
 
         /// <summary>
-        /// Öppnar Review-dialogen (dry-run) för aktiv par-flik. Visar diff med Before→After.
+        /// Räknar ATM Mid och ATM Bid/Ask för en grid-rad utifrån aktuella cellvärden + baseline,
+        /// med stöd för anchored och non-anchored:
+        /// - Non-anchored:   Mid = ATM_mid (cell→baseline).
+        /// - Anchored:       Mid = AnchorMid + Offset, där AnchorMid ≈ (baseline ATM_mid − baseline ATM_adj), Offset = ATM_adj (cell→baseline).
+        /// - Spread:         ATM_spread (cell) → (ATM_ask − ATM_bid) (cell/header) → baseline (ATM_ask − ATM_bid).
+        /// Sätter cellerna "ATM_mid", "ATM_bid", "ATM_ask" om underlag finns.
         /// </summary>
-        private void ShowReviewDialogForActivePair()
+        private void RecomputeAtmForRow(DataGridView grid, DataGridViewRow row, bool anchored)
         {
-            var pair = GetActivePairFromTabs();
-            if (string.IsNullOrWhiteSpace(pair))
+            if (grid == null || row == null) return;
+
+            // Hjälpare: hämta cellvärde via Name eller HeaderText
+            decimal? getCell(string key) => TryGetCellDecimal(row, key);
+
+            // ---- Spread
+            decimal? spread = getCell("ATM_spread");
+            if (!spread.HasValue)
             {
-                MessageBox.Show(this, "Ingen aktiv par-flik.", "Review", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
+                // Försök härleda från Bid/Ask i celler (både Name "ATM_ask"/"ATM_bid" och Header "ATM Ask"/"ATM Bid")
+                var bid = getCell("ATM_bid") ?? getCell("ATM Bid");
+                var ask = getCell("ATM_ask") ?? getCell("ATM Ask");
+                if (bid.HasValue && ask.HasValue && ask.Value >= bid.Value)
+                    spread = ask.Value - bid.Value;
+            }
+            if (!spread.HasValue && row.Tag is Dictionary<string, decimal?> baseMap)
+            {
+                // Fallback till baseline
+                if (baseMap.TryGetValue("ATM_ask", out var a0) && a0.HasValue &&
+                    baseMap.TryGetValue("ATM_bid", out var b0) && b0.HasValue &&
+                    a0.Value >= b0.Value)
+                {
+                    spread = a0.Value - b0.Value;
+                }
             }
 
-            var grid = EnsurePairTabGrid(pair);
-            if (grid == null)
+            // ---- Mid
+            decimal? mid = null;
+            if (!anchored)
             {
-                MessageBox.Show(this, $"Ingen grid för {pair}.", "Review", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
+                mid = getCell("ATM_mid");
+                if (!mid.HasValue && row.Tag is Dictionary<string, decimal?> m1 && m1.TryGetValue("ATM_mid", out var m0) && m0.HasValue)
+                    mid = m0.Value;
+            }
+            else
+            {
+                decimal? anchorMid = null;
+                if (row.Tag is Dictionary<string, decimal?> bm)
+                {
+                    if (bm.TryGetValue("ATM_mid", out var dbMid) && dbMid.HasValue &&
+                        bm.TryGetValue("ATM_adj", out var dbOff) && dbOff.HasValue)
+                    {
+                        anchorMid = dbMid.Value - dbOff.Value;
+                    }
+                }
+                var offset = getCell("ATM_adj");
+                if (!offset.HasValue && row.Tag is Dictionary<string, decimal?> om && om.TryGetValue("ATM_adj", out var off0) && off0.HasValue)
+                    offset = off0.Value;
+
+                if (anchorMid.HasValue && offset.HasValue)
+                    mid = anchorMid.Value + offset.Value;
             }
 
-            var changes = BuildDraftDiffForPair(pair, grid);
-            var (hardCount, softCount) = CountRuleFlags(grid);
+            // ---- Skriv tillbaka
+            // Mid kan behöva uppdateras (t.ex. anchored när Offset ändras)
+            if (mid.HasValue && grid.Columns.Contains("ATM_mid"))
+                row.Cells["ATM_mid"].Value = mid.Value;
 
-            if (changes == null || changes.Count == 0)
+            if (mid.HasValue && spread.HasValue && spread.Value >= 0m)
             {
-                MessageBox.Show(this, "Inga draftade ändringar att reviewa.", "Volatility Manager",
-                                MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
+                var bidOut = mid.Value - spread.Value / 2m;
+                var askOut = mid.Value + spread.Value / 2m;
 
-            using (var dlg = BuildReviewDialog(pair, changes, hardCount, softCount))
-            {
-                dlg.StartPosition = FormStartPosition.CenterParent;
-                dlg.ShowDialog(this);
+                // Sätt via kolumnnamn om de finns
+                if (grid.Columns.Contains("ATM_bid")) row.Cells["ATM_bid"].Value = bidOut;
+                if (grid.Columns.Contains("ATM_ask")) row.Cells["ATM_ask"].Value = askOut;
             }
         }
 
 
+        /// <summary>
+        /// Visar en enkel inmatningsdialog för att sätta ett nytt ATM Mid-värde (decimal med punkt).
+        /// Returnerar det användaren matat in, eller null om avbrutet.
+        /// </summary>
+        private decimal? ShowSetAtmMidDialog(string pair, string tenor, decimal currentMid)
+        {
+            var dlg = new Form
+            {
+                Text = $"Set ATM Mid – {pair} / {tenor}",
+                StartPosition = FormStartPosition.CenterParent,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowIcon = false,
+                ShowInTaskbar = false,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                Width = 360,
+                Height = 160
+            };
+
+            var lbl = new Label { Left = 12, Top = 12, AutoSize = true, Text = "ATM Mid (use '.' as decimal):" };
+            var tb = new TextBox { Left = 12, Top = lbl.Bottom + 6, Width = dlg.ClientSize.Width - 24, Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top };
+            tb.Text = currentMid.ToString("0.####", CultureInfo.InvariantCulture);
+
+            var btnOk = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 90, Left = dlg.ClientSize.Width - 12 - 90 - 8 - 90, Top = tb.Bottom + 12, Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 90, Left = dlg.ClientSize.Width - 12 - 90, Top = tb.Bottom + 12, Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+
+            dlg.AcceptButton = btnOk;
+            dlg.CancelButton = btnCancel;
+
+            dlg.Controls.Add(lbl);
+            dlg.Controls.Add(tb);
+            dlg.Controls.Add(btnOk);
+            dlg.Controls.Add(btnCancel);
+
+            decimal? parsedOrNull(string s)
+            {
+                if (string.IsNullOrWhiteSpace(s)) return null;
+                s = s.Trim();
+                // Tillåt även komma – normalisera till punkt
+                if (s.IndexOf(',') >= 0) s = s.Replace(',', '.');
+                if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d))
+                    return d;
+                return null;
+            }
+
+            return dlg.ShowDialog(this) == DialogResult.OK ? parsedOrNull(tb.Text) : (decimal?)null;
+        }
 
         /// <summary>
-        /// Skapar en diff-lista (Tenor, Field, Old, New) genom att jämföra draftvärden
-        /// mot DB-baseline som snapshot:ats i BindPairSurface (radens row.Tag).
+        /// Försöker härleda AnchorMid för en rad i ett ankrat par ur baseline (row.Tag):
+        /// AnchorMid ≈ (baseline ATM_mid) − (baseline ATM_adj). Returnerar null om ej möjligt.
         /// </summary>
-        private List<VolDraftChange> BuildDraftDiffForPair(string pair, DataGridView grid)
+        private decimal? TryGetAnchorMidFromRow(DataGridViewRow row)
+        {
+            if (row?.Tag is Dictionary<string, decimal?> map)
+            {
+                var hasMid = map.TryGetValue("ATM_mid", out var mid);
+                var hasAdj = map.TryGetValue("ATM_adj", out var adj); // baseline offset i anchored
+                if (hasMid && hasAdj && mid.HasValue && adj.HasValue)
+                    return mid.Value - adj.Value;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Bygger ATM Bid/Mid/Ask-preview för en rad utifrån nuvarande cellvärden (inkl. ev. draft)
+        /// med robusta fallbacks för spread.
+        /// - Non-anchored: Mid = ATM_mid (cell → baseline).
+        /// - Anchored: Mid = AnchorMid + Offset, där AnchorMid ≈ (baseline ATM_mid − baseline ATM_adj).
+        /// - Spread: ATM_spread (cell) → (ATM_ask − ATM_bid) (cell: både "ATM_ask"/"ATM ask") → baseline "ATM_ask"/"ATM_bid".
+        /// Returnerar tooltip-text (punkt som decimal) eller null om ej beräkningsbart.
+        /// </summary>
+        private string BuildAtmPreviewTooltip(DataGridViewRow row, bool anchored)
+        {
+            if (row == null) return null;
+
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+            // ---- Spread: primärt från cell "ATM_spread"
+            decimal? spread = TryGetCellDecimal(row, "ATM_spread");
+
+            // Fallback 1: härled från Bid/Ask i celler (stöder både "ATM_ask"/"ATM ask" och "ATM_bid"/"ATM bid")
+            if (!spread.HasValue)
+            {
+                decimal? bid = TryGetCellDecimal(row, "ATM_bid");
+                if (!bid.HasValue) bid = TryGetCellDecimal(row, "ATM Bid");
+
+                decimal? ask = TryGetCellDecimal(row, "ATM_ask");
+                if (!ask.HasValue) ask = TryGetCellDecimal(row, "ATM Ask");
+
+                if (bid.HasValue && ask.HasValue && ask.Value >= bid.Value)
+                    spread = ask.Value - bid.Value;
+            }
+
+            // Fallback 2: baseline från row.Tag ("ATM_ask" / "ATM_bid")
+            if (!spread.HasValue && row.Tag is Dictionary<string, decimal?> baseMap)
+            {
+                if (baseMap.TryGetValue("ATM_ask", out var a0) && a0.HasValue &&
+                    baseMap.TryGetValue("ATM_bid", out var b0) && b0.HasValue &&
+                    a0.Value >= b0.Value)
+                {
+                    spread = a0.Value - b0.Value;
+                }
+            }
+
+            // ---- Mid
+            decimal? mid = null;
+
+            if (!anchored)
+            {
+                mid = TryGetCellDecimal(row, "ATM_mid");
+                if (!mid.HasValue && row.Tag is Dictionary<string, decimal?> map1 && map1.TryGetValue("ATM_mid", out var m0) && m0.HasValue)
+                    mid = m0.Value;
+            }
+            else
+            {
+                // AnchorMid ≈ baseline ATM_mid − baseline ATM_adj
+                decimal? anchorMid = null;
+                if (row.Tag is Dictionary<string, decimal?> map2)
+                {
+                    if (map2.TryGetValue("ATM_mid", out var bm) && bm.HasValue &&
+                        map2.TryGetValue("ATM_adj", out var bo) && bo.HasValue)
+                    {
+                        anchorMid = bm.Value - bo.Value;
+                    }
+                }
+
+                var offset = TryGetCellDecimal(row, "ATM_adj");
+                if (!offset.HasValue && row.Tag is Dictionary<string, decimal?> map3 && map3.TryGetValue("ATM_adj", out var off0) && off0.HasValue)
+                    offset = off0.Value;
+
+                if (anchorMid.HasValue && offset.HasValue)
+                    mid = anchorMid.Value + offset.Value;
+            }
+
+            // ---- Resultat
+            if (!mid.HasValue || !spread.HasValue || spread.Value < 0m) return null;
+
+            var bidOut = mid.Value - spread.Value / 2m;
+            var askOut = mid.Value + spread.Value / 2m;
+            return $"ATM Preview  Bid={bidOut.ToString("0.####", inv)}  Mid={mid.Value.ToString("0.####", inv)}  Ask={askOut.ToString("0.####", inv)}";
+        }
+
+        /// <summary>
+        /// Säkerställer att griden har en kontextmeny för ATM Mid när paret är anchored.
+        /// Högerklick på ATM_mid visar "Set ATM Mid…" som översätter till Offset=dMid.
+        /// </summary>
+        private void EnsureAtmContextMenuForGrid(DataGridView grid)
+        {
+            if (grid == null) return;
+
+            // Koppla mus-hanterare en gång
+            if (!string.Equals(grid.Tag as string, "edit-wired", StringComparison.OrdinalIgnoreCase))
+                return; // Wire görs i EnableEditingForPairGrid
+
+            grid.CellMouseDown -= OnPairGridCellMouseDown;
+            grid.CellMouseDown += OnPairGridCellMouseDown;
+        }
+
+        /// <summary>
+        /// Hanterar högerklick på ATM_mid för anchored par och visar kontextmeny "Set ATM Mid…".
+        /// Utfallet blir att AtmOffset skrivs till draft (NewOffset = NewMid − AnchorMid).
+        /// </summary>
+        private void OnPairGridCellMouseDown(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            var grid = sender as DataGridView;
+            if (grid == null || e.Button != MouseButtons.Right || e.RowIndex < 0 || e.ColumnIndex < 0) return;
+
+            var col = grid.Columns[e.ColumnIndex];
+            if (col == null || !string.Equals(col.Name, "ATM_mid", StringComparison.OrdinalIgnoreCase)) return;
+
+            var pair = GetActivePairFor(grid);
+            if (string.IsNullOrWhiteSpace(pair) || !_presenter.IsAnchoredPair(pair)) return;
+
+            var row = grid.Rows[e.RowIndex];
+            var tenor = GetTenorFromRow(row);
+            if (string.IsNullOrEmpty(tenor)) return;
+
+            // Läs aktuellt Mid (display) – används som default i dialogen
+            var curMid = TryGetCellDecimal(row, "ATM_mid") ?? 0m;
+
+            // Skapa enkel CM på plats
+            var cms = new ContextMenuStrip
+            {
+                ShowImageMargin = false,
+                ShowCheckMargin = false
+            };
+            var mi = new ToolStripMenuItem("Set ATM Mid"); 
+            cms.Items.Add(mi);
+            mi.Click += (s, _e) =>
+            {
+                var newMid = ShowSetAtmMidDialog(pair, tenor, curMid);
+                if (!newMid.HasValue) return;
+
+                var anchorMid = TryGetAnchorMidFromRow(row);
+                if (!anchorMid.HasValue)
+                {
+                    MessageBox.Show(this, "AnchorMid saknas i baseline (row.Tag). Kan inte räkna Offset.", "Volatility Manager",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                var newOffset = newMid.Value - anchorMid.Value;
+
+                // Skriv till draft (AtmOffset) och uppdatera Offset-cellen
+                UpsertDraftValue(pair, tenor, "AtmOffset", newOffset);
+                if (grid.Columns.Contains("ATM_adj"))
+                    row.Cells["ATM_adj"].Value = newOffset;
+
+                // Kör radregler (hårda/mjuka)
+                var hard = new List<string>();
+                var soft = new List<string>();
+                EvaluateRowRules_Scoped(row, true, hard, soft);
+                if (hard.Count > 0) row.ErrorText = string.Join("  ", hard);
+
+                // Draft-räknare + repaint
+                UpdateDraftEditsCounter(pair);
+                grid.InvalidateRow(e.RowIndex);
+            };
+
+            // Visa vid klickposition
+            cms.Show(Cursor.Position);
+        }
+
+
+        /// <summary>
+        /// Säkerställer att grid har separata kolumner för "ATM Offset" (ATM_adj) och "ATM Spread" (ATM_spread),
+        /// samt sätter synlighet och ReadOnly enligt ankarstatus.
+        /// </summary>
+        private void EnsureAtmColumnsAndVisibility(DataGridView grid, bool anchored)
+        {
+            if (grid == null) return;
+
+            // 1) ATM Offset-kolumn (ATM_adj) – ska alltid finnas, permanent header "ATM Offset"
+            var colOffset = grid.Columns.Cast<DataGridViewColumn>()
+                .FirstOrDefault(c => string.Equals(c.Name, "ATM_adj", StringComparison.OrdinalIgnoreCase));
+            if (colOffset != null)
+            {
+                colOffset.HeaderText = "ATM Offset";
+                colOffset.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                colOffset.Width = Math.Max(colOffset.Width, 90);
+            }
+
+            // 2) ATM Spread-kolumn (ATM_spread) – skapa om den saknas
+            var colSpread = grid.Columns.Cast<DataGridViewColumn>()
+                .FirstOrDefault(c => string.Equals(c.Name, "ATM_spread", StringComparison.OrdinalIgnoreCase));
+            if (colSpread == null)
+            {
+                colSpread = new DataGridViewTextBoxColumn
+                {
+                    Name = "ATM_spread",
+                    HeaderText = "ATM Spread",
+                    Width = 90,
+                    SortMode = DataGridViewColumnSortMode.NotSortable,
+                    DefaultCellStyle = new DataGridViewCellStyle
+                    {
+                        Alignment = DataGridViewContentAlignment.MiddleCenter
+                    },
+                    ReadOnly = false
+                };
+                // Placera bredvid ATM_mid om möjligt
+                var idxMid = grid.Columns.Contains("ATM_mid") ? grid.Columns["ATM_mid"].Index : -1;
+                var insertAt = idxMid >= 0 ? idxMid + 1 : grid.Columns.Count;
+                grid.Columns.Insert(insertAt, colSpread);
+            }
+            else
+            {
+                colSpread.HeaderText = "ATM Spread";
+                colSpread.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                colSpread.Width = Math.Max(colSpread.Width, 90);
+            }
+
+            // 3) Synlighet/ReadOnly per ankarstatus
+            // Anchored: visa båda (Offset + Spread); Mid = RO
+            // Non-anchored: visa endast Spread; Offset göms; Mid = editerbar
+            if (anchored)
+            {
+                if (colOffset != null)
+                {
+                    colOffset.Visible = true;
+                    colOffset.ReadOnly = false;   // Offset editerbar vid anchored
+                }
+                if (colSpread != null)
+                {
+                    colSpread.Visible = true;
+                    colSpread.ReadOnly = false;   // Spread editerbar vid anchored
+                }
+                if (grid.Columns.Contains("ATM_mid"))
+                {
+                    grid.Columns["ATM_mid"].ReadOnly = true; // Mid härledd vid anchored
+                }
+            }
+            else
+            {
+                if (colOffset != null)
+                {
+                    colOffset.Visible = false;    // Offset används ej i non-anchored UI
+                }
+                if (colSpread != null)
+                {
+                    colSpread.Visible = true;
+                    colSpread.ReadOnly = false;   // Spread editerbar
+                }
+                if (grid.Columns.Contains("ATM_mid"))
+                {
+                    grid.Columns["ATM_mid"].ReadOnly = false; // Mid editerbar vid non-anchored
+                }
+            }
+        }
+
+
+        /// <summary>
+        /// Bygger diff-listan (Tenor, Field, Old, New) från draft-lagret för ett par
+        /// genom att jämföra mot baseline som lades i row.Tag i BindPairSurface.
+        /// Inkluderar "ATM Mid" (baseline-nyckel: "ATM_mid").
+        /// </summary>
+        private List<VolDraftChange> BuildDraftDiffForPair(string pair, DataGridView grid) // ERSÄTT
         {
             var list = new List<VolDraftChange>();
             if (string.IsNullOrWhiteSpace(pair) || grid == null) return list;
@@ -1059,13 +1339,13 @@ namespace FX.UI.WinForms.Features.VolManager
             if (!_draftStore.TryGetValue(pair, out var perPair) || perPair == null || perPair.Count == 0)
                 return list;
 
-            foreach (var kv in perPair) // kv.Key = Tenor
+            foreach (var kv in perPair)
             {
                 var tenor = kv.Key;
                 var d = kv.Value;
                 if (d == null) continue;
 
-                // Hitta rad för aktuellt tenor
+                // Hitta grid-rad för detta tenor (för att läsa baseline från row.Tag)
                 DataGridViewRow row = null;
                 foreach (DataGridViewRow r in grid.Rows)
                 {
@@ -1074,20 +1354,22 @@ namespace FX.UI.WinForms.Features.VolManager
                 }
                 if (row == null) continue;
 
-                // Baseline (“Before”) som sattes i BindPairSurface via row.Tag
+                // Baseline (“Before”) satt i BindPairSurface via row.Tag
                 var baseMap = row.Tag as Dictionary<string, decimal?> ?? new Dictionary<string, decimal?>();
 
                 decimal? GetOld(string fieldKey)
                 {
                     switch (fieldKey)
                     {
+                        case "ATM Mid": return baseMap.TryGetValue("ATM_mid", out var mid) ? mid : (decimal?)null;
+
                         case "RR25 Mid": return baseMap.TryGetValue("RR25", out var rr25) ? rr25 : (decimal?)null;
                         case "RR10 Mid": return baseMap.TryGetValue("RR10", out var rr10) ? rr10 : (decimal?)null;
                         case "BF25 Mid": return baseMap.TryGetValue("BF25", out var bf25) ? bf25 : (decimal?)null;
                         case "BF10 Mid": return baseMap.TryGetValue("BF10", out var bf10) ? bf10 : (decimal?)null;
 
-                        // NYTT: hämta ATM Spread/Offset “Before” från baseline-nyckeln "ATM_adj".
-                        // För icke-ankrat par är detta Ask−Bid; för ankrat kan den vara null (visas som blankt).
+                        // ATM Spread/Offset hämtas ur baseline-nyckeln "ATM_adj".
+                        // Icke-ankrat: "Before" = ask−bid; ankrat: kan vara null (visas blankt).
                         case "ATM Spread":
                         case "ATM Offset":
                             return baseMap.TryGetValue("ATM_adj", out var adj) ? adj : (decimal?)null;
@@ -1113,6 +1395,10 @@ namespace FX.UI.WinForms.Features.VolManager
                     }
                 }
 
+                // Viktigt: ATM Mid ska vara med i diffen
+                addIfChanged("ATM Mid", d.AtmMid);
+
+                // Övriga fält
                 addIfChanged("ATM Spread", d.AtmSpread);
                 addIfChanged("ATM Offset", d.AtmOffset);
                 addIfChanged("RR25 Mid", d.Rr25Mid);
@@ -1121,11 +1407,9 @@ namespace FX.UI.WinForms.Features.VolManager
                 addIfChanged("BF10 Mid", d.Bf10Mid);
             }
 
-            // Sortera i samma ordning som tenor-etiketterna (alfabetiskt räcker här)
             list.Sort((a, b) => string.CompareOrdinal(a.Tenor, b.Tenor));
             return list;
         }
-
 
 
         /// <summary>
@@ -1152,257 +1436,385 @@ namespace FX.UI.WinForms.Features.VolManager
         }
 
         /// <summary>
-        /// Bygger en modal Review-dialog (dry-run) som visar Tenor/Field och Before→After,
-        /// samt mjuka varningar. Knappen Publish är avsiktligt disabled i 6c.
-        /// Metoden är tolerant mot olika egenskapsnamn i VolDraftChange (Before/After/Warning
-        /// eller Old/New/SoftWarn etc).
+        /// Hämtar UI-behållaren (PairTabUi) för ett givet valutapar
+        /// från TabControl-layouten. Returnerar null om fliken inte finns.
+        /// </summary>
+        private PairTabUi GetPairTabUi(string pair)
+        {
+            if (_pairTabs == null) return null;
+
+            foreach (TabPage page in _pairTabs.TabPages)
+            {
+                if (page.Tag is PairTabUi ui &&
+                    string.Equals(ui.PairSymbol, pair, StringComparison.OrdinalIgnoreCase))
+                    return ui;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Försöker läsa snapshotens UTC-tidsstämpel för ett par från den aktiva pair-gridens baseline
+        /// (sparad i DataGridViewRow.Tag vid bindningen). Returnerar null om ingen baseline hittas.
+        /// </summary>
+        private DateTime? ResolveSnapshotTsUtcForPair(string pair)
+        {
+            if (string.IsNullOrWhiteSpace(pair) || _pairTabs == null) return null;
+
+            var grid = EnsurePairTabGrid(pair.Trim().ToUpperInvariant());
+            if (grid == null) return null;
+
+            foreach (DataGridViewRow r in grid.Rows)
+            {
+                var tag = r?.Tag as System.Collections.Generic.Dictionary<string, object>;
+                if (tag != null && tag.TryGetValue("SnapshotTsUtc", out var o) && o is DateTime dt)
+                    return dt;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Bygger Review-dialogen (draft-rader + QC). Förutom cross-tenor-QC lägger vi även in
+        /// intra-tenor (radvisa) hårda fel som "QC: Intra-tenor (hard)" baserat på gridens Row.ErrorText.
         /// </summary>
         private Form BuildReviewDialog(string pair, List<VolDraftChange> changes, int hardCount, int softCount)
         {
+            string F4(decimal? x) => x.HasValue
+                ? x.Value.ToString("0.0000", CultureInfo.InvariantCulture)
+                : string.Empty;
+
             var dlg = new Form
             {
-                Text = $"Review – {pair} (Dry-run)",
-                Width = 880,
-                Height = 520,
+                Text = $"Review – {pair}",
+                StartPosition = FormStartPosition.CenterParent,
                 MinimizeBox = false,
                 MaximizeBox = false,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
                 ShowIcon = false,
                 ShowInTaskbar = false,
-                StartPosition = FormStartPosition.CenterParent
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                Width = 880,
+                Height = 520
             };
 
-            var info = new Label
+            var lblHeader = new Label
             {
-                Dock = DockStyle.Top,
-                Height = 32,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(10, 0, 0, 0),
-                Text = $"Draft changes: {changes?.Count ?? 0}   |   Hard errors: {hardCount}   |   Soft warnings: {softCount}"
+                AutoSize = true,
+                Text = $"Draft changes: {changes?.Count ?? 0}  |  Hard errors: {hardCount}  |  Soft warnings: {softCount}",
+                Left = 8,
+                Top = 8
             };
+            dlg.Controls.Add(lblHeader);
 
             var grid = new DataGridView
             {
-                Dock = DockStyle.Fill,
+                Left = 8,
+                Top = lblHeader.Bottom + 8,
+                Width = dlg.ClientSize.Width - 16,
+                Height = dlg.ClientSize.Height - 16 - 44 - (lblHeader.Bottom + 8),
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 ReadOnly = true,
                 AllowUserToAddRows = false,
                 AllowUserToDeleteRows = false,
-                AllowUserToResizeRows = false,
-                RowHeadersVisible = false,
+                AllowUserToOrderColumns = false,
+                MultiSelect = false,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                RowHeadersVisible = false,
                 BackgroundColor = Color.White,
-                GridColor = Color.Gainsboro,
+                GridColor = Color.FromArgb(220, 220, 220),
                 EnableHeadersVisualStyles = false
             };
 
-            // Pricer-lik look
-            grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(242, 246, 251);
-            grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.Black;
-            grid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
-            grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 8.25f, FontStyle.Bold);
-            grid.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
-            grid.Font = new Font("Segoe UI", 8.25f, FontStyle.Regular);
-            grid.RowsDefaultCellStyle.BackColor = Color.White;
-            grid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(250, 251, 253);
-
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tenor", HeaderText = "Tenor", FillWeight = 90 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Field", HeaderText = "Field", FillWeight = 130 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn
+            grid.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
             {
-                Name = "Old",
-                HeaderText = "Before",
-                FillWeight = 90,
-                DefaultCellStyle = new DataGridViewCellStyle { Format = "0.0000" }
-            });
-            grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "New",
-                HeaderText = "After",
-                FillWeight = 90,
-                DefaultCellStyle = new DataGridViewCellStyle { Format = "0.0000" }
-            });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Warn", HeaderText = "Warnings (soft)", FillWeight = 230 });
-
-            // Lokal, enkel mappare som tål olika property-namn utan att kräva ändringar i övrig kod.
-            object ReadProp(object o, params string[] names)
-            {
-                if (o == null) return null;
-                var t = o.GetType();
-                foreach (var n in names)
-                {
-                    var p = t.GetProperty(n, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.IgnoreCase);
-                    if (p != null) return p.GetValue(o);
-                }
-                return null;
-            }
-            string ReadString(object o, params string[] names) => ReadProp(o, names) as string;
-            decimal? ReadDec(object o, params string[] names)
-            {
-                var v = ReadProp(o, names);
-                if (v == null) return null;
-                if (v is decimal d) return d;
-                if (v is double dbl) return (decimal)dbl;
-                if (v is float fl) return (decimal)fl;
-                if (v is string s && decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dp)) return dp;
-                return null;
-            }
-
-            if (changes != null)
-            {
-                foreach (var c in changes)
-                {
-                    var tenor = ReadString(c, "TenorCode", "Tenor") ?? "";
-                    var field = ReadString(c, "Field") ?? "";
-                    var before = ReadDec(c, "Before", "Old", "OldValue");
-                    var after = ReadDec(c, "After", "New", "NewValue");
-                    var warn = ReadString(c, "Warning", "Warn", "SoftWarning") ?? "";
-
-                    grid.Rows.Add(tenor, field, before, after, warn);
-                }
-            }
-
-            // Bottenpanel med Close + (disabled) Publish i 6c
-            var pnlButtons = new Panel { Dock = DockStyle.Bottom, Height = 44 };
-
-            var btnClose = new Button
-            {
-                Name = "BtnDialogClose",
-                Text = "Close",
-                Size = new Size(90, 28),
-                Anchor = AnchorStyles.Right | AnchorStyles.Bottom
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(245, 246, 248),
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold)
             };
+            grid.DefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI", 9F, FontStyle.Regular)
+            };
+            grid.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Tenor", Width = 90, SortMode = DataGridViewColumnSortMode.NotSortable });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Field", Width = 180, SortMode = DataGridViewColumnSortMode.NotSortable });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Before", Width = 120, SortMode = DataGridViewColumnSortMode.NotSortable });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "After", Width = 120, SortMode = DataGridViewColumnSortMode.NotSortable });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Warnings (soft) / Preview", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, SortMode = DataGridViewColumnSortMode.NotSortable });
+
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+            var activeGrid = GetActivePairGrid();
+
+            // 1) Draft-rader + ATM-preview
+            foreach (var c in (changes ?? new List<VolDraftChange>()))
+            {
+                var note = TryGetWarning(c);
+                if (activeGrid != null &&
+                    (c.Field == "ATM Mid" || c.Field == "ATM Spread" || c.Field == "ATM Offset"))
+                {
+                    // lägg ATM-preview i noten
+                    DataGridViewRow row = null;
+                    foreach (DataGridViewRow r in activeGrid.Rows)
+                    {
+                        var t = r.Cells["Tenor"]?.Value?.ToString();
+                        if (string.Equals(t, c.Tenor, StringComparison.OrdinalIgnoreCase)) { row = r; break; }
+                    }
+                    if (row != null)
+                    {
+                        var preview = BuildAtmPreviewTooltip(row, anchored);
+                        if (!string.IsNullOrEmpty(preview))
+                            note = string.IsNullOrEmpty(note) ? preview : (note + "  |  " + preview);
+                    }
+                }
+                grid.Rows.Add(c.Tenor, c.Field, F4(c.Old), F4(c.New), note);
+            }
+
+            // 2) QC: intra-tenor (hårda) – ta radfel från den aktiva griden
+            var intraHardAdd = 0;
+            if (activeGrid != null)
+            {
+                foreach (DataGridViewRow r in activeGrid.Rows)
+                {
+                    if (!string.IsNullOrWhiteSpace(r.ErrorText))
+                    {
+                        var t = GetTenorFromRow(r) ?? "?";
+                        grid.Rows.Add(t, "QC: Intra-tenor (hard)", "", "", r.ErrorText);
+                        intraHardAdd++;
+                    }
+                }
+            }
+
+            // 3) QC: cross-tenor (som tidigare)
+            var crossHardAdd = 0;
+            var crossSoftAdd = 0;
+            if (activeGrid != null)
+            {
+                var qc = BuildCrossTenorQcRows(pair, activeGrid);
+                crossHardAdd = qc.Item1;
+                crossSoftAdd = qc.Item2;
+                foreach (var t in qc.Item3)
+                    grid.Rows.Add(t.Item1, t.Item2, t.Item3, t.Item4, t.Item5);
+            }
+
+            // Uppdatera headern med totala counts
+            var totalHard = hardCount + intraHardAdd + crossHardAdd;
+            var totalSoft = softCount + crossSoftAdd;
+            lblHeader.Text = $"Draft changes: {changes?.Count ?? 0}  |  Hard errors: {totalHard}  |  Soft warnings: {totalSoft}";
+
+            dlg.Controls.Add(grid);
+
+            // Knappar
+            var pnlButtons = new Panel { Dock = DockStyle.Bottom, Height = 44 };
+            dlg.Controls.Add(pnlButtons);
+
+            var btnClose = new Button { Text = "Close", Size = new Size(90, 28), Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
             btnClose.Click += (s, e) => dlg.Close();
+            pnlButtons.Controls.Add(btnClose);
 
             var btnPublish = new Button
             {
                 Name = "BtnDialogPublish",
                 Text = "Publish",
-                Enabled = false, // 6c: dry-run – aktiveras i 6d
+                Enabled = (changes?.Count ?? 0) > 0,
                 Size = new Size(90, 28),
                 Anchor = AnchorStyles.Right | AnchorStyles.Bottom
             };
-            btnPublish.Click += OnDialogPublishClick;
-
-            pnlButtons.Controls.Add(btnClose);
-            pnlButtons.Controls.Add(btnPublish);
-            pnlButtons.Resize += (s, e) =>
+            btnPublish.Click += async (s, e) =>
             {
-                btnClose.Left = pnlButtons.ClientSize.Width - btnClose.Width - 12;
-                btnClose.Top = (pnlButtons.ClientSize.Height - btnClose.Height) / 2;
-                btnPublish.Left = btnClose.Left - btnPublish.Width - 8;
-                btnPublish.Top = btnClose.Top;
+                btnPublish.Enabled = false;
+                try
+                {
+                    var tsOpt = ResolveSnapshotTsUtcForPair(pair);
+                    var tsUtc = tsOpt ?? DateTime.UtcNow;
+                    using (var cts = new CancellationTokenSource())
+                        await HandlePublishAsync(pair, tsUtc, changes ?? new List<VolDraftChange>(), dlg, cts.Token);
+                }
+                finally { btnPublish.Enabled = true; }
             };
+            pnlButtons.Controls.Add(btnPublish);
 
-            dlg.Controls.Add(grid);
-            dlg.Controls.Add(pnlButtons);
-            dlg.Controls.Add(info);
+            // Layout
+            dlg.Load += (s, e) =>
+            {
+                btnClose.Left = dlg.ClientSize.Width - 8 - btnClose.Width;
+                btnClose.Top = 8;
+                btnPublish.Left = btnClose.Left - 8 - btnPublish.Width;
+                btnPublish.Top = 8;
+            };
+            dlg.Resize += (s, e) =>
+            {
+                btnClose.Left = dlg.ClientSize.Width - 8 - btnClose.Width;
+                btnPublish.Left = btnClose.Left - 8 - btnPublish.Width;
+                grid.Width = dlg.ClientSize.Width - 16;
+                grid.Height = dlg.ClientSize.Height - 16 - pnlButtons.Height - (lblHeader.Bottom + 8);
+            };
 
             return dlg;
         }
 
 
 
-
-
-
         /// <summary>
-        /// Ansluter validerings- och edit-händelser för ett par-grid.
+        /// Review-grid: säkerställer att numeriska kolumner "Before" och "After" alltid renderas
+        /// med decimalpunkt (.) och 4 decimaler, även om källdata råkar vara text med kommatecken.
+        /// Påverkar endast display; underliggande värden lämnas orörda.
         /// </summary>
-        private void HookValidationEvents(DataGridView grid) // NY
+        private void OnReviewGridCellFormattingNormalizeDecimals(object sender, DataGridViewCellFormattingEventArgs e)
         {
-            if (grid == null) return;
-            grid.CellValidating -= PairGrid_CellValidating;
-            grid.CellEndEdit -= PairGrid_CellEndEdit;
-            grid.DataError -= PairGrid_DataError;
+            var grid = sender as DataGridView;
+            if (grid == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
 
-            grid.CellValidating += PairGrid_CellValidating;
-            grid.CellEndEdit += PairGrid_CellEndEdit;
-            grid.DataError += PairGrid_DataError;
+            var col = grid.Columns[e.ColumnIndex];
+            if (col == null) return;
+
+            var isNumericDisplayCol =
+                string.Equals(col.HeaderText, "Before", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(col.HeaderText, "After", StringComparison.OrdinalIgnoreCase);
+
+            if (!isNumericDisplayCol || e.Value == null) return;
+
+            try
+            {
+                // Om värdet redan är decimal/double → formatera invariant.
+                if (e.Value is decimal dec)
+                {
+                    e.Value = dec.ToString("0.0000", CultureInfo.InvariantCulture);
+                    e.FormattingApplied = true;
+                    return;
+                }
+                if (e.Value is double dbl)
+                {
+                    e.Value = ((decimal)dbl).ToString("0.0000", CultureInfo.InvariantCulture);
+                    e.FormattingApplied = true;
+                    return;
+                }
+
+                // Om det är text: normalisera , → . och försök tolka.
+                var s = e.Value.ToString();
+                if (string.IsNullOrWhiteSpace(s)) return;
+
+                // Försök först med nuvarande kultur (tillåter både , och .)
+                if (decimal.TryParse(s, NumberStyles.Any, CultureInfo.CurrentCulture, out var p1))
+                {
+                    e.Value = p1.ToString("0.0000", CultureInfo.InvariantCulture);
+                    e.FormattingApplied = true;
+                    return;
+                }
+                // Fallback: byt , → . och kör invariant
+                s = s.Replace(',', '.');
+                if (decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var p2))
+                {
+                    e.Value = p2.ToString("0.0000", CultureInfo.InvariantCulture);
+                    e.FormattingApplied = true;
+                }
+            }
+            catch
+            {
+                // Display-only: vid fel låter vi standardformatet gälla.
+            }
         }
 
         /// <summary>
-        /// Cellvalidering: parsar tal & kör hårda kolumnregler.
-        /// Vi CANCEL:ar inte, så ENTER fungerar. Vid ogiltigt tal markerar vi revert.
-        /// Vid giltigt värde rensas ev. tidigare felindikatorer omedelbart.
-        /// Visar röd error-badge direkt genom explicit Invalidate av cellen.
+        /// Försöker plocka ev. “soft warning”-text från en VolDraftChange utan att anta exakt property-namn.
+        /// Stöder t.ex. "Warning", "SoftWarning", "Warn", "Message". Finns ingen → tom sträng.
+        /// </summary>
+        private static string TryGetWarning(VolDraftChange change)
+        {
+            if (change == null) return string.Empty;
+            var t = change.GetType();
+            var pi = t.GetProperty("Warning") ??
+                     t.GetProperty("SoftWarning") ??
+                     t.GetProperty("Warn") ??
+                     t.GetProperty("Message");
+            return (pi?.GetValue(change) as string) ?? string.Empty;
+        }
+
+        /// <summary>
+        /// Validerar editerbara celler. Skiljer på ATM Offset (ATM_adj) och ATM Spread (ATM_spread).
+        /// - Inmatning med komma/punkt tillåts.
+        /// - Anchored: ATM Offset |offset| ≤ 10.000.
+        /// - Non-anchored + Anchored: ATM Spread ≥ 0 och ≤ 2×ATM Mid (om Mid finns).
+        /// - BF25 Mid ≥ 0. Övriga endast numerisk kontroll här; relationer i EndEdit.
         /// </summary>
         private void PairGrid_CellValidating(object sender, DataGridViewCellValidatingEventArgs e)
         {
             var grid = sender as DataGridView;
-            if (grid == null) return;
-
-            var col = grid.Columns[e.ColumnIndex];
-            var name = col?.Name ?? "";
-            if (name == "Tenor" || name == "DaysNom") return; // ej numeriska
+            if (grid == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
 
             var row = grid.Rows[e.RowIndex];
+            var col = grid.Columns[e.ColumnIndex];
+            var name = col?.Name ?? string.Empty;
+
+            var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "ATM_mid", "ATM_adj", "ATM_spread", "RR25_mid", "RR10_mid", "BF25_mid", "BF10_mid"
+    };
+            if (!targets.Contains(name)) return;
+
             var cell = row.Cells[e.ColumnIndex];
+            var original = cell.Value?.ToString() ?? string.Empty;
 
-            string text = (e.FormattedValue ?? "").ToString().Trim();
-            if (text.Length == 0)
+            var txt = (e.FormattedValue ?? string.Empty).ToString().Trim();
+            if (string.IsNullOrEmpty(txt))
             {
-                // Tomt => rensa cellfel. Draft rensas i EndEdit.
-                cell.ErrorText = null;
-                SetCellRevertFlag(cell, false);
-                // Visa direkt
-                grid.InvalidateCell(e.ColumnIndex, e.RowIndex);
-                grid.BeginInvoke(new Action(() => grid.InvalidateCell(e.ColumnIndex, e.RowIndex)));
+                cell.Tag = new Tuple<string, bool>(original, false);
+                row.ErrorText = null;
                 return;
             }
 
-            decimal value;
-            if (!TryParseFlexibleDecimal(text, out value))
+            if (!TryParseFlexibleDecimal(txt, out var parsed))
             {
-                // Ogiltigt tal: markera revert (återställ i EndEdit), visa cellfel men blockera inte ENTER.
-                cell.ErrorText = "Ogiltigt tal.";
-                SetCellRevertFlag(cell, true);
-                // Visa direkt
-                grid.InvalidateCell(e.ColumnIndex, e.RowIndex);
-                grid.BeginInvoke(new Action(() => grid.InvalidateCell(e.ColumnIndex, e.RowIndex)));
+                cell.Tag = new Tuple<string, bool>(original, true);
                 return;
             }
 
-            // Numeric OK => rensa ev. gamla fel
-            cell.ErrorText = null;
-            SetCellRevertFlag(cell, false);
+            var pair = GetActivePairFor(grid);
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
 
-            // ATM Spread/Offset regler
             if (string.Equals(name, "ATM_adj", StringComparison.OrdinalIgnoreCase))
             {
-                var pair = GetActivePairFor(grid);
-                var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
-
-                if (!anchored)
+                // ATM Offset – endast relevant vid anchored; men vi validerar alltid enligt offset-regel
+                if (Math.Abs(parsed) > 10.000m)
                 {
-                    // Spread hårt: >= 0 och (om ATM_mid finns) Spread <= 2*ATM_mid (så att Bid >= 0)
-                    if (value < 0m)
-                        cell.ErrorText = "ATM Spread kan inte vara negativ.";
-                    else
-                    {
-                        var mid = TryGetCellDecimal(row, "ATM_mid");
-                        if (mid.HasValue && value > 2m * mid.Value)
-                            cell.ErrorText = $"ATM Spread för stor: Bid blir negativ (kräver ≤ {2m * mid.Value:0.0000}).";
-                    }
+                    cell.Tag = new Tuple<string, bool>(original, true);
+                    row.ErrorText = "ATM Offset orimlig (|offset| > 10.000).";
+                    return;
                 }
-                // Anchored: inga hårda absoluta limits i 6b (preview/ankare kommer senare).
             }
-            else if (name == "RR25_mid" || name == "RR10_mid")
+            else if (string.Equals(name, "ATM_spread", StringComparison.OrdinalIgnoreCase))
             {
-                if (Math.Abs(value) > 20m)
-                    cell.ErrorText = "|RR| för stort (> 20).";
+                // ATM Spread
+                if (parsed < 0m)
+                {
+                    cell.Tag = new Tuple<string, bool>(original, true);
+                    row.ErrorText = "ATM Spread kan inte vara negativ.";
+                    return;
+                }
+                var mid = TryGetCellDecimal(row, "ATM_mid");
+                if (mid.HasValue && parsed > 2.0m * mid.Value)
+                {
+                    cell.Tag = new Tuple<string, bool>(original, true);
+                    row.ErrorText = "ATM Spread för stor i förhållande till Mid (> 2×Mid).";
+                    return;
+                }
             }
-            else if (name == "BF25_mid" || name == "BF10_mid")
+            else if (string.Equals(name, "BF25_mid", StringComparison.OrdinalIgnoreCase))
             {
-                if (value < 0m) cell.ErrorText = "Butterfly kan inte vara negativ.";
-                else if (value > 25m) cell.ErrorText = "Butterfly för stor (> 25).";
+                if (parsed < 0m)
+                {
+                    cell.Tag = new Tuple<string, bool>(original, true);
+                    row.ErrorText = "BF25 kan inte vara negativ.";
+                    return;
+                }
             }
 
-            // Se till att den röda badgen uppdateras direkt
-            grid.InvalidateCell(e.ColumnIndex, e.RowIndex);
-            grid.BeginInvoke(new Action(() => grid.InvalidateCell(e.ColumnIndex, e.RowIndex)));
+            cell.Tag = new Tuple<string, bool>(original, false);
+            row.ErrorText = null;
         }
-
 
 
         /// <summary>
@@ -1417,153 +1829,110 @@ namespace FX.UI.WinForms.Features.VolManager
             return decimal.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out value);
         }
 
-
-        /// <summary>
-        /// Efter commit: hantera ogiltigt tal (revert), skriv draft (endast vid giltigt tal),
-        /// kör radregler och sätt soft/hard meddelanden på relevanta celler.
-        /// Säkerställer också att cellens ErrorText nollställs vid giltig commit.
-        /// </summary>
-        private void PairGrid_CellEndEdit(object sender, DataGridViewCellEventArgs e)
-        {
-            var grid = sender as DataGridView;
-            if (grid == null) return;
-
-            var row = grid.Rows[e.RowIndex];
-            var cell = row.Cells[e.ColumnIndex];
-            var col = grid.Columns[e.ColumnIndex];
-            var name = col?.Name ?? "";
-
-            // 1) Ogiltigt tal? Revert till original utan att skapa draft.
-            var tag = cell.Tag as Tuple<string, bool>;
-            var revert = tag != null && tag.Item2;
-            if (revert)
-            {
-                cell.Value = tag.Item1;          // återställ
-                cell.ErrorText = "Ogiltigt tal. Värdet återställdes.";
-                // Ingen draft vid ogiltigt tal
-                UpdateDraftEditsCounter(GetActivePairFor(grid));
-                grid.InvalidateCell(cell);
-                return;
-            }
-
-            // 2) Giltig commit → rensa cell/rad-fel
-            cell.ErrorText = null;
-            row.ErrorText = null;
-
-            // 3) Draft-skrivning endast för numeriskt värde
-            decimal? newVal = TryGetCellDecimal(row, name); // efter commit ligger nya texten i Value
-            var pair = GetActivePairFor(grid);
-            var tenor = GetTenorFromRow(row);
-            if (!string.IsNullOrEmpty(pair) && !string.IsNullOrEmpty(tenor))
-            {
-                var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
-                if (string.Equals(name, "ATM_adj", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (anchored) UpsertDraftValue(pair, tenor, "AtmOffset", newVal);
-                    else UpsertDraftValue(pair, tenor, "AtmSpread", newVal);
-                }
-                else
-                {
-                    if (name == "RR25_mid") UpsertDraftValue(pair, tenor, "Rr25Mid", newVal);
-                    if (name == "RR10_mid") UpsertDraftValue(pair, tenor, "Rr10Mid", newVal);
-                    if (name == "BF25_mid") UpsertDraftValue(pair, tenor, "Bf25Mid", newVal);
-                    if (name == "BF10_mid") UpsertDraftValue(pair, tenor, "Bf10Mid", newVal);
-                }
-            }
-
-            // 4) Radregler – endast relevanta celler får soft-warn tooltip
-            row.ErrorText = null;
-            var hard = new List<string>();
-            var soft = new List<string>();
-            EvaluateRowRules_Scoped(row, _presenter != null && _presenter.IsAnchoredPair(pair), hard, soft);
-
-            if (hard.Count > 0)
-                row.ErrorText = string.Join("  ", hard);
-
-            // rensa tooltips
-            foreach (var n in new[] { "RR25_mid", "RR10_mid", "BF25_mid", "BF10_mid", "ATM_adj" })
-            {
-                var c = row.Cells[n];
-                if (c != null) c.ToolTipText = null;
-            }
-            foreach (var kv in _lastSoftTargets)
-            {
-                var c = row.Cells[kv];
-                if (c != null) c.ToolTipText = string.Join("  ", soft);
-            }
-
-            UpdateDraftEditsCounter(pair);
-            grid.InvalidateRow(e.RowIndex);
-        }
-
-
         // Håller senaste soft-targets för tooltips per Evaluate-körning
         private static readonly string[] _rrTargets = new[] { "RR25_mid", "RR10_mid" };
         private static readonly string[] _bfTargets = new[] { "BF25_mid", "BF10_mid" };
         private List<string> _lastSoftTargets = new List<string>();
 
         /// <summary>
-        /// Hårda & mjuka regler på radnivå, men returnerar även vilka kolumner som är "berörda"
-        /// för att begränsa soft-warn tooltips till rätt fält.
+        /// Utvärderar per-rad (intra-tenor) regler och fyller hårda/mjuka fel.
+        /// - RR: |RR10| ≥ |RR25| (hård) + samma tecken (hård). Vid tecken-mismatch sätts även tooltip på RR10/RR25.
+        /// - BF: BF10 ≥ BF25 ≥ 0 (hård).
+        /// - ATM: negativ spread eller negativ mid → hårt fel.
+        /// - Soft: RR-ratio |RR10|/|RR25| ∈ [1.0,2.5], BF-ratio BF10/BF25 ∈ [1.0,3.0] (tooltips).
+        /// Sätter row.ErrorText för hårda fel och ToolTipText på relevanta celler för mjuka (och tecken-mismatch).
         /// </summary>
         private void EvaluateRowRules_Scoped(DataGridViewRow row, bool anchored, List<string> hard, List<string> soft)
         {
-            _lastSoftTargets.Clear();
+            if (row == null) return;
+            hard?.Clear();
+            soft?.Clear();
 
-            decimal? rr25 = TryGetCellDecimal(row, "RR25_mid");
-            decimal? rr10 = TryGetCellDecimal(row, "RR10_mid");
-            decimal? bf25 = TryGetCellDecimal(row, "BF25_mid");
-            decimal? bf10 = TryGetCellDecimal(row, "BF10_mid");
-            decimal? adj = TryGetCellDecimal(row, "ATM_adj");
-            decimal? mid = TryGetCellDecimal(row, "ATM_mid");
+            var rr25 = TryGetCellDecimal(row, "RR25_mid");
+            var rr10 = TryGetCellDecimal(row, "RR10_mid");
+            var bf25 = TryGetCellDecimal(row, "BF25_mid");
+            var bf10 = TryGetCellDecimal(row, "BF10_mid");
+            var spr = TryGetCellDecimal(row, "ATM_spread");
+            var mid = TryGetCellDecimal(row, "ATM_mid");
 
-            // ATM Spread (icke-ankrat): redan cellfel i Validating om > 2*mid; ingen extra rad-hard här.
+            // Nollställ mjuka tooltips på målkolumner (lämna ATM-preview orörd – den sitter på ATM-kolumnerna)
+            foreach (var name in new[] { "RR25_mid", "RR10_mid", "BF25_mid", "BF10_mid" })
+                if (row.DataGridView != null && row.DataGridView.Columns.Contains(name))
+                    row.Cells[name].ToolTipText = null;
 
-            // RR: |RR10| ≥ |RR25| och samma tecken
+            const decimal eps = 1e-8m;
+
+            // ----- Hårda regler -----
+
+            // RR: samma tecken (båda ≠ 0)
+            if (rr25.HasValue && rr10.HasValue && rr25.Value != 0m && rr10.Value != 0m)
+            {
+                var sign25 = Math.Sign(rr25.Value);
+                var sign10 = Math.Sign(rr10.Value);
+                if (sign25 != sign10)
+                {
+                    var msg = "RR: 10D och 25D måste ha samma tecken.";
+                    hard?.Add(msg);
+
+                    // Lägg också tooltip på båda RR-cellerna så det syns direkt i griden
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("RR25_mid"))
+                        row.Cells["RR25_mid"].ToolTipText = msg;
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("RR10_mid"))
+                        row.Cells["RR10_mid"].ToolTipText = msg;
+                }
+            }
+
+            // RR: |RR10| ≥ |RR25|
             if (rr25.HasValue && rr10.HasValue)
             {
-                if (Math.Sign(rr25.Value) != Math.Sign(rr10.Value))
-                    hard.Add("RR10 och RR25 har olika tecken.");
-                if (Math.Abs(rr10.Value) + 1e-12m < Math.Abs(rr25.Value))
-                    hard.Add("|RR10| måste vara ≥ |RR25|.");
+                if (Math.Abs(rr10.Value) + eps < Math.Abs(rr25.Value))
+                    hard?.Add($"RR: |RR10| ≥ |RR25| bryts (|{rr10:0.####}| < |{rr25:0.####}|).");
+            }
 
-                // Soft: ratio inom [1.0, 2.5]
-                var denom = Math.Abs(rr25.Value);
-                if (denom > 1e-12m)
+            // BF: BF10 ≥ BF25 ≥ 0
+            if (bf25.HasValue && bf25.Value < 0m - eps)
+                hard?.Add($"BF: BF25 < 0 ({bf25:0.####}).");
+
+            if (bf10.HasValue && bf25.HasValue && bf10.Value + eps < bf25.Value)
+                hard?.Add($"BF: BF10 < BF25 ({bf10:0.####} < {bf25:0.####}).");
+
+            // ATM: spread < 0 eller mid < 0
+            if (spr.HasValue && spr.Value < 0m - eps) hard?.Add($"ATM: Spread negativ ({spr:0.####}).");
+            if (mid.HasValue && mid.Value < 0m - eps) hard?.Add($"ATM: Mid negativ ({mid:0.####}).");
+
+            // ----- Mjuka regler (tooltips) -----
+
+            // RR-ratio
+            if (rr25.HasValue && Math.Abs(rr25.Value) > eps && rr10.HasValue)
+            {
+                var ratio = Math.Abs(rr10.Value) / Math.Abs(rr25.Value);
+                if (ratio < 1.0m - 1e-6m || ratio > 2.5m + 1e-6m)
                 {
-                    var k = Math.Abs(rr10.Value) / denom;
-                    if (k < 1.0m || k > 2.5m)
-                    {
-                        soft.Add($"RR-ratio (|RR10|/|RR25| = {k:0.00}) utanför [1.0, 2.5].");
-                        _lastSoftTargets.AddRange(_rrTargets);
-                    }
+                    var tip = $"RR-ratio hint: |RR10|/|RR25| = {ratio:0.###} (mål 1.0–2.5)";
+                    soft?.Add($"RR-ratio: |RR10|/|RR25| = {ratio:0.###} utanför [1.0, 2.5].");
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("RR10_mid"))
+                        row.Cells["RR10_mid"].ToolTipText = tip;
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("RR25_mid"))
+                        row.Cells["RR25_mid"].ToolTipText = tip;
                 }
             }
 
-            // BF: BF10 ≥ BF25 ≥ 0 (BF25>=0 checkades i Validating; vi säkrar relationen här)
-            if (bf10.HasValue && bf25.HasValue)
+            // BF-ratio
+            if (bf25.HasValue && bf25.Value > eps && bf10.HasValue && bf10.Value > eps)
             {
-                if (bf10.Value + 1e-12m < bf25.Value)
-                    hard.Add("BF10 måste vara ≥ BF25.");
-
-                if (bf25.Value > 1e-12m)
+                var ratio = bf10.Value / bf25.Value;
+                if (ratio < 1.0m - 1e-6m || ratio > 3.0m + 1e-6m)
                 {
-                    var m = bf10.Value / bf25.Value;
-                    if (m < 1.0m || m > 3.0m)
-                    {
-                        soft.Add($"BF-ratio (BF10/BF25 = {m:0.00}) utanför [1.0, 3.0].");
-                        _lastSoftTargets.AddRange(_bfTargets);
-                    }
+                    var tip = $"BF-ratio hint: BF10/BF25 = {ratio:0.###} (mål 1.0–3.0)";
+                    soft?.Add($"BF-ratio: BF10/BF25 = {ratio:0.###} utanför [1.0, 3.0].");
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("BF10_mid"))
+                        row.Cells["BF10_mid"].ToolTipText = tip;
+                    if (row.DataGridView != null && row.DataGridView.Columns.Contains("BF25_mid"))
+                        row.Cells["BF25_mid"].ToolTipText = tip;
                 }
             }
 
-            // ATM Offset – soft varning (frivillig): om Mid finns och adj är väldigt negativ
-            if (anchored && adj.HasValue && mid.HasValue && (mid.Value + adj.Value) < 0m)
-            {
-                // Vi kan inte räkna korrekt anchored-mid här utan ankar-ATM, så vi nöjer oss med en hint:
-                soft.Add("Offset verkar göra Mid negativ (kontrollera ankare i preview).");
-                _lastSoftTargets.Add("ATM_adj");
-            }
+            row.ErrorText = (hard != null && hard.Count > 0) ? string.Join("  ", hard) : null;
         }
 
 
@@ -1578,7 +1947,7 @@ namespace FX.UI.WinForms.Features.VolManager
         ///   • |RR10| ≈ k×|RR25|, k i [1.0, 2.5]
         ///   • BF10 ≈ m×BF25,      m i [1.0, 3.0]
         /// </summary>
-        private void EvaluateRowRules(DataGridViewRow row, bool anchored, List<string> hard, List<string> soft) // NY
+        private void EvaluateRowRules(DataGridViewRow row, bool anchored, List<string> hard, List<string> soft) 
         {
             decimal? rr25 = TryGetCellDecimal(row, "RR25_mid");
             decimal? rr10 = TryGetCellDecimal(row, "RR10_mid");
@@ -1629,21 +1998,61 @@ namespace FX.UI.WinForms.Features.VolManager
             }
         }
 
-        /// <summary> Försöker läsa en decimal från en cells Value (invariant kultur). </summary>
-        private static decimal? TryGetCellDecimal(DataGridViewRow row, string name) // NY
+        /// <summary>
+        /// Försöker läsa ett decimalvärde från en rad för en given kolumnidentifierare.
+        /// Robust mot att kolumnnamnet saknas: matchar först på Column.Name, därefter på HeaderText (case-insensitivt).
+        /// Returnerar null om kolumn eller värde inte finns, istället för att kasta undantag.
+        /// Tillåter både punkt och komma i strängvärden.
+        /// </summary>
+        private decimal? TryGetCellDecimal(DataGridViewRow row, string name)
         {
-            var cell = row.Cells[name];
-            if (cell == null) return null;
-            var obj = cell.Value;
-            if (obj == null) return null;
-            if (obj is decimal d) return d;
-            if (obj is double db) return (decimal)db;
-            var s = obj.ToString();
-            decimal val;
-            if (decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out val))
-                return val;
+            if (row == null || string.IsNullOrWhiteSpace(name)) return null;
+            var grid = row.DataGridView;
+            if (grid == null) return null;
+
+            // 1) Hitta kolumn via Name eller HeaderText (case-insensitivt)
+            DataGridViewColumn col = null;
+            foreach (DataGridViewColumn c in grid.Columns)
+            {
+                if (string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    col = c; break;
+                }
+            }
+            if (col == null)
+            {
+                foreach (DataGridViewColumn c in grid.Columns)
+                {
+                    if (string.Equals(c.HeaderText, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        col = c; break;
+                    }
+                }
+            }
+            if (col == null) return null; // kolumnen finns inte → inget värde
+
+            var cell = row.Cells[col.Index];
+            var val = cell?.Value;
+            if (val == null) return null;
+
+            // 2) Tolka värdet
+            if (val is decimal d) return d;
+            if (val is double dd) return (decimal)dd;
+
+            var s = val.ToString();
+            if (string.IsNullOrWhiteSpace(s)) return null;
+
+            // Tillåt både , och .
+            if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.CurrentCulture, out var p1))
+                return p1;
+
+            s = s.Replace(',', '.');
+            if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var p2))
+                return p2;
+
             return null;
         }
+
 
         /// <summary>
         /// Hämtar aktivt parnamn för ett givet grid (läser TabPage.Text).
@@ -1664,9 +2073,7 @@ namespace FX.UI.WinForms.Features.VolManager
             e.Cancel = true;
         }
 
-
         #endregion
-
 
         #region Pair Tabs – vänsterpanel (Pin, Pinned, Recent)
 
@@ -1682,7 +2089,6 @@ namespace FX.UI.WinForms.Features.VolManager
             RemovePinnedAndCloseTab(sel);
             SaveUiStateFromControls();
         }
-
 
         /// <summary>
         /// Växlar vyn till flikläge ("Pair Tabs") och sätter upp vänsterpanelen
@@ -1864,7 +2270,6 @@ namespace FX.UI.WinForms.Features.VolManager
             Controls.Add(_pairTabs);
             Controls.Add(pnlLeft);
 
-            // OBS: Ingen TryApplyLoadedState här längre – workspace applicerar per-session-state.
         }
 
         /// <summary>
@@ -1882,7 +2287,6 @@ namespace FX.UI.WinForms.Features.VolManager
             SaveUiStateFromControls();
             e.Handled = true;
         }
-
 
         /// <summary>
         /// Tar bort ett par från Pinned och stänger motsvarande underflik (om existerar).
@@ -1927,9 +2331,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 RebuildTilesFromPinned(force: false);
         }
 
-
-
-
         /// <summary>
         /// Klick på "Refresh" – i Tabs-läge uppdateras aktiv flik.
         /// I Tiles-läge uppdateras alla tiles.
@@ -1948,8 +2349,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 RefreshActivePair(force);
             }
         }
-
-
 
         /// <summary>
         /// Dubbelklick på en Pinned-rad: aktivera/flika upp paret och bumpa det i Recent.
@@ -1982,9 +2381,6 @@ namespace FX.UI.WinForms.Features.VolManager
             AddToRecent(sel, 10);
             SaveUiStateFromControls();
         }
-
-
-
 
         /// <summary>
         /// Lägger till ett par i Pinned-listan om det saknas (case-insensitivt).
@@ -2322,7 +2718,6 @@ namespace FX.UI.WinForms.Features.VolManager
 
         #endregion
 
-
         #region Privata hjälpare – Pair Tabs
 
         /// <summary>
@@ -2330,7 +2725,7 @@ namespace FX.UI.WinForms.Features.VolManager
         /// Ordning: SelectedTab.Tag (string) → SelectedTab.Text → headerlabel "PairHeaderLabel".
         /// Returnerar t.ex. "EUR/USD", annars null om inget kan hittas.
         /// </summary>
-        private string GetActivePairSymbol() // NY
+        private string GetActivePairSymbol()
         {
             var tab = _pairTabs?.SelectedTab;
             if (tab == null) return null;
@@ -2397,46 +2792,50 @@ namespace FX.UI.WinForms.Features.VolManager
             return first;
         }
 
-
-
         /// <summary>
-        /// Positionerar LblEdits och knapparna Review/Discard mot högerkanten:
-        /// [Review][mellanrum][Discard] och LblEdits strax till vänster.
+        /// Lägger ut högersidan i headern: LblEdits, BtnDiscardDraft och BtnReviewDraft
+        /// med jämn horisontell spacing och gemensam vertikal centrering.
         /// </summary>
-        private void LayoutHeaderRightControls(Control headerHost)
+        private void LayoutHeaderRightControls(Panel header)
         {
-            if (headerHost == null) return;
+            if (header == null) return;
 
-            var lblEdits = FindChild<Label>(headerHost, "LblEdits");
-            var btnDiscard = FindChild<Button>(headerHost, "BtnDiscardDraft");
-            var btnReview = FindChild<Button>(headerHost, "BtnReviewDraft");
-            if (lblEdits == null || btnDiscard == null || btnReview == null) return;
+            var lblEdits = header.Controls.OfType<Label>().FirstOrDefault(x => x.Name == "LblEdits");
+            var btnDiscard = header.Controls.OfType<Button>().FirstOrDefault(x => x.Name == "BtnDiscardDraft");
+            var btnReview = header.Controls.OfType<Button>().FirstOrDefault(x => x.Name == "BtnReviewDraft");
 
-            int w = headerHost.ClientSize.Width;
+            if (lblEdits == null || btnDiscard == null || btnReview == null)
+                return;
 
-            // Höger till vänster: Review, Discard, LblEdits
-            btnReview.Left = w - btnReview.Width - 4;
-            btnDiscard.Left = btnReview.Left - btnDiscard.Width - 6;
-            lblEdits.Left = btnDiscard.Left - lblEdits.PreferredWidth - 12;
+            const int padRight = 10;
+            const int gap = 8;
+
+            // Förutsägbar storlek på knappar
+            if (btnDiscard.Width == 0) btnDiscard.Size = new Size(78, 23);
+            if (btnReview.Width == 0) btnReview.Size = new Size(78, 23);
+
+            // Höger → vänster: Review, Discard, Edits
+            btnReview.Left = header.Width - padRight - btnReview.Width;
+            btnDiscard.Left = btnReview.Left - gap - btnDiscard.Width;
+            lblEdits.Left = btnDiscard.Left - gap - lblEdits.PreferredWidth;
+
+            // Vertikal centrering (alla tre i samma linje)
+            int centerY = (header.Height - btnReview.Height) / 2;
+            btnReview.Top = centerY;
+            btnDiscard.Top = centerY;
+            lblEdits.Top = centerY + (btnReview.Height - lblEdits.Height) / 2;
+
+            // Anchors för att följa resize
+            btnReview.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            btnDiscard.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            lblEdits.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         }
 
-
-
         /// <summary>
-        /// Hämtar aktuellt par från PairTabs (flikens Text).
+        /// Uppdaterar "Edits: n" i aktiva parets header samt enable/disable för Discard/Review.
+        /// Räknar alla fält i draft-lagret, inklusive ATM Mid.
         /// </summary>
-        private string GetActivePairFromTabs()
-        {
-            if (_pairTabs == null || _pairTabs.SelectedTab == null) return null;
-            return _pairTabs.SelectedTab.Text;
-        }
-
-
-        /// <summary>
-        /// Räknar antal draft-fält för ett par och uppdaterar "Edits: n" i headern.
-        /// Enable/Disable på Discard/Review och om-layout efter textbyte.
-        /// </summary>
-        private void UpdateDraftEditsCounter(string pair)
+        private void UpdateDraftEditsCounter(string pair) // ERSÄTT
         {
             if (string.IsNullOrWhiteSpace(pair)) return;
             pair = pair.ToUpperInvariant();
@@ -2456,13 +2855,18 @@ namespace FX.UI.WinForms.Features.VolManager
             {
                 foreach (var kv in perPair.Values)
                 {
-                    if (kv == null) continue;
-                    if (kv.Rr25Mid.HasValue) n++;
-                    if (kv.Bf25Mid.HasValue) n++;
-                    if (kv.Rr10Mid.HasValue) n++;
-                    if (kv.Bf10Mid.HasValue) n++;
-                    if (kv.AtmSpread.HasValue) n++;
-                    if (kv.AtmOffset.HasValue) n++;
+                    var r = kv;
+                    if (r == null) continue;
+
+                    // Viktigt: ta med ATM Mid
+                    if (r.AtmMid.HasValue) n++;
+
+                    if (r.Rr25Mid.HasValue) n++;
+                    if (r.Bf25Mid.HasValue) n++;
+                    if (r.Rr10Mid.HasValue) n++;
+                    if (r.Bf10Mid.HasValue) n++;
+                    if (r.AtmSpread.HasValue) n++;
+                    if (r.AtmOffset.HasValue) n++;
                 }
             }
 
@@ -2472,7 +2876,6 @@ namespace FX.UI.WinForms.Features.VolManager
 
             LayoutHeaderRightControls(headerHost);
         }
-
 
 
         /// <summary>
@@ -2502,8 +2905,6 @@ namespace FX.UI.WinForms.Features.VolManager
             }
         }
 
-
-
         private TabPage FindPairTabPage(string pair)
         {
             if (_pairTabs == null || string.IsNullOrWhiteSpace(pair)) return null;
@@ -2513,7 +2914,6 @@ namespace FX.UI.WinForms.Features.VolManager
                     return p;
             return null;
         }
-
 
         /// <summary>
         /// Säkerställer en editerbar ATM-justeringskolumn. Header blir "ATM Spread" (icke-ankrat)
@@ -2558,7 +2958,6 @@ namespace FX.UI.WinForms.Features.VolManager
             try { col.DisplayIndex = insertAfterIdx + 1; } catch { /* best effort */ }
         }
 
-
         /// <summary>
         /// Sätt/ta bort revert-flaggan i cell.Tag (Tuple&lt;orig, revert&gt;).
         /// </summary>
@@ -2570,59 +2969,72 @@ namespace FX.UI.WinForms.Features.VolManager
         }
 
         /// <summary>
-        /// Applicerar utkast/draft-värden (RR/BF + ATM Spread/Offset) på en redan bunden grid för ett visst par.
-        /// Anropas direkt efter att raderna lagts in i BindPairSurface(...).
+        /// Applicerar draft-värden från _draftStore till grid och räknar därefter ATM Mid samt Bid/Ask per rad.
+        /// Kör även per-rad QC-regler så att hårda/mjuka fel och tooltips syns direkt efter overlay.
         /// </summary>
-        private void ApplyDraftToGrid(string pair, DataGridView grid)
+        private void ApplyDraftToGrid(string pair, DataGridView grid) // ERSÄTT
         {
-            if (grid == null || string.IsNullOrWhiteSpace(pair)) return;
+            if (string.IsNullOrWhiteSpace(pair) || grid == null) return;
+            pair = pair.ToUpperInvariant();
+
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
 
             if (!_draftStore.TryGetValue(pair, out var perPair) || perPair == null || perPair.Count == 0)
+            {
+                // Ingen draft – men se till att Bid/Ask och QC ändå är koherenta
+                foreach (DataGridViewRow row in grid.Rows)
+                {
+                    RecomputeAtmForRow(grid, row, anchored);
+
+                    var hard = new List<string>();
+                    var soft = new List<string>();
+                    EvaluateRowRules_Scoped(row, anchored, hard, soft);
+                }
                 return;
+            }
 
-            DataGridViewColumn ColByHeader(string header) =>
-                grid.Columns.Cast<DataGridViewColumn>()
-                    .FirstOrDefault(c => string.Equals(c.HeaderText, header, StringComparison.OrdinalIgnoreCase));
-
-            var cRR25 = ColByHeader("RR25 Mid");
-            var cRR10 = ColByHeader("RR10 Mid");
-            var cBF25 = ColByHeader("BF25 Mid");
-            var cBF10 = ColByHeader("BF10 Mid");
-
-            var cATMAdj = grid.Columns.Cast<DataGridViewColumn>()
-                .FirstOrDefault(c => string.Equals(c.Name, "ATM_adj", StringComparison.OrdinalIgnoreCase));
-
-            // Vilken header har ATM_adj just nu?
-            var atmAdjHeader = cATMAdj?.HeaderText?.Trim();
+            int ColIndexByNameOrHeader(string key)
+            {
+                foreach (DataGridViewColumn c in grid.Columns)
+                    if (string.Equals(c.Name, key, StringComparison.OrdinalIgnoreCase)) return c.Index;
+                foreach (DataGridViewColumn c in grid.Columns)
+                    if (string.Equals(c.HeaderText, key, StringComparison.OrdinalIgnoreCase)) return c.Index;
+                return -1;
+            }
+            void SetCell(DataGridViewRow row, string key, object value)
+            {
+                var idx = ColIndexByNameOrHeader(key);
+                if (idx >= 0) row.Cells[idx].Value = value ?? "";
+            }
 
             foreach (DataGridViewRow row in grid.Rows)
             {
                 var tenor = GetTenorFromRow(row);
-                if (string.IsNullOrEmpty(tenor)) continue;
-                if (!perPair.TryGetValue(tenor, out var d) || d == null) continue;
-
-                void SetIf(DataGridViewColumn col, decimal? val)
+                if (string.IsNullOrEmpty(tenor))
                 {
-                    if (col == null || !val.HasValue) return;
-                    row.Cells[col.Index].Value = val.Value; // 4dp-formaten sköts redan av kolumnen
+                    // QC även om tenor saknas är inte meningsfullt; hoppa över.
+                    continue;
                 }
 
-                SetIf(cRR25, d.Rr25Mid);
-                SetIf(cRR10, d.Rr10Mid);
-                SetIf(cBF25, d.Bf25Mid);
-                SetIf(cBF10, d.Bf10Mid);
-
-                // ATM Spread / Offset
-                if (cATMAdj != null)
+                if (perPair.TryGetValue(tenor, out var d) && d != null)
                 {
-                    if (string.Equals(atmAdjHeader, "ATM Spread", StringComparison.OrdinalIgnoreCase))
-                        SetIf(cATMAdj, d.AtmSpread);
-                    else if (string.Equals(atmAdjHeader, "ATM Offset", StringComparison.OrdinalIgnoreCase))
-                        SetIf(cATMAdj, d.AtmOffset);
+                    // Lägg ut draftade fält på cellerna
+                    if (d.AtmMid.HasValue && !anchored) SetCell(row, "ATM_mid", d.AtmMid.Value);  // endast non-anchored
+                    if (d.AtmSpread.HasValue) SetCell(row, "ATM_spread", d.AtmSpread.Value);
+                    if (d.AtmOffset.HasValue) SetCell(row, "ATM_adj", d.AtmOffset.Value);
+
+                    if (d.Rr25Mid.HasValue) SetCell(row, "RR25_mid", d.Rr25Mid.Value);
+                    if (d.Rr10Mid.HasValue) SetCell(row, "RR10_mid", d.Rr10Mid.Value);
+                    if (d.Bf25Mid.HasValue) SetCell(row, "BF25_mid", d.Bf25Mid.Value);
+                    if (d.Bf10Mid.HasValue) SetCell(row, "BF10_mid", d.Bf10Mid.Value);
                 }
+
+                // Efter overlay – räkna Mid + Bid/Ask och kör QC-regler
+                RecomputeAtmForRow(grid, row, anchored);
+                var hard = new List<string>();
+                var soft = new List<string>();
+                EvaluateRowRules_Scoped(row, anchored, hard, soft);
             }
-
-            grid.Invalidate(); // trigga omritning så gul markering syns ihop med värdena
         }
 
 
@@ -2650,15 +3062,15 @@ namespace FX.UI.WinForms.Features.VolManager
         }
 
         /// <summary>
-        /// Öppnar Review-dialogen för aktivt par (6c). 
-        /// Bygger diff från det aktiva parets grid, och lägger till en inaktiv "Publish"-knapp (dry-run).
+        /// Öppnar Review-dialogen för aktivt par:
+        /// - Bygger diff-lista från aktivt grids draft.
+        /// - Räknar hårda/mjuka flaggor (radfel + tooltips) för visning i header.
+        /// - Visar dialogen med fungerande Publish (kopplad till HandlePublishAsync).
         /// </summary>
         private void OnReviewDraftClick(object sender, EventArgs e)
         {
-            // 1) Hämta aktivt par + dess grid
             var pair = GetActivePairSymbol();
-            if (string.IsNullOrWhiteSpace(pair))
-                return;
+            if (string.IsNullOrWhiteSpace(pair)) return;
 
             var grid = GetActivePairGrid();
             if (grid == null)
@@ -2668,67 +3080,21 @@ namespace FX.UI.WinForms.Features.VolManager
                 return;
             }
 
-            // 2) Bygg diff (din befintliga helper kräver grid)
-            var rows = BuildDraftDiffForPair(pair, grid);
-            if (rows == null || rows.Count == 0)
+            // Bygg diff
+            var changes = BuildDraftDiffForPair(pair, grid);
+            if (changes == null || changes.Count == 0)
             {
                 MessageBox.Show(this, "Inga draftade ändringar att reviewa.", "Volatility Manager",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            // 3) Hard/soft-counts – minimal variant (0/0). 
-            //    Vill du visa faktiska counts kan vi knyta mot dina valideringsflaggor i 6d.
-            int hardCount = 0;
-            int warnCount = 0;
+            // Räkna hårda/mjuka för dialogheadern
+            var (hard, soft) = CountRuleFlags(grid);
 
-            // 4) Bygg och visa dialogen (din dialog tar pair, rows, hardCount, warnCount)
-            var dlg = BuildReviewDialog(pair, rows, hardCount, warnCount);
-            if (dlg == null) return;
-
-            // 5) Lägg till en "Publish"-knapp (disabled i 6c – aktiveras i 6d)
-            var btnPublish = new Button
-            {
-                Name = "BtnDialogPublish",
-                Text = "Publish",
-                Enabled = false,                      // 6c: dry-run, ingen DB-skriv ännu
-                Size = new System.Drawing.Size(90, 28),
-                Anchor = AnchorStyles.Right | AnchorStyles.Bottom
-            };
-
-            // Försök placera till vänster om ev. Close/OK-knapp om den finns, annars nere till höger.
-            Control closeBtn = null;
-            foreach (Control c in dlg.Controls)
-            {
-                if (c is Button && (string.Equals(c.Text, "Stäng", StringComparison.OrdinalIgnoreCase)
-                                 || string.Equals(c.Text, "Close", StringComparison.OrdinalIgnoreCase)
-                                 || string.Equals(c.Name, "BtnDialogClose", StringComparison.OrdinalIgnoreCase)))
-                {
-                    closeBtn = c;
-                    break;
-                }
-            }
-
-            if (closeBtn != null)
-            {
-                btnPublish.Left = Math.Max(8, closeBtn.Left - btnPublish.Width - 8);
-                btnPublish.Top = closeBtn.Top;
-            }
-            else
-            {
-                btnPublish.Left = dlg.ClientSize.Width - btnPublish.Width - 16;
-                btnPublish.Top = dlg.ClientSize.Height - btnPublish.Height - 16;
-                dlg.Resize += (s, ev) =>
-                {
-                    btnPublish.Left = dlg.ClientSize.Width - btnPublish.Width - 16;
-                    btnPublish.Top = dlg.ClientSize.Height - btnPublish.Height - 16;
-                };
-            }
-
-            btnPublish.Click += OnDialogPublishClick;
-            dlg.Controls.Add(btnPublish);
-
-            dlg.ShowDialog(this);
+            // Bygg & visa (dialogen har redan Publish-knapp kopplad till HandlePublishAsync)
+            var dlg = BuildReviewDialog(pair, changes, hard, soft);
+            dlg?.ShowDialog(this);
         }
 
 
@@ -2742,8 +3108,6 @@ namespace FX.UI.WinForms.Features.VolManager
                 "Publish är inte aktiverat ännu (steg 6d). Detta är en dry-run för att granska ändringarna.",
                 "Volatility Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
-
-
 
         /// <summary>
         /// Lätt validering: endast RR/BF-kolumner, accepterar både sv/eng decimaler.
@@ -2781,115 +3145,188 @@ namespace FX.UI.WinForms.Features.VolManager
             }
         }
 
-
-
         /// <summary>
-        /// Slutför cellredigering: parse sv/eng decimal, skriv till draft (RR/BF + ATM Spread/Offset),
-        /// och se till att visuellt värdet är numeriskt (formateras 4 dp).
+        /// Commit i grid (alternativ handler i Pair Tabs)/>.
+        /// Bevarar tooltips från <see cref="EvaluateRowRules_Scoped"/> och rensar dem inte här,
+        /// så RR/BF-ratio/tecken och ATM-preview fortsätter att visas efter commit.
         /// </summary>
         private void OnPairGridCellEndEdit(object sender, DataGridViewCellEventArgs e)
         {
             var grid = sender as DataGridView;
             if (grid == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
 
-            var pair = GetPairKeyFromGrid(grid);
             var row = grid.Rows[e.RowIndex];
-            var tenor = GetTenorFromRow(row);
-            if (string.IsNullOrEmpty(pair) || string.IsNullOrEmpty(tenor)) return;
-
-            if (!_draftStore.TryGetValue(pair, out var perPair))
-            {
-                perPair = new Dictionary<string, VolDraftRow>(StringComparer.OrdinalIgnoreCase);
-                _draftStore[pair] = perPair;
-            }
-            if (!perPair.TryGetValue(tenor, out var d))
-            {
-                d = new VolDraftRow { TenorCode = tenor };
-                perPair[tenor] = d;
-            }
-
-            var header = grid.Columns[e.ColumnIndex].HeaderText?.Trim();
+            var col = grid.Columns[e.ColumnIndex];
             var cell = row.Cells[e.ColumnIndex];
-            var txt = (cell.Value ?? "").ToString().Trim();
+            var name = col?.Name ?? string.Empty;
 
-            // Tomt → null
-            if (string.IsNullOrEmpty(txt))
+            // Revert-guard (ogiltigt tal)
+            var tag = cell.Tag as Tuple<string, bool>;
+            var revert = tag != null && tag.Item2;
+            if (revert)
             {
-                switch (header)
+                cell.Value = tag.Item1;
+                cell.ErrorText = "Ogiltigt eller otillåtet värde. Återställdes.";
+                UpdateDraftEditsCounter(GetActivePairFor(grid));
+                grid.InvalidateCell(cell);
+                return;
+            }
+
+            cell.ErrorText = null;
+            row.ErrorText = null;
+
+            var pair = GetActivePairFor(grid);
+            var tenor = GetTenorFromRow(row);
+            if (!string.IsNullOrEmpty(pair) && !string.IsNullOrEmpty(tenor))
+            {
+                var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+                var newVal = TryGetCellDecimal(row, name);
+
+                if (string.Equals(name, "ATM_adj", StringComparison.OrdinalIgnoreCase))
                 {
-                    case "RR25 Mid": d.Rr25Mid = null; break;
-                    case "BF25 Mid": d.Bf25Mid = null; break;
-                    case "RR10 Mid": d.Rr10Mid = null; break;
-                    case "BF10 Mid": d.Bf10Mid = null; break;
-                    case "ATM Spread": d.AtmSpread = null; break;
-                    case "ATM Offset": d.AtmOffset = null; break;
+                    UpsertDraftValue(pair, tenor, "AtmOffset", newVal);
                 }
-                grid.InvalidateRow(e.RowIndex);
-                UpdateDraftEditsCounter(pair);
-                return;
+                else if (string.Equals(name, "ATM_spread", StringComparison.OrdinalIgnoreCase))
+                {
+                    UpsertDraftValue(pair, tenor, "AtmSpread", newVal);
+                }
+                else if (string.Equals(name, "ATM_mid", StringComparison.OrdinalIgnoreCase))
+                {
+                    UpsertDraftValue(pair, tenor, "AtmMid", newVal);
+                }
+                else
+                {
+                    if (name == "RR25_mid") UpsertDraftValue(pair, tenor, "Rr25Mid", newVal);
+                    if (name == "RR10_mid") UpsertDraftValue(pair, tenor, "Rr10Mid", newVal);
+                    if (name == "BF25_mid") UpsertDraftValue(pair, tenor, "Bf25Mid", newVal);
+                    if (name == "BF10_mid") UpsertDraftValue(pair, tenor, "Bf10Mid", newVal);
+                }
+
+                // Kör regler (sätter hårda fel + mjuka tooltips på rätt celler)
+                var hard = new List<string>();
+                var soft = new List<string>();
+                EvaluateRowRules_Scoped(row, anchored, hard, soft);
+                if (hard.Count > 0) row.ErrorText = string.Join("  ", hard);
+
+                // Räkna om ATM Mid/Bid/Ask för raden (t.ex. hvis Spread/Offset/Mid ändrats)
+                RecomputeAtmForRow(grid, row, anchored);
             }
 
-            decimal parsed;
-            bool ok =
-                decimal.TryParse(txt, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.CurrentCulture, out parsed)
-                || decimal.TryParse(txt, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out parsed);
-
-            if (!ok)
-            {
-                grid.CancelEdit();
-                return;
-            }
-
-            switch (header)
-            {
-                case "RR25 Mid": d.Rr25Mid = parsed; break;
-                case "BF25 Mid": d.Bf25Mid = parsed; break;
-                case "RR10 Mid": d.Rr10Mid = parsed; break;
-                case "BF10 Mid": d.Bf10Mid = parsed; break;
-                case "ATM Spread": d.AtmSpread = parsed; break;
-                case "ATM Offset": d.AtmOffset = parsed; break;
-            }
-
-            cell.Value = parsed;         // visa som nummer
-            grid.InvalidateRow(e.RowIndex);
             UpdateDraftEditsCounter(pair);
+            grid.InvalidateRow(e.RowIndex);
         }
+
+
 
 
 
         /// <summary>
-        /// Gulmarkerar endast celler där draft finns (inte hela raden).
+        /// Gulmarkering (draft) + visning av numeriska celler med decimalpunkt.
+        /// Lägger dessutom på ATM Preview (Bid/Mid/Ask) i tooltip för ATM_mid/ATM_spread/ATM_adj.
         /// </summary>
-        private void OnPairGridCellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
+        private void OnPairGridCellFormatting(object sender, DataGridViewCellFormattingEventArgs e) // ERSÄTT
         {
             var grid = sender as DataGridView;
-            if (grid == null) return;
+            if (grid == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
 
             var row = grid.Rows[e.RowIndex];
             var col = grid.Columns[e.ColumnIndex];
-            var name = col?.Name ?? "";
+            var name = col?.Name ?? string.Empty;
+
             var pair = GetActivePairFor(grid);
             var tenor = GetTenorFromRow(row);
-            if (string.IsNullOrEmpty(pair) || string.IsNullOrEmpty(tenor)) return;
+            if (string.IsNullOrEmpty(pair) || string.IsNullOrEmpty(tenor))
+                return;
 
+            // 1) Gulmarkering vid draft (inkl. ATM_spread/ATM_adj)
             bool hasDraft = false;
-            if (_draftStore.TryGetValue(pair, out var perPair) && perPair != null && perPair.TryGetValue(tenor, out var d) && d != null)
+            if (_draftStore.TryGetValue(pair, out var perPair) && perPair != null &&
+                perPair.TryGetValue(tenor, out var d) && d != null)
             {
-                if (name == "RR25_mid") hasDraft = d.Rr25Mid.HasValue;
+                if (name == "ATM_mid") hasDraft = d.AtmMid.HasValue;
+                else if (name == "ATM_spread") hasDraft = d.AtmSpread.HasValue;
+                else if (name == "RR25_mid") hasDraft = d.Rr25Mid.HasValue;
                 else if (name == "RR10_mid") hasDraft = d.Rr10Mid.HasValue;
                 else if (name == "BF25_mid") hasDraft = d.Bf25Mid.HasValue;
                 else if (name == "BF10_mid") hasDraft = d.Bf10Mid.HasValue;
                 else if (string.Equals(name, "ATM_adj", StringComparison.OrdinalIgnoreCase))
+                    hasDraft = d.AtmOffset.HasValue;
+            }
+            if (hasDraft)
+                row.Cells[e.ColumnIndex].Style.BackColor = Color.FromArgb(255, 249, 196);
+
+            // 2) Numeriskt punkt-format
+            var numericCols = name == "ATM_mid"
+                              || name == "ATM_spread"
+                              || name == "ATM_adj"
+                              || name == "RR25_mid"
+                              || name == "RR10_mid"
+                              || name == "BF25_mid"
+                              || name == "BF10_mid";
+            if (numericCols && e.Value != null)
+            {
+                try
                 {
-                    var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
-                    hasDraft = anchored ? d.AtmOffset.HasValue : d.AtmSpread.HasValue;
+                    if (e.Value is decimal dec)
+                    {
+                        e.Value = dec.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                        e.FormattingApplied = true;
+                    }
+                    else if (e.Value is double dbl)
+                    {
+                        e.Value = ((decimal)dbl).ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                        e.FormattingApplied = true;
+                    }
+                    else
+                    {
+                        var s = e.Value.ToString();
+                        if (!string.IsNullOrEmpty(s))
+                        {
+                            if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.CurrentCulture, out var p1))
+                            {
+                                e.Value = p1.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                                e.FormattingApplied = true;
+                            }
+                            else if (decimal.TryParse(s.Replace(',', '.'), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var p2))
+                            {
+                                e.Value = p2.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                                e.FormattingApplied = true;
+                            }
+                            else
+                            {
+                                var normalized = s.Replace(',', '.');
+                                if (!ReferenceEquals(normalized, s))
+                                {
+                                    e.Value = normalized;
+                                    e.FormattingApplied = true;
+                                }
+                            }
+                        }
+                    }
                 }
+                catch { /* display only */ }
             }
 
-            if (hasDraft)
-                row.Cells[e.ColumnIndex].Style.BackColor = Color.FromArgb(255, 249, 196); // ljusgul
+            // 3) ATM Preview-tooltip på relevanta celler
+            if (name == "ATM_mid" || name == "ATM_spread" || name == "ATM_adj")
+            {
+                var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+                var preview = BuildAtmPreviewTooltip(row, anchored);
+                if (!string.IsNullOrEmpty(preview))
+                {
+                    var cell = row.Cells[e.ColumnIndex];
+                    if (cell != null)
+                    {
+                        // Blanda in ev. befintliga mjuka varningar (från EndEdit) – lägg preview längst ned
+                        var existing = cell.ToolTipText;
+                        if (string.IsNullOrEmpty(existing))
+                            cell.ToolTipText = preview;
+                        else if (!existing.Contains("ATM Preview"))
+                            cell.ToolTipText = existing + Environment.NewLine + preview;
+                    }
+                }
+            }
         }
-
 
 
 
@@ -2906,50 +3343,51 @@ namespace FX.UI.WinForms.Features.VolManager
             return row?.Cells[0]?.Value?.ToString()?.Trim();
         }
 
-
         /// <summary>
-        /// Aktiverar editering för RR/BF och ATM-justering, kopplar strikt validering
-        /// + draft-uppdatering och gul markering. Visar cellfel (inte radheader).
+        /// Aktiverar editering för RR/BF, ATM Mid samt separata ATM Offset/ATM Spread enligt modell B.
+        /// - Wire: CellBeginEdit/Validating/EndEdit/Formatting/DataError (kopplas endast en gång).
+        /// - Synlighet/ReadOnly för ATM-kolumner styrs av ankarstatus.
+        /// - Kontextmeny för anchored: högerklick på ATM Mid → "Set ATM Mid…".
         /// </summary>
-        private void EnableEditingForPairGrid(DataGridView grid)
+        private void EnableEditingForPairGrid(DataGridView grid) // ERSÄTT
         {
             if (grid == null) return;
-            if (grid.Tag as string == "edit-wired") return;
 
-            // Skrivbara kolumner
+            var pair = GetActivePairFor(grid);
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+
+            // Säkerställ ATM-kolumner + synlighet/ReadOnly enligt ankarpolicy
+            EnsureAtmColumnsAndVisibility(grid, anchored);
+
+            // RR/BF – alltid editerbara
             SetReadOnly(grid, "RR25 Mid", false);
             SetReadOnly(grid, "BF25 Mid", false);
             SetReadOnly(grid, "RR10 Mid", false);
             SetReadOnly(grid, "BF10 Mid", false);
-            var atmAdj = grid.Columns.Cast<DataGridViewColumn>()
-                .FirstOrDefault(c => string.Equals(c.Name, "ATM_adj", StringComparison.OrdinalIgnoreCase));
-            if (atmAdj != null) atmAdj.ReadOnly = false;
 
-            // Koppla bort ev. legacy-handlers
-            grid.CellBeginEdit -= OnPairGridCellBeginEdit;
-            grid.CellValidating -= PairGrid_CellValidating;
-            grid.CellEndEdit -= PairGrid_CellEndEdit;
-            grid.CellEndEdit -= OnPairGridCellEndEdit;
-            grid.CellFormatting -= OnPairGridCellFormatting;
-            grid.DataError -= PairGrid_DataError;
+            // Event wiring: koppla endast en gång
+            if (!string.Equals(grid.Tag as string, "edit-wired", StringComparison.OrdinalIgnoreCase))
+            {
+                grid.CellBeginEdit -= OnPairGridCellBeginEdit;
+                grid.CellValidating -= PairGrid_CellValidating;
+                grid.CellEndEdit -= OnPairGridCellEndEdit;
+                grid.CellFormatting -= OnPairGridCellFormatting;
+                grid.DataError -= PairGrid_DataError;
 
-            // Nya handlers
-            grid.CellBeginEdit += OnPairGridCellBeginEdit;   // spara original för Esc/ogiltigt tal
-            grid.CellValidating += PairGrid_CellValidating;  // strikt parse + hårda kolumnregler (utan cancel)
-            grid.CellEndEdit += PairGrid_CellEndEdit;     // radregler + soft warns + draft-skriv
-            grid.CellEndEdit += OnPairGridCellEndEdit;    // befintlig: uppdaterar draftstore
-            grid.CellFormatting += OnPairGridCellFormatting; // gul markering endast när draft finns
-            grid.DataError += PairGrid_DataError;       // tysta grid-formatfel
+                grid.CellBeginEdit += OnPairGridCellBeginEdit;
+                grid.CellValidating += PairGrid_CellValidating;
+                grid.CellEndEdit += OnPairGridCellEndEdit;
+                grid.CellFormatting += OnPairGridCellFormatting;
+                grid.DataError += PairGrid_DataError;
 
-            grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
-            grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;
-            grid.ReadOnly = false;
-            grid.ShowCellErrors = true;
-            grid.ShowRowErrors = false;
+                grid.Tag = "edit-wired";
+            }
 
-            grid.Tag = "edit-wired";
+            // Kontextmeny för anchored (ATM_mid)
+            EnsureAtmContextMenuForGrid(grid);
+
+            grid.Invalidate();
         }
-
 
 
 
@@ -2967,8 +3405,6 @@ namespace FX.UI.WinForms.Features.VolManager
             if (col != null)
                 col.ReadOnly = ro;
         }
-
-
 
         /// <summary>
         /// Uppdaterar header-texten i par-fliken: "PAIR • yyyy-MM-dd HH:mm UTC".
@@ -2994,7 +3430,6 @@ namespace FX.UI.WinForms.Features.VolManager
             if (lbl != null)
                 lbl.Text = fromCache ? "Cached" : $"Fresh @ {DateTime.Now:HH:mm:ss}";
         }
-
 
         /// <summary>
         /// Skapar/hämtar TabPage + DataGridView för ett par i Tabs-läget och
@@ -3079,7 +3514,6 @@ namespace FX.UI.WinForms.Features.VolManager
         }
 
 
-
         /// <summary>
         /// Applicerar Pricer-temat på en DataGridView:
         /// (1) Samma typsnitt i grid och headers: Segoe UI 8.25 (header Bold)
@@ -3159,22 +3593,18 @@ namespace FX.UI.WinForms.Features.VolManager
 
 
         /// <summary>
-        /// Bygger/återanvänder headern för ett par i Tabs-vyn när man hostar i en given Panel,
-        /// i stället för direkt i en TabPage. Används när koden anropar
-        /// EnsurePairTabHeader(hostPanel, "PairHeaderHost", "PairHeaderLabel").
-        /// Skapar etikett för antal edits samt knapparna Discard och Review.
+        /// Bygger/återanvänder headern för ett par i Tabs-vyn när man hostar i en given Panel.
+        /// Skapar vänster titel-label (PairHeaderLabel), status-label (PairHeaderStatus)
+        /// samt edits-label (LblEdits) och knapparna BtnDiscardDraft/BtnReviewDraft som
+        /// UpdateDraftEditsCounter och layout-logiken förväntar sig.
         /// </summary>
-        /// <param name="hostPanel">Panel som äger headern (ligger normalt över gridet i tab-sidan).</param>
-        /// <param name="headerPanelName">Name att ge header-panelen (för att kunna hitta/återanvända).</param>
-        /// <param name="editsLabelName">Name att ge edits-labeln (för att kunna hitta/uppdatera).</param>
-        /// <returns>Header-panelen som innehåller label + knappar.</returns>
-        private Panel EnsurePairTabHeader(Panel hostPanel, string headerPanelName, string editsLabelName)
+        private Panel EnsurePairTabHeader(Panel hostPanel, string headerPanelName, string pairHeaderLabelName)
         {
             if (hostPanel == null) throw new ArgumentNullException(nameof(hostPanel));
             if (string.IsNullOrWhiteSpace(headerPanelName)) throw new ArgumentNullException(nameof(headerPanelName));
-            if (string.IsNullOrWhiteSpace(editsLabelName)) throw new ArgumentNullException(nameof(editsLabelName));
+            if (string.IsNullOrWhiteSpace(pairHeaderLabelName)) throw new ArgumentNullException(nameof(pairHeaderLabelName));
 
-            // 1) Header-panel (dockad överst i hostPanel)
+            // 1) Header-panel
             var header = hostPanel.Controls.OfType<Panel>().FirstOrDefault(p => p.Name == headerPanelName);
             if (header == null)
             {
@@ -3190,13 +3620,41 @@ namespace FX.UI.WinForms.Features.VolManager
                 header.BringToFront();
             }
 
-            // 2) Edits-label
-            var lblEdits = header.Controls.OfType<Label>().FirstOrDefault(l => l.Name == editsLabelName);
+            // 2) Vänster titel (PAIR • TS)
+            var lblPair = header.Controls.OfType<Label>().FirstOrDefault(l => l.Name == pairHeaderLabelName);
+            if (lblPair == null)
+            {
+                lblPair = new Label
+                {
+                    Name = pairHeaderLabelName,        // "PairHeaderLabel"
+                    AutoSize = true,
+                    Text = "",                         // sätts via UpdatePairHeader(...)
+                    TextAlign = ContentAlignment.MiddleLeft
+                };
+                header.Controls.Add(lblPair);
+            }
+
+            // 3) Status-label (t.ex. "Cached" / "Fresh @ hh:mm:ss")
+            var lblStatus = header.Controls.OfType<Label>().FirstOrDefault(l => l.Name == "PairHeaderStatus");
+            if (lblStatus == null)
+            {
+                lblStatus = new Label
+                {
+                    Name = "PairHeaderStatus",
+                    AutoSize = true,
+                    Text = "",
+                    TextAlign = ContentAlignment.MiddleLeft
+                };
+                header.Controls.Add(lblStatus);
+            }
+
+            // 4) Edits-label (det här namnet förväntas av UpdateDraftEditsCounter)
+            var lblEdits = header.Controls.OfType<Label>().FirstOrDefault(l => l.Name == "LblEdits");
             if (lblEdits == null)
             {
                 lblEdits = new Label
                 {
-                    Name = editsLabelName,
+                    Name = "LblEdits",
                     AutoSize = true,
                     Text = "Edits: 0",
                     TextAlign = ContentAlignment.MiddleLeft
@@ -3204,69 +3662,58 @@ namespace FX.UI.WinForms.Features.VolManager
                 header.Controls.Add(lblEdits);
             }
 
-            // 3) Discard-knapp (återanvänd om den redan finns)
-            var btnDiscard = header.Controls.OfType<Button>().FirstOrDefault(b => b.Name == "BtnDiscard");
+            // 5) Discard-knapp (namn förväntas av UpdateDraftEditsCounter/LayoutHeaderRightControls)
+            var btnDiscard = header.Controls.OfType<Button>().FirstOrDefault(b => b.Name == "BtnDiscardDraft");
             if (btnDiscard == null)
             {
                 btnDiscard = new Button
                 {
-                    Name = "BtnDiscard",
+                    Name = "BtnDiscardDraft",
                     Text = "Discard",
                     Size = new Size(78, 23),
-                    Enabled = false // aktiveras när det finns draft
+                    Enabled = false
                 };
-                btnDiscard.Click += (s, e) => DiscardAllDraftForActivePair();
+                btnDiscard.Click += OnDiscardAllDraftClick;
                 header.Controls.Add(btnDiscard);
             }
 
-            // 4) Review-knapp (öppnar review-dialogen)
-            var btnReview = header.Controls.OfType<Button>().FirstOrDefault(b => b.Name == "BtnReview");
+            // 6) Review-knapp (namn förväntas av UpdateDraftEditsCounter/LayoutHeaderRightControls)
+            var btnReview = header.Controls.OfType<Button>().FirstOrDefault(b => b.Name == "BtnReviewDraft");
             if (btnReview == null)
             {
                 btnReview = new Button
                 {
-                    Name = "BtnReview",
+                    Name = "BtnReviewDraft",
                     Text = "Review",
                     Size = new Size(78, 23),
-                    Enabled = false // aktiveras när det finns draft
+                    Enabled = false
                 };
-                // Koppla klick → review-dialogen för aktivt par
-                btnReview.Click += (s, e) => ShowReviewDialogForActivePair();
+                btnReview.Click += OnReviewDraftClick; // öppnar dry-run-dialogen
                 header.Controls.Add(btnReview);
             }
 
-            // 5) Enkel högerställd layout: [lblEdits] ... [Review][Discard]
-            void LayoutHeader()
+            // 7) Layout – vänster etiketter, höger knappar/edits
+            void DoLayout()
             {
-                var right = header.ClientSize.Width - 8;
+                // Vänster sida: PairHeaderLabel följt av PairHeaderStatus
+                lblPair.Left = 8;
+                lblPair.Top = (header.Height - lblPair.Height) / 2;
 
-                btnDiscard.Top = (header.Height - btnDiscard.Height) / 2;
-                btnDiscard.Left = right - btnDiscard.Width;
-                right = btnDiscard.Left - 6;
+                lblStatus.Left = lblPair.Right + 12;
+                lblStatus.Top = (header.Height - lblStatus.Height) / 2;
 
-                btnReview.Top = (header.Height - btnReview.Height) / 2;
-                btnReview.Left = right - btnReview.Width;
-                right = btnReview.Left - 12;
-
-                lblEdits.Top = (header.Height - lblEdits.Height) / 2;
-                lblEdits.Left = 8;
+                // Höger sida läggs av befintlig helper (placerar LblEdits, BtnDiscardDraft, BtnReviewDraft)
+                LayoutHeaderRightControls(header);
             }
 
             header.Resize -= HeaderOnResize;
             header.Resize += HeaderOnResize;
-            LayoutHeader(); // fixar initialt att label inte hamnar fel
+            DoLayout();
 
-            void HeaderOnResize(object sender, EventArgs e) => LayoutHeader();
+            void HeaderOnResize(object sender, EventArgs e) => DoLayout();
 
             return header;
         }
-
-
-
-
-
-
-
 
         #endregion
 
@@ -3361,30 +3808,75 @@ namespace FX.UI.WinForms.Features.VolManager
 
         #region Privata hjälpare – Formatting
 
-        /// <summary>Vol-tal (ATM/RR/BF) med 4 decimaler eller tomt.</summary>
-        private string FormatVol4(decimal? v) => v.HasValue ? v.Value.ToString("0.0000") : "";
-
         /// <summary>Snapshot UTC-tid i standardformat.</summary>
         private string FormatTimeUtc(DateTime tsUtc) => tsUtc.ToString("yyyy-MM-dd HH:mm") + " UTC";
 
+        #endregion
+
+        #region Shared helpers / grid
+
         /// <summary>
-        /// Sätter 4 decimalers format på angivna kolumner i en DGV.
+        /// Försöker läsa ett heltal från en rad för en given kolumn (Name eller HeaderText).
+        /// Returnerar null om kolumn saknas eller ej kan tolkas.
         /// </summary>
-        private void ApplyVol4Dp(DataGridView grid, params string[] columnNames)
+        private int? TryGetCellInt(DataGridViewRow row, string name)
         {
-            if (grid == null || columnNames == null) return;
-            var style = new DataGridViewCellStyle
-            {
-                Alignment = DataGridViewContentAlignment.MiddleRight,
-                Format = "0.0000"
-            };
-            foreach (var name in columnNames)
-            {
-                var col = grid.Columns[name] as DataGridViewTextBoxColumn;
-                if (col != null) col.DefaultCellStyle = style;
-            }
+            if (row == null || string.IsNullOrWhiteSpace(name)) return null;
+            var grid = row.DataGridView;
+            if (grid == null) return null;
+
+            DataGridViewColumn col = null;
+            foreach (DataGridViewColumn c in grid.Columns)
+                if (string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase)) { col = c; break; }
+            if (col == null)
+                foreach (DataGridViewColumn c in grid.Columns)
+                    if (string.Equals(c.HeaderText, name, StringComparison.OrdinalIgnoreCase)) { col = c; break; }
+
+            if (col == null) return null;
+
+            var val = row.Cells[col.Index]?.Value;
+            if (val == null) return null;
+
+            if (val is int i) return i;
+
+            var s = val.ToString();
+            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.CurrentCulture, out var p1)) return p1;
+            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p2)) return p2;
+
+            return null;
         }
 
+        /// <summary>
+        /// Tolkar en tenorsträng till nominella dagar (fallback när DaysNom saknas). Enkla regler: 1W=7, 2W=14, 1M=30, 3M=90, 6M=180, 1Y=365, etc.
+        /// Returnerar null om strängen ej känns igen.
+        /// </summary>
+        private int? TenorToNominalDaysFallback(string tenor)
+        {
+            if (string.IsNullOrWhiteSpace(tenor)) return null;
+            tenor = tenor.Trim().ToUpperInvariant();
+
+            try
+            {
+                if (tenor.EndsWith("W"))
+                {
+                    var n = int.Parse(tenor.Substring(0, tenor.Length - 1));
+                    return n * 7;
+                }
+                if (tenor.EndsWith("M"))
+                {
+                    var n = int.Parse(tenor.Substring(0, tenor.Length - 1));
+                    return n * 30; // enkel approx
+                }
+                if (tenor.EndsWith("Y"))
+                {
+                    var n = int.Parse(tenor.Substring(0, tenor.Length - 1));
+                    return n * 365;
+                }
+            }
+            catch { /* ignore */ }
+
+            return null;
+        }
 
         #endregion
 
@@ -3393,7 +3885,7 @@ namespace FX.UI.WinForms.Features.VolManager
 
         /// <summary>
         /// Sätter eller rensar ett draftvärde för ett par/tenor och fält.
-        /// fieldKey stöder: "Rr25Mid","Rr10Mid","Bf25Mid","Bf10Mid","AtmSpread","AtmOffset".
+        /// fieldKey stöder: "AtmMid","Rr25Mid","Rr10Mid","Bf25Mid","Bf10Mid","AtmSpread","AtmOffset".
         /// Skapar rad vid behov. Tar bort rad/par-nycklar när samtliga fält blir null.
         /// Anropar UpdateDraftEditsCounter(pair) och gör ingen IO.
         /// </summary>
@@ -3419,6 +3911,7 @@ namespace FX.UI.WinForms.Features.VolManager
             // Sätt/ta bort värdet på rätt fält
             switch (fieldKey)
             {
+                case "AtmMid": row.AtmMid = value; break; // <— nytt fält i draft-raden
                 case "Rr25Mid": row.Rr25Mid = value; break;
                 case "Rr10Mid": row.Rr10Mid = value; break;
                 case "Bf25Mid": row.Bf25Mid = value; break;
@@ -3436,7 +3929,7 @@ namespace FX.UI.WinForms.Features.VolManager
                     _draftStore.Remove(pair);
             }
 
-            // Uppdatera liten status (om du har denna metod; annars no-op)
+            // Uppdatera liten status (om metoden finns; annars no-op)
             try { UpdateDraftEditsCounter(pair); } catch { /* best effort */ }
         }
 
@@ -3445,29 +3938,35 @@ namespace FX.UI.WinForms.Features.VolManager
         /// </summary>
         private static string NormalizeDraftFieldKey(string fieldKey)
         {
+            if (string.IsNullOrWhiteSpace(fieldKey)) return fieldKey;
             var k = fieldKey.Trim();
-            // Tillåt även grid-kolumnnamn (case-insensitivt)
-            if (k.Equals("RR25_mid", StringComparison.OrdinalIgnoreCase)) return "Rr25Mid";
-            if (k.Equals("RR10_mid", StringComparison.OrdinalIgnoreCase)) return "Rr10Mid";
-            if (k.Equals("BF25_mid", StringComparison.OrdinalIgnoreCase)) return "Bf25Mid";
-            if (k.Equals("BF10_mid", StringComparison.OrdinalIgnoreCase)) return "Bf10Mid";
-            if (k.Equals("ATM_adj", StringComparison.OrdinalIgnoreCase)) return "AtmSpread"; // default – växlas till Offset i call-site vid anchored
-                                                                                             // Stöd redan “rätta” nycklar
-            if (k.Equals("Rr25Mid", StringComparison.OrdinalIgnoreCase)) return "Rr25Mid";
-            if (k.Equals("Rr10Mid", StringComparison.OrdinalIgnoreCase)) return "Rr10Mid";
-            if (k.Equals("Bf25Mid", StringComparison.OrdinalIgnoreCase)) return "Bf25Mid";
-            if (k.Equals("Bf10Mid", StringComparison.OrdinalIgnoreCase)) return "Bf10Mid";
-            if (k.Equals("AtmSpread", StringComparison.OrdinalIgnoreCase)) return "AtmSpread";
-            if (k.Equals("AtmOffset", StringComparison.OrdinalIgnoreCase)) return "AtmOffset";
+
+            // Tillåt både header-texter och interna namn
+            if (k.Equals("ATM Mid", StringComparison.OrdinalIgnoreCase) || k.Equals("ATM_mid", StringComparison.OrdinalIgnoreCase))
+                return "AtmMid";
+            if (k.Equals("RR25 Mid", StringComparison.OrdinalIgnoreCase) || k.Equals("RR25_mid", StringComparison.OrdinalIgnoreCase))
+                return "Rr25Mid";
+            if (k.Equals("RR10 Mid", StringComparison.OrdinalIgnoreCase) || k.Equals("RR10_mid", StringComparison.OrdinalIgnoreCase))
+                return "Rr10Mid";
+            if (k.Equals("BF25 Mid", StringComparison.OrdinalIgnoreCase) || k.Equals("BF25_mid", StringComparison.OrdinalIgnoreCase))
+                return "Bf25Mid";
+            if (k.Equals("BF10 Mid", StringComparison.OrdinalIgnoreCase) || k.Equals("BF10_mid", StringComparison.OrdinalIgnoreCase))
+                return "Bf10Mid";
+            if (k.Equals("ATM Spread", StringComparison.OrdinalIgnoreCase) || k.Equals("AtmSpread", StringComparison.OrdinalIgnoreCase))
+                return "AtmSpread";
+            if (k.Equals("ATM Offset", StringComparison.OrdinalIgnoreCase) || k.Equals("AtmOffset", StringComparison.OrdinalIgnoreCase))
+                return "AtmOffset";
+
             return k;
         }
 
         /// <summary>
-        /// True om någon draft-kolumn i raden har värde.
+        /// True om raden bär någon draft (inklusive AtmMid).
         /// </summary>
         private static bool HasAnyDraftValues(VolDraftRow r)
         {
             return r != null && (
+                r.AtmMid.HasValue ||          // <— nytt
                 r.Rr25Mid.HasValue ||
                 r.Rr10Mid.HasValue ||
                 r.Bf25Mid.HasValue ||
@@ -3476,6 +3975,360 @@ namespace FX.UI.WinForms.Features.VolManager
                 r.AtmOffset.HasValue
             );
         }
+
+        #endregion
+
+        #region Draft – review/publish dialog
+
+        /// <summary>
+        /// Beräknar cross-tenor QC för ett par utifrån den aktiva griden (draftoverlay redan applicerad i cellerna).
+        /// Returnerar (hardCount, softCount, lista av rader som kan adderas till Review-grid).
+        /// Varje "rad" är ett tuple: (TenorLabel, Field, Before, After, Note).
+        /// </summary>
+        private Tuple<int, int, List<Tuple<string, string, string, string, string>>> BuildCrossTenorQcRows(string pair, DataGridView grid)
+        {
+            var hard = 0;
+            var soft = 0;
+            var rowsOut = new List<Tuple<string, string, string, string, string>>();
+            if (grid == null) return Tuple.Create(hard, soft, rowsOut);
+
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+
+            // Läs ut tenorer sorterade på T (år) – använd DaysNom i första hand, annars fallback från tenorsträng
+            var items = new List<(DataGridViewRow row, string tenor, decimal? atm, decimal? rr25, decimal? rr10, decimal? bf25, decimal? bf10, decimal T)>();
+            foreach (DataGridViewRow r in grid.Rows)
+            {
+                var tenor = r.Cells["Tenor"]?.Value?.ToString();
+                if (string.IsNullOrWhiteSpace(tenor)) continue;
+
+                // ATM (effektiv): cell "ATM_mid" har redan eff mid (anchored = AnchorMid+Offset) efter våra tidigare steg
+                var atm = TryGetCellDecimal(r, "ATM_mid");
+                var rr25 = TryGetCellDecimal(r, "RR25_mid");
+                var rr10 = TryGetCellDecimal(r, "RR10_mid");
+                var bf25 = TryGetCellDecimal(r, "BF25_mid");
+                var bf10 = TryGetCellDecimal(r, "BF10_mid");
+
+                // T i år
+                var days = TryGetCellInt(r, "DaysNom") ?? TenorToNominalDaysFallback(tenor) ?? 0;
+                if (days <= 0) continue; // utan T kan vi inte göra kalender-QC
+                var T = (decimal)days / 365.0m;
+
+                items.Add((r, tenor, atm, rr25, rr10, bf25, bf10, T));
+            }
+
+            // Sortera på T
+            items.Sort((a, b) => a.T.CompareTo(b.T));
+            if (items.Count < 2) return Tuple.Create(hard, soft, rowsOut);
+
+            // Hjälpare för varians
+            decimal Var(decimal sigma, decimal T) => sigma * sigma * T;
+
+            // Trösklar (kan göras konfigurerbara senare)
+            const decimal EPS = 1e-8m;            // numerisk tolerans
+            const decimal ATM_JUMP = 2.0m;        // soft varning vid stort hopp i ATM (vol-points)
+            const decimal RR_JUMP = 1.5m;        // soft varning vid stort hopp i RR
+            const decimal BF_JUMP = 1.0m;        // soft varning vid stort hopp i BF
+            const decimal OFF_JUMP = 1.0m;        // soft varning vid "hackig" offset (endast anchored)
+
+            // Loop över grannar för kalender-QC + släthet
+            for (int i = 0; i < items.Count - 1; i++)
+            {
+                var a = items[i];
+                var b = items[i + 1];
+                var label = $"{a.tenor}→{b.tenor}";
+
+                // Härled 10P/25P/25C/10C från ATM/RR/BF (om alla komponenter finns)
+                bool have25 = a.atm.HasValue && a.rr25.HasValue && a.bf25.HasValue &&
+                              b.atm.HasValue && b.rr25.HasValue && b.bf25.HasValue;
+                bool have10 = a.atm.HasValue && a.rr10.HasValue && a.bf10.HasValue &&
+                              b.atm.HasValue && b.rr10.HasValue && b.bf10.HasValue;
+
+                if (have25)
+                {
+                    var a25C = a.atm.Value + 0.5m * a.bf25.Value - 0.5m * a.rr25.Value;
+                    var a25P = a.atm.Value + 0.5m * a.bf25.Value + 0.5m * a.rr25.Value;
+                    var b25C = b.atm.Value + 0.5m * b.bf25.Value - 0.5m * b.rr25.Value;
+                    var b25P = b.atm.Value + 0.5m * b.bf25.Value + 0.5m * b.rr25.Value;
+
+                    if (Var(b25C, b.T) + EPS < Var(a25C, a.T))
+                    {
+                        hard++;
+                        rowsOut.Add(Tuple.Create(label, "QC: Calendar variance 25C", "", "",
+                            $"Total variance decreases ({a.tenor}→{b.tenor}).  {a25C:0.####}²·{a.T:0.####} → {b25C:0.####}²·{b.T:0.####}"));
+                    }
+                    if (Var(b25P, b.T) + EPS < Var(a25P, a.T))
+                    {
+                        hard++;
+                        rowsOut.Add(Tuple.Create(label, "QC: Calendar variance 25P", "", "",
+                            $"Total variance decreases ({a.tenor}→{b.tenor}).  {a25P:0.####}²·{a.T:0.####} → {b25P:0.####}²·{b.T:0.####}"));
+                    }
+                }
+
+                if (have10)
+                {
+                    var a10C = a.atm.Value + 0.5m * a.bf10.Value - 0.5m * a.rr10.Value;
+                    var a10P = a.atm.Value + 0.5m * a.bf10.Value + 0.5m * a.rr10.Value;
+                    var b10C = b.atm.Value + 0.5m * b.bf10.Value - 0.5m * b.rr10.Value;
+                    var b10P = b.atm.Value + 0.5m * b.bf10.Value + 0.5m * b.rr10.Value;
+
+                    if (Var(b10C, b.T) + EPS < Var(a10C, a.T))
+                    {
+                        hard++;
+                        rowsOut.Add(Tuple.Create(label, "QC: Calendar variance 10C", "", "",
+                            $"Total variance decreases ({a.tenor}→{b.tenor}).  {a10C:0.####}²·{a.T:0.####} → {b10C:0.####}²·{b.T:0.####}"));
+                    }
+                    if (Var(b10P, b.T) + EPS < Var(a10P, a.T))
+                    {
+                        hard++;
+                        rowsOut.Add(Tuple.Create(label, "QC: Calendar variance 10P", "", "",
+                            $"Total variance decreases ({a.tenor}→{b.tenor}).  {a10P:0.####}²·{a.T:0.####} → {b10P:0.####}²·{b.T:0.####}"));
+                    }
+                }
+
+                // Släthet (soft): stora hopp mellan grannar
+                if (a.atm.HasValue && b.atm.HasValue && Math.Abs(b.atm.Value - a.atm.Value) > ATM_JUMP)
+                {
+                    soft++;
+                    rowsOut.Add(Tuple.Create(label, "QC: ATM jump", "", "",
+                        $"Large ATM change: {a.atm.Value:0.####} → {b.atm.Value:0.####}"));
+                }
+                if (a.rr25.HasValue && b.rr25.HasValue && Math.Abs(b.rr25.Value - a.rr25.Value) > RR_JUMP)
+                {
+                    soft++;
+                    rowsOut.Add(Tuple.Create(label, "QC: RR25 jump", "", "",
+                        $"Large RR25 change: {a.rr25.Value:0.####} → {b.rr25.Value:0.####}"));
+                }
+                if (a.rr10.HasValue && b.rr10.HasValue && Math.Abs(b.rr10.Value - a.rr10.Value) > RR_JUMP)
+                {
+                    soft++;
+                    rowsOut.Add(Tuple.Create(label, "QC: RR10 jump", "", "",
+                        $"Large RR10 change: {a.rr10.Value:0.####} → {b.rr10.Value:0.####}"));
+                }
+                if (a.bf25.HasValue && b.bf25.HasValue && Math.Abs(b.bf25.Value - a.bf25.Value) > BF_JUMP)
+                {
+                    soft++;
+                    rowsOut.Add(Tuple.Create(label, "QC: BF25 jump", "", "",
+                        $"Large BF25 change: {a.bf25.Value:0.####} → {b.bf25.Value:0.####}"));
+                }
+                if (a.bf10.HasValue && b.bf10.HasValue && Math.Abs(b.bf10.Value - a.bf10.Value) > BF_JUMP)
+                {
+                    soft++;
+                    rowsOut.Add(Tuple.Create(label, "QC: BF10 jump", "", "",
+                        $"Large BF10 change: {a.bf10.Value:0.####} → {b.bf10.Value:0.####}"));
+                }
+
+                // Anchored: Offset-släthet (soft)
+                if (anchored)
+                {
+                    var offA = TryGetCellDecimal(a.row, "ATM_adj");
+                    var offB = TryGetCellDecimal(b.row, "ATM_adj");
+                    if (offA.HasValue && offB.HasValue && Math.Abs(offB.Value - offA.Value) > OFF_JUMP)
+                    {
+                        soft++;
+                        rowsOut.Add(Tuple.Create(label, "QC: Offset jump", "", "",
+                            $"Large Offset change: {offA.Value:0.####} → {offB.Value:0.####}"));
+                    }
+                }
+            }
+
+            return Tuple.Create(hard, soft, rowsOut);
+        }
+
+
+        /// <summary>
+        /// Utför publicering av draftade voländringar för ett valutapar.
+        /// Mappar draft till VolPublishRow, anropar presenter.PublishAsync,
+        /// visar en "Published OK"-notis, triggar refresh och stänger dialogen.
+        /// </summary>
+        private async Task HandlePublishAsync(
+            string pair,
+            DateTime tsUtc,
+            List<VolDraftChange> changes,
+            Form dialog,
+            CancellationToken ct)
+        {
+            // 1) Bygg lista per tenor
+            var rows = new Dictionary<string, VolPublishRow>();
+
+            foreach (var change in changes)
+            {
+                if (!rows.TryGetValue(change.Tenor, out var pubRow))
+                {
+                    pubRow = new VolPublishRow
+                    {
+                        TenorCode = change.Tenor,
+                        AtmMid = null,
+                        AtmSpread = null,
+                        AtmOffset = null,
+                        Rr25Mid = null,
+                        Rr10Mid = null,
+                        Bf25Mid = null,
+                        Bf10Mid = null
+                    };
+                    rows[change.Tenor] = pubRow;
+                }
+
+                // 2) Mappa Field → rätt fält i VolPublishRow
+                switch (change.Field)
+                {
+                    case "ATM Mid":
+                        pubRow.AtmMid = change.New;
+                        break;
+
+                    case "ATM Spread":
+                        pubRow.AtmSpread = change.New;
+                        break;
+
+                    case "ATM Offset":
+                        pubRow.AtmOffset = change.New;
+                        break;
+
+                    case "RR25 Mid":
+                        pubRow.Rr25Mid = change.New;
+                        break;
+
+                    case "RR10 Mid":
+                        pubRow.Rr10Mid = change.New;
+                        break;
+
+                    case "BF25 Mid":
+                        pubRow.Bf25Mid = change.New;
+                        break;
+
+                    case "BF10 Mid":
+                        pubRow.Bf10Mid = change.New;
+                        break;
+                }
+            }
+
+            // 3) Publicera via presentern
+            var ok = await _presenter.PublishAsync(
+                Environment.UserName,
+                pair,
+                tsUtc,
+                rows.Values.ToList(),
+                ct);
+
+            if (!ok)
+            {
+                MessageBox.Show(
+                    this,
+                    "Publish misslyckades.",
+                    "Volatility Manager",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
+            // 4) Visa "Published OK"
+            MessageBox.Show(
+                this,
+                "Published OK",
+                "Volatility Manager",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+
+
+            // Rensa alla draft för paret
+            if (_draftStore.ContainsKey(pair))
+                _draftStore[pair].Clear();
+
+            // 5) Refresh paret — force = true
+            await _presenter.RefreshPairAndBindAsync(pair, true);
+
+            // 6) Stäng dialogen
+            dialog.Close();
+        }
+
+
+        /// <summary>
+        /// Bygger publish-rader från draft för ett par.
+        /// Säkerställer att AtmMid i raden alltid är "effective mid":
+        /// - Non-anchored:   AtmMid = (draft.AtmMid om satt) annars grid/baseline ATM_mid.
+        /// - Anchored:       AtmMid = AnchorMid + (draft/aktuellt) Offset,
+        ///   där AnchorMid ≈ (baseline ATM_mid − baseline ATM_adj) per tenor.
+        /// AtmSpread/Offset tas från draft om satt, annars aktuella cellvärden om vi tillåter fallback.
+        /// RR/BF tas från draft om satta.
+        /// </summary>
+        private List<VolPublishRow> BuildPublishRowsFromDraft(string pair) // ERSÄTT
+        {
+            var list = new List<VolPublishRow>();
+            if (string.IsNullOrWhiteSpace(pair)) return list;
+            pair = pair.ToUpperInvariant();
+
+            if (!_draftStore.TryGetValue(pair, out var perPair) || perPair == null || perPair.Count == 0)
+                return list;
+
+            var grid = GetActivePairGrid();
+            var anchored = _presenter != null && _presenter.IsAnchoredPair(pair);
+            if (grid == null) return list;
+
+            foreach (var kv in perPair)
+            {
+                var tenor = kv.Key;
+                var d = kv.Value;
+                if (d == null) continue;
+
+                // Hitta grid-raden och baseline
+                DataGridViewRow row = null;
+                foreach (DataGridViewRow r in grid.Rows)
+                {
+                    var t = r.Cells["Tenor"]?.Value?.ToString();
+                    if (string.Equals(t, tenor, StringComparison.OrdinalIgnoreCase)) { row = r; break; }
+                }
+                if (row == null) continue;
+                var baseMap = row.Tag as Dictionary<string, decimal?> ?? new Dictionary<string, decimal?>();
+
+                // Effective Mid
+                decimal? midEff = null;
+                if (!anchored)
+                {
+                    midEff = d.AtmMid
+                          ?? TryGetCellDecimal(row, "ATM_mid")
+                          ?? (baseMap.TryGetValue("ATM_mid", out var m0) ? m0 : null);
+                }
+                else
+                {
+                    decimal? anchorMid = null;
+                    if (baseMap.TryGetValue("ATM_mid", out var dbMid) && dbMid.HasValue &&
+                        baseMap.TryGetValue("ATM_adj", out var dbOff) && dbOff.HasValue)
+                    {
+                        anchorMid = dbMid.Value - dbOff.Value;
+                    }
+                    var offset = d.AtmOffset
+                              ?? TryGetCellDecimal(row, "ATM_adj")
+                              ?? (baseMap.TryGetValue("ATM_adj", out var off0) ? off0 : null);
+
+                    if (anchorMid.HasValue && offset.HasValue)
+                        midEff = anchorMid.Value + offset.Value;
+                }
+
+                var rowOut = new VolPublishRow
+                {
+                    TenorCode = tenor,
+                    AtmMid = midEff,                      // viktiga ändringen
+                    AtmSpread = d.AtmSpread,                 // endast draftade fält skickas
+                    AtmOffset = d.AtmOffset,
+                    Rr25Mid = d.Rr25Mid,
+                    Rr10Mid = d.Rr10Mid,
+                    Bf25Mid = d.Bf25Mid,
+                    Bf10Mid = d.Bf10Mid
+                };
+
+                // Skicka endast rader som faktiskt har något att publicera
+                if (rowOut.AtmMid.HasValue || rowOut.AtmSpread.HasValue || rowOut.AtmOffset.HasValue ||
+                    rowOut.Rr25Mid.HasValue || rowOut.Rr10Mid.HasValue || rowOut.Bf25Mid.HasValue || rowOut.Bf10Mid.HasValue)
+                {
+                    list.Add(rowOut);
+                }
+            }
+
+            return list;
+        }
+
+
+
+
 
 
 

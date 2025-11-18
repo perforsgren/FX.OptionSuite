@@ -114,5 +114,77 @@ namespace FX.Core.Interfaces
         VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId);
     }
 
+    /// <summary>
+    /// Skriv-interface för publicering av vol-rader. Valfritt (stubbar om null).
+    /// </summary>
+    public interface IVolWriteRepository
+    {
+        /// <summary>
+        /// Upsert av ändrade rader för ett par vid given tidsstämpel.
+        /// Returnerar t.ex. audit-id/snapshot-id (kan vara valfritt).
+        /// </summary>
+        Task<long> UpsertSurfaceRowsAsync(
+            string user,
+            string pair,
+            DateTime tsUtc,
+            IEnumerable<VolPublishRow> rows,
+            CancellationToken ct);
+    }
+
+    /// <summary>
+    /// Representerar en publicerbar ändring för en tenor i volytan.
+    /// Modellen stödjer både ATM mid och ATM spread/offset.
+    /// Spread används för icke-ankrade par.
+    /// Offset används för ankrade par.
+    /// RR/BF publiceras endast som mid-värden.
+    /// </summary>
+    public sealed class VolPublishRow
+    {
+        /// <summary>
+        /// Tenorkod, t.ex. "1W" eller "1M".
+        /// </summary>
+        public string TenorCode { get; set; }
+
+        /// <summary>
+        /// Det nya ATM mid-värdet efter draft/ändring.
+        /// Om null: ATM mid ändrades inte av användaren.
+        /// </summary>
+        public decimal? AtmMid { get; set; }
+
+        /// <summary>
+        /// ATM spread för icke-ankrade par.
+        /// När spread finns -> atm_bid/atm_ask räknas ut från AtmMid ± (spread/2).
+        /// </summary>
+        public decimal? AtmSpread { get; set; }
+
+        /// <summary>
+        /// ATM offset för ankrade par.
+        /// När offset används -> atm_mid = anchor_atm_mid + offset.
+        /// Bid/Ask = Mid (dvs noll spread).
+        /// </summary>
+        public decimal? AtmOffset { get; set; }
+
+        /// <summary>
+        /// RR25 mid (ändrat värde).
+        /// </summary>
+        public decimal? Rr25Mid { get; set; }
+
+        /// <summary>
+        /// RR10 mid (ändrat värde).
+        /// </summary>
+        public decimal? Rr10Mid { get; set; }
+
+        /// <summary>
+        /// BF25 mid (ändrat värde).
+        /// </summary>
+        public decimal? Bf25Mid { get; set; }
+
+        /// <summary>
+        /// BF10 mid (ändrat värde).
+        /// </summary>
+        public decimal? Bf10Mid { get; set; }
+
+
+    }
 
 }

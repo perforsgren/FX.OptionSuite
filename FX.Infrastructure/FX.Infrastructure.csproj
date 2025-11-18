@@ -76,6 +76,7 @@
     <Compile Include="InfrastructureMarkers.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="VolDb\MySqlVolRepository.cs" />
+    <Compile Include="VolDb\MySqlVolWriteRepository.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\FX.Core\FX.Core.csproj">

@@ -32,11 +32,6 @@ namespace FX.Services
             // Runtime (subscribar på RequestPrice)
             services.AddSingleton<FxRuntime>();
 
-            // NY: VolRepository (MySQL, endast läsning i detta skede)
-            //var fxvolConn =
-            //    Environment.GetEnvironmentVariable("FXVOL_CONN")
-            //    ?? Environment.GetEnvironmentVariable("MYSQL_FXVOL_CONN")
-            //    ?? "Server=localhost;Database=fxvol;Uid=fx;Pwd=fx;TreatTinyAsBoolean=false;";
 
             string username = "fxopt";
             string password = "fxopt987";
@@ -48,10 +43,11 @@ namespace FX.Services
                 "Password=" + password + ";" +
                 "Connection Timeout=15;SslMode=None;TreatTinyAsBoolean=false;";
 
-
-
-
+            // Read
             services.AddSingleton<CoreI.IVolRepository>(_ => new MySqlVolRepository(fxvolConn));
+            // Write
+            services.AddSingleton<CoreI.IVolWriteRepository>(_ => new MySqlVolWriteRepository(fxvolConn));
+
 
             return services;
         }
