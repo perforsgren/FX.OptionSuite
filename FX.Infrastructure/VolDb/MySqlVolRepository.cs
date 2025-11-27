@@ -27,6 +27,70 @@ namespace FX.Infrastructure.VolDb
         }
 
         /// <summary>
+        /// Hämtar effektiva ATM-rader för ett valutapar från fxvol.v_atm_effective_latest.
+        /// Returnerar en rad per tenor med Mid, ev. Bid/Ask, SpreadTotal samt BaseAtmMid/AtmOffset.
+        /// </summary>
+        public IEnumerable<EffectiveAtmRow> GetEffectiveAtmRows(string pairSymbol)
+        {
+            var rows = new List<EffectiveAtmRow>();
+            if (string.IsNullOrWhiteSpace(pairSymbol))
+                return rows;
+
+            using (var conn = new MySqlConnection(_connectionString))
+            {
+                conn.Open();
+
+                var sql = @"
+SELECT
+    pair_symbol,
+    tenor_code,
+    days_for_sort,
+    source_kind,
+    anchor_pair_symbol,
+    atm_bid_effective,
+    atm_mid_effective,
+    atm_ask_effective,
+    spread_total,
+    base_atm_mid,
+    offset_mid
+FROM fxvol.v_atm_effective_latest
+WHERE pair_symbol = @pair
+ORDER BY COALESCE(days_for_sort, 999999), tenor_code;";
+
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@pair", pairSymbol);
+
+                    using (var rd = cmd.ExecuteReader())
+                    {
+                        while (rd.Read())
+                        {
+                            var r = new EffectiveAtmRow
+                            {
+                                PairSymbol = rd.IsDBNull(0) ? null : rd.GetString(0),
+                                TenorCode = rd.IsDBNull(1) ? null : rd.GetString(1),
+                                DaysForSort = rd.IsDBNull(2) ? (int?)null : rd.GetInt32(2),
+                                SourceKind = rd.IsDBNull(3) ? null : rd.GetString(3),
+                                AnchorPairSymbol = rd.IsDBNull(4) ? null : rd.GetString(4),
+                                AtmBidEffective = rd.IsDBNull(5) ? (decimal?)null : rd.GetDecimal(5),
+                                AtmMidEffective = rd.IsDBNull(6) ? (decimal?)null : rd.GetDecimal(6),
+                                AtmAskEffective = rd.IsDBNull(7) ? (decimal?)null : rd.GetDecimal(7),
+                                SpreadTotal = rd.IsDBNull(8) ? (decimal?)null : rd.GetDecimal(8),
+                                BaseAtmMid = rd.IsDBNull(9) ? (decimal?)null : rd.GetDecimal(9),
+                                AtmOffset = rd.IsDBNull(10) ? (decimal?)null : rd.GetDecimal(10)
+                            };
+                            rows.Add(r);
+                        }
+                    }
+                }
+            }
+
+            return rows;
+        }
+
+
+
+        /// <summary>
         /// Returnerar snapshot-id för den senaste volytan (MAX(ts_utc)) för ett givet valutapar.
         /// </summary>
         /// <param name="pairSymbol">Par såsom "EUR/USD", "USD/SEK".</param>
@@ -67,7 +131,7 @@ namespace FX.Infrastructure.VolDb
         /// </summary>
         /// <param name="snapshotId">Id från vol_surface_snapshot.</param>
         /// <returns>Header-objekt, eller null om snapshot saknas.</returns>
-        public FX.Core.Domain.VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId)
+        public VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId)
         {
             const string sql = @"
                                 SELECT 
@@ -177,6 +241,74 @@ namespace FX.Infrastructure.VolDb
         }
 
 
+        /// <summary>
+        /// Slår upp ankare för target-paret via fxvol.vol_anchor_map.
+        /// </summary>
+        public bool TryGetAnchorPair(string targetPairSymbol, out string anchorPairSymbol)
+        {
+            anchorPairSymbol = null;
+            if (string.IsNullOrWhiteSpace(targetPairSymbol)) return false;
+
+            using (var conn = new MySqlConnection(_connectionString))
+            {
+                conn.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+SELECT anchor_pair_symbol
+FROM fxvol.vol_anchor_map
+WHERE target_pair_symbol = @p
+LIMIT 1;";
+                    cmd.Parameters.Add("@p", MySqlDbType.VarChar).Value = targetPairSymbol;
+
+                    var obj = cmd.ExecuteScalar();
+                    if (obj != null && obj != DBNull.Value)
+                    {
+                        anchorPairSymbol = Convert.ToString(obj);
+                        return !string.IsNullOrWhiteSpace(anchorPairSymbol);
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Läser current policy (offset + spread) för ett ankrat par från fxvol.vol_anchor_atm_policy.
+        /// </summary>
+        public IEnumerable<AnchorAtmPolicyRow> GetAnchorAtmPolicy(string targetPairSymbol)
+        {
+            var list = new List<AnchorAtmPolicyRow>();
+            if (string.IsNullOrWhiteSpace(targetPairSymbol)) return list;
+
+            using (var conn = new MySqlConnection(_connectionString))
+            {
+                conn.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+SELECT tenor_code, offset_mid, spread_total, effective_from_utc
+FROM fxvol.vol_anchor_atm_policy
+WHERE target_pair_symbol = @p;";
+                    cmd.Parameters.Add("@p", MySqlDbType.VarChar).Value = targetPairSymbol;
+
+                    using (var rdr = cmd.ExecuteReader())
+                    {
+                        while (rdr.Read())
+                        {
+                            var row = new AnchorAtmPolicyRow
+                            {
+                                TenorCode = rdr.IsDBNull(0) ? null : rdr.GetString(0),
+                                OffsetMid = rdr.IsDBNull(1) ? (decimal?)null : rdr.GetDecimal(1),
+                                SpreadTotal = rdr.IsDBNull(2) ? (decimal?)null : rdr.GetDecimal(2),
+                                EffectiveFromUtc = rdr.IsDBNull(3) ? DateTime.MinValue : rdr.GetDateTime(3)
+                            };
+                            list.Add(row);
+                        }
+                    }
+                }
+            }
+            return list;
+        }
 
 
 

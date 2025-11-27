@@ -48,7 +48,6 @@ namespace FX.Services
             // Write
             services.AddSingleton<CoreI.IVolWriteRepository>(_ => new MySqlVolWriteRepository(fxvolConn));
 
-
             return services;
         }
     }

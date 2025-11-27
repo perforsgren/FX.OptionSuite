@@ -36,6 +36,8 @@ namespace FX.UI.WinForms
 
             services.AddTransient<VolAppInstance>();
 
+            services.AddTransient<BlotterAppInstance>();
+
             // Registrera EN global MarketStore för hela appen
             services.AddSingleton<IMarketStore, MarketStore>();
 

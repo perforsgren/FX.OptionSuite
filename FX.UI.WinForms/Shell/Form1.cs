@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using Svg;
 using System.Drawing.Drawing2D;
 using System.IO;
+using static System.Windows.Forms.AxHost;
 
 namespace FX.UI.WinForms
 {
@@ -260,9 +261,15 @@ namespace FX.UI.WinForms
                 OpenOrFocusVolManager();
                 return _apps.TryGetValue("Volatility Management", out var vol) ? vol.Doc : null;
             }
-            // === Placeholders: Blotter / Gamma Hedger =======
-            if (string.Equals(persistString, "Blotter", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(persistString, "Gamma Hedger", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(persistString, "Blotter", StringComparison.Ordinal))
+            {
+                // Återskapa/fokusera Blotter via vår launcher (samma mönster som Pricer/Vol).
+                OpenOrFocusBlotter();
+                return _apps.TryGetValue("Blotter", out var blotter) ? blotter.Doc : null;
+            }
+
+            // === Placeholders: Gamma Hedger =======
+            if (string.Equals(persistString, "Gamma Hedger", StringComparison.OrdinalIgnoreCase))
             {
                 var title = persistString;
 
@@ -371,7 +378,7 @@ namespace FX.UI.WinForms
                 Height = 28,
                 Margin = new Padding(0, 0, 4, 0)
             };
-            bBlotter.Click += (s, e) => OpenPlaceholderOnce("Blotter");
+            bBlotter.Click += (s, e) => OpenOrFocusBlotter();
 
             // Gamma Hedger
             var gammaIcon = RenderSvgIconFromEmbedded(
@@ -677,6 +684,7 @@ namespace FX.UI.WinForms
         private void OpenOrFocusVolManager()
         {
             const string key = "Volatility Management";
+
             if (_apps.TryGetValue(key, out var existing))
             {
                 existing.Doc.Activate();
@@ -706,6 +714,53 @@ namespace FX.UI.WinForms
             _apps[key] = (doc, vol);
             ShowInCurrentMode(doc);
         }
+
+        #region === Blotter (en-instans via DI) ===
+
+        /// <summary>Öppnar eller fokuserar Blotter-appen (en instans), med samma mönster som Pricer/Vol.</summary>
+        private void OpenOrFocusBlotter()
+        {
+            const string key = "Blotter";
+
+            // Finns redan? Aktivera befintligt dock-fönster.
+            if (_apps.TryGetValue(key, out var existing))
+            {
+                existing.Doc.Activate();
+                return;
+            }
+
+            // Resolve BlotterAppInstance via DI (registrerad som Singleton).
+            var blotter = _sp.GetRequiredService<BlotterAppInstance>();
+            var view = blotter.View ?? throw new InvalidOperationException("BlotterAppInstance.View saknas.");
+
+            // Egen DockContent med stabil persist-sträng ("Blotter").
+            var doc = new BlotterDockContent
+            {
+                Text = blotter.Title ?? key,
+                Icon = GetAppIcon("Blotter")
+            };
+
+            view.Dock = DockStyle.Fill;
+            doc.Controls.Add(view);
+
+            // Livscykel-wire
+            doc.Activated += (s, e) => Safe(blotter.OnActivated);
+            doc.Deactivate += (s, e) => Safe(blotter.OnDeactivated);
+            doc.FormClosed += (s, e) =>
+            {
+                if (_apps.ContainsKey(key)) _apps.Remove(key);
+                Safe(blotter.Dispose);
+            };
+
+            _apps[key] = (doc, blotter);
+
+            // Visa enligt aktuell window mode (Attached/Detached).
+            ShowInCurrentMode(doc);
+        }
+
+
+
+        #endregion
 
         #endregion
 
@@ -890,7 +945,20 @@ namespace FX.UI.WinForms
             }
         }
 
-        /// <summary>DockContent för placeholders (Blotter, Gamma Hedger, Volatility Management).</summary>
+        /// <summary>
+        /// DockContent för Blotter med stabil persist-sträng.
+        /// Gör att sparad layout öppnar riktiga Blotter-appen vid återladdning.
+        /// </summary>
+        private sealed class BlotterDockContent : DockContent
+        {
+            protected override string GetPersistString()
+            {
+                return "Blotter";
+            }
+        }
+
+
+        /// <summary>DockContent för placeholders (t.ex. Gamma Hedger).</summary>
         private sealed class PlaceholderDockContent : DockContent
         {
             /// <summary>Nyckeln som används som persist-sträng (sätts vid skapande).</summary>

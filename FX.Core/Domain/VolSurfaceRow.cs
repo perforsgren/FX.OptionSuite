@@ -27,6 +27,27 @@ namespace FX.Core.Domain
         /// <summary>ATM mid volatilitet (kan vara beräknad kolumn i DB).</summary>
         public decimal? AtmMid { get; set; }
 
+        /// <summary>
+        /// ATM-spread i absoluta vol-points (t.ex. 0.0020 = 20bp).
+        /// Kan komma från effective (v_atm_effective_latest) eller vara null om saknas.
+        /// </summary>
+        public decimal? AtmSpread { get; set; }
+
+        /// <summary>
+        /// Anger om raden är syntetisk/ankrad (härledd från annat par) enligt effective-källan.
+        /// </summary>
+        public bool IsSynthetic { get; set; }
+
+        /// <summary>
+        /// Om ankrad: vilket par som är ankare (t.ex. "EUR/USD"). Annars null/empty.
+        /// </summary>
+        public string AnchorPairSymbol { get; set; }
+
+        /// <summary>
+        /// Källa för ATM enligt effective (t.ex. "DIRECT", "ANCHORED", "COMPOSITE").
+        /// </summary>
+        public string SourceKind { get; set; }
+
         /// <summary>25D Risk Reversal (mid).</summary>
         public decimal? Rr25Mid { get; set; }
 
@@ -38,5 +59,16 @@ namespace FX.Core.Domain
 
         /// <summary>10D Butterfly (mid).</summary>
         public decimal? Bf10Mid { get; set; }
+
+        /// <summary>
+        /// Offset som appliceras på AnchorMid för att få effektiv ATM Mid i ankrade par.
+        /// </summary>
+        public decimal? AtmOffset { get; set; }
+
+        /// <summary>
+        /// AnchorMid (bas-mid före offset) för ankrade par.
+        /// </summary>
+        public decimal? AnchorMid { get; set; }
+
     }
 }

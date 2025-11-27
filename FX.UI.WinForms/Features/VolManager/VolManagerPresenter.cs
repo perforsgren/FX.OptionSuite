@@ -436,33 +436,12 @@ namespace FX.UI.WinForms.Features.VolManager
         /// Async-wrapper för <see cref="RefreshPinned(IEnumerable{string}, bool)"/>.
         /// Implementeras via Task.Run i detta steg.
         /// </summary>
-        public System.Threading.Tasks.Task<Dictionary<string, (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)>>
+        public Task<Dictionary<string, (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)>>
             RefreshPinnedAsync(IEnumerable<string> pairs, bool force = false)
         {
             return System.Threading.Tasks.Task.Run(() => RefreshPinned(pairs, force));
         }
 
-
-        /// <summary>
-        /// Hämtar senaste snapshot-id för angivet valutapar och laddar samtliga tenor-rader.
-        /// Returnerar både snapshot-id och en sorterad lista av rader för enkel databindning i UI.
-        /// </summary>
-        /// <param name="pairSymbol">Valutapar, t.ex. "EUR/USD" eller "USD/SEK".</param>
-        /// <returns>
-        /// Tuple där Item1 = snapshot-id (kan vara null om saknas) och Item2 = lista med tenor-rader (kan vara tom).
-        /// </returns>
-        public (long? SnapshotId, List<VolSurfaceRow> Rows) LoadLatest(string pairSymbol)
-        {
-            if (string.IsNullOrWhiteSpace(pairSymbol))
-                return (null, new List<VolSurfaceRow>());
-
-            var sid = _repo.GetLatestVolSnapshotId(pairSymbol);
-            if (sid == null)
-                return (null, new List<VolSurfaceRow>());
-
-            var rows = _repo.GetVolExpiries(sid.Value)?.ToList() ?? new List<VolSurfaceRow>();
-            return (sid, rows);
-        }
 
         /// <summary>
         /// Hämtar senaste snapshot-id, dess header och tenor-rader för ett valutapar.
@@ -534,20 +513,20 @@ namespace FX.UI.WinForms.Features.VolManager
         }
 
         /// <summary>
-        /// Hämtar senaste snapshot-id, dess header och tenor-rader för ett valutapar,
-        /// med möjlighet att forcera bypass av cache, samt flagga om resultatet kom från cache.
+        /// Laddar yta för ett par med cache-tag och bygger “effective” i Presentern.
+        /// Icke-ankrat: ATM (Bid/Mid/Ask) och RR/BF från target-snapshot; UI-spread = (ask − bid) i runtime.
+        /// Ankrat: AnchorMid (från anchor-snapshot) + Offset + Spread (från vol_anchor_atm_policy) ⇒ Mid/Bid/Ask. RR/BF = null.
+        /// Inga per-tenor DB-anrop – allt läses i batch per par.
         /// </summary>
-        /// <param name="pairSymbol">Valutapar, t.ex. "EUR/USD".</param>
-        /// <param name="forceReload">True = bypass cache och hämta från DB.</param>
         public (bool FromCache, long? SnapshotId, VolSurfaceSnapshotHeader Header, List<VolSurfaceRow> Rows)
             LoadLatestWithHeaderTagged(string pairSymbol, bool forceReload)
         {
             if (string.IsNullOrWhiteSpace(pairSymbol))
                 return (false, null, null, new List<VolSurfaceRow>());
 
-            var key = pairSymbol.ToUpperInvariant();
+            var key = pairSymbol.Trim().ToUpperInvariant();
 
-            // 1) Cache-träff inom mjuk TTL om vi inte forcerar
+            // 1) Cache inom soft-TTL
             if (!forceReload && _cache.TryGetValue(key, out var cached))
             {
                 var age = DateTime.UtcNow - cached.CacheTimeUtc;
@@ -555,34 +534,166 @@ namespace FX.UI.WinForms.Features.VolManager
                     return (true, cached.Result.SnapshotId, cached.Result.Header, cached.Result.Rows);
             }
 
-            // 2) Hämta från repo (som i din befintliga LoadLatestWithHeader)
-            var sid = _repo.GetLatestVolSnapshotId(key);
-            if (sid == null)
+            // 2) Är paret ankrat? (ankare via vol_anchor_map)
+            string anchorPair;
+            var isAnchored = _repo.TryGetAnchorPair(key, out anchorPair);
+
+            // 3) Target-snapshot + header + expiries (kan saknas för ankrat)
+            long? targetSnapshotId = _repo.GetLatestVolSnapshotId(key);
+            var header = targetSnapshotId != null ? _repo.GetSnapshotHeader(targetSnapshotId.Value) : null;
+            var targetExpiries = targetSnapshotId != null
+                ? (_repo.GetVolExpiries(targetSnapshotId.Value)?.ToList() ?? new List<VolSurfaceRow>())
+                : new List<VolSurfaceRow>();
+
+            List<VolSurfaceRow> rows;
+
+            if (!isAnchored)
             {
-                var emptyTuple = (false, null as long?, null as VolSurfaceSnapshotHeader, new List<VolSurfaceRow>());
-                _cache[key] = new CachedSurface { Pair = key, CacheTimeUtc = DateTime.UtcNow, Result = (emptyTuple.Item2, emptyTuple.Item3, emptyTuple.Item4) };
-                return emptyTuple;
+                // Icke-ankrat: snapshot-driver; RR/BF från snapshot; Spread i UI = (ask−bid)
+                rows = CompleteWithStandardTenors(targetExpiries);
+            }
+            else
+            {
+                // 4) Anchored: anchor-snapshot (för AnchorMid per tenor)
+                long? anchorSnapshotId = !string.IsNullOrWhiteSpace(anchorPair)
+                    ? _repo.GetLatestVolSnapshotId(anchorPair)
+                    : null;
+                var anchorExpiries = anchorSnapshotId != null
+                    ? (_repo.GetVolExpiries(anchorSnapshotId.Value)?.ToList() ?? new List<VolSurfaceRow>())
+                    : new List<VolSurfaceRow>();
+
+                // 5) Anchored policy (Offset + Spread) från vol_anchor_atm_policy
+                var policy = _repo.GetAnchorAtmPolicy(key)?.ToList() ?? new List<AnchorAtmPolicyRow>();
+
+                // 6) Komponera ankrat i minnet
+                rows = BuildAnchoredRowsFromPolicy(policy, anchorExpiries);
             }
 
-            var header = _repo.GetSnapshotHeader(sid.Value);
-            var rows = _repo.GetVolExpiries(sid.Value)?.ToList() ?? new List<VolSurfaceRow>();
+            var fresh = (targetSnapshotId, header, rows);
 
-            var freshCore = (sid as long?, header, rows);
-
-            // 3) Uppdatera cache
+            // 7) Cache
             _cache[key] = new CachedSurface
             {
                 Pair = key,
                 CacheTimeUtc = DateTime.UtcNow,
-                Result = freshCore
+                Result = fresh
             };
 
-            return (false, freshCore.Item1, freshCore.Item2, freshCore.Item3);
+            return (false, fresh.Item1, fresh.Item2, fresh.Item3);
         }
+
+
+
+
+
+
 
         #endregion
 
         #region Privata hjälpare
+
+        /// <summary>
+        /// Kombinerar RR/BF från vol_surface_expiry och ATM från v_atm_effective_latest per tenor.
+        /// </summary>
+        private List<VolSurfaceRow> MergeExpiriesAndEffective(string pairSymbol, long? snapshotId)
+        {
+            var result = new List<VolSurfaceRow>();
+            if (string.IsNullOrWhiteSpace(pairSymbol)) return result;
+
+            var expDict = (snapshotId.HasValue ? _repo.GetVolExpiries(snapshotId.Value) : null)?
+                          .ToDictionary(r => (r?.TenorCode ?? string.Empty).Trim(), r => r,
+                                        StringComparer.OrdinalIgnoreCase)
+                          ?? new Dictionary<string, VolSurfaceRow>(StringComparer.OrdinalIgnoreCase);
+
+            var effDict = _repo.GetEffectiveAtmRows(pairSymbol)?
+                          .ToDictionary(e => (e?.TenorCode ?? string.Empty).Trim(), e => e,
+                                        StringComparer.OrdinalIgnoreCase)
+                          ?? new Dictionary<string, EffectiveAtmRow>(StringComparer.OrdinalIgnoreCase);
+
+            var keys = new HashSet<string>(expDict.Keys, StringComparer.OrdinalIgnoreCase);
+            foreach (var k in effDict.Keys) keys.Add(k);
+
+            foreach (var t in keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase))
+            {
+                expDict.TryGetValue(t, out var exp);
+                effDict.TryGetValue(t, out var eff);
+
+                var row = exp != null ? CloneVolSurfaceRow(exp) : new VolSurfaceRow { TenorCode = t };
+
+                // TenorDaysNominal från expiries annars från effective
+                if (!HasTenorDays(row) && eff?.DaysForSort != null) SetTenorDays(row, eff.DaysForSort.Value);
+
+                if (eff != null)
+                {
+                    // ATM från effective
+                    SetAtm(row, eff.AtmBidEffective, eff.AtmMidEffective, eff.AtmAskEffective);
+                    row.AtmSpread = eff.SpreadTotal;
+                    row.AnchorMid = eff.BaseAtmMid;
+                    row.AtmOffset = eff.AtmOffset;
+                    row.SourceKind = eff.SourceKind ?? string.Empty;
+                    row.AnchorPairSymbol = eff.AnchorPairSymbol ?? string.Empty;
+                    row.IsSynthetic = !string.Equals(row.SourceKind, "DIRECT", StringComparison.OrdinalIgnoreCase);
+                }
+
+                result.Add(row);
+            }
+
+            return result;
+        }
+
+
+        /// <summary>Ytlig kopia av fält vi använder.</summary>
+        private static VolSurfaceRow CloneVolSurfaceRow(VolSurfaceRow s)
+        {
+            if (s == null) return null;
+            return new VolSurfaceRow
+            {
+                TenorCode = s.TenorCode,
+                // TenorDaysNominal (om propertyn finns i din modell)
+                // ExpiryDateUtc (om den finns)
+                AtmMid = s.AtmMid,
+                // AtmBid/AtmAsk kopieras om egenskaperna finns:
+                // (reflektion skyddar om modellen varierar mellan delprojekt)
+                // RR/BF
+                Rr25Mid = s.Rr25Mid,
+                Bf25Mid = s.Bf25Mid,
+                Rr10Mid = s.Rr10Mid,
+                Bf10Mid = s.Bf10Mid,
+                // Nya fält
+                AtmSpread = s.AtmSpread,
+                IsSynthetic = s.IsSynthetic,
+                AnchorPairSymbol = s.AnchorPairSymbol,
+                SourceKind = s.SourceKind
+            };
+        }
+
+        /// <summary>Sätter ATM Bid/Mid/Ask om värden finns (kompatibel med modellvarianter).</summary>
+        private static void SetAtm(VolSurfaceRow row, decimal? bid, decimal? mid, decimal? ask)
+        {
+            if (row == null) return;
+            if (mid.HasValue) row.AtmMid = mid.Value;
+
+            var pBid = typeof(VolSurfaceRow).GetProperty("AtmBid");
+            var pAsk = typeof(VolSurfaceRow).GetProperty("AtmAsk");
+            if (pBid != null && bid.HasValue) pBid.SetValue(row, bid.Value, null);
+            if (pAsk != null && ask.HasValue) pAsk.SetValue(row, ask.Value, null);
+        }
+
+        /// <summary>True om TenorDaysNominal finns och är satt.</summary>
+        private static bool HasTenorDays(VolSurfaceRow row)
+        {
+            var pi = typeof(VolSurfaceRow).GetProperty("TenorDaysNominal");
+            if (pi == null) return false;
+            return pi.GetValue(row, null) != null;
+        }
+
+        /// <summary>Sätter TenorDaysNominal om propertyn finns.</summary>
+        private static void SetTenorDays(VolSurfaceRow row, int days)
+        {
+            var pi = typeof(VolSurfaceRow).GetProperty("TenorDaysNominal");
+            if (pi != null) pi.SetValue(row, days, null);
+        }
+
 
         /// <summary>
         /// Skapa ny CTS för paret och avbryt/avyttra tidigare CTS om den fanns.
@@ -624,6 +735,103 @@ namespace FX.UI.WinForms.Features.VolManager
         #endregion
 
         #region Privata hjälpare – transform/merge
+
+        /// <summary>
+        /// Bygger rader för ett ankrat par genom att kombinera:
+        ///  • policyRows (offset + spread per tenor) från fxvol.vol_anchor_atm_policy
+        ///  • anchorExpiries (ankarets snapshot) för att få AnchorMid och Days.
+        /// Resultat:
+        ///  Mid = AnchorMid + Offset
+        ///  Bid/Ask = Mid ± Spread/2
+        ///  RR/BF = null (tills “ankrat eget smile” implementeras)
+        /// Sätter dessutom modellfält som vyn kräver: TenorDaysNominal, AnchorMid, AtmOffset, AtmSpread.
+        /// Returnerar rader i standardtenorordning; saknade tenorer skapas som tomma rader.
+        /// </summary>
+        private List<VolSurfaceRow> BuildAnchoredRowsFromPolicy(
+            IList<AnchorAtmPolicyRow> policyRows,
+            IList<VolSurfaceRow> anchorExpiries)
+        {
+            // AnchorMid + Days per tenor från ankarets snapshot
+            var anchorByTenor = new Dictionary<string, (decimal mid, int? days)>(StringComparer.OrdinalIgnoreCase);
+            if (anchorExpiries != null)
+            {
+                foreach (var e in anchorExpiries)
+                {
+                    if (e == null) continue;
+                    var t = (e.TenorCode ?? string.Empty).Trim();
+                    if (t.Length == 0) continue;
+                    if (e.AtmMid.HasValue && !anchorByTenor.ContainsKey(t))
+                        anchorByTenor[t] = (e.AtmMid.Value, e.TenorDaysNominal);
+                }
+            }
+
+            // Bästa policy per tenor (senaste effective_from_utc vinner)
+            var bestPolicy = new Dictionary<string, AnchorAtmPolicyRow>(StringComparer.OrdinalIgnoreCase);
+            if (policyRows != null)
+            {
+                foreach (var p in policyRows.OrderByDescending(x => x?.EffectiveFromUtc ?? DateTime.MinValue))
+                {
+                    if (p == null) continue;
+                    var t = (p.TenorCode ?? string.Empty).Trim();
+                    if (t.Length == 0) continue;
+                    if (!bestPolicy.ContainsKey(t)) bestPolicy[t] = p;
+                }
+            }
+
+            // Bygg utdata i standardordning
+            var outRows = new List<VolSurfaceRow>(_stdTenors.Length);
+            foreach (var t in _stdTenors)
+            {
+                bestPolicy.TryGetValue(t, out var pol);
+                anchorByTenor.TryGetValue(t, out var anc);
+
+                if (pol != null && anc.mid != 0m) // vi har både policy och anchor-mid
+                {
+                    var offset = pol.OffsetMid ?? 0m;
+                    var spread = pol.SpreadTotal ?? 0m;
+                    var mid = anc.mid + offset;
+                    var half = spread / 2m;
+
+                    outRows.Add(new VolSurfaceRow
+                    {
+                        TenorCode = t,
+                        TenorDaysNominal = anc.days,  // <-- visar "Days (nom.)" i UI
+                        AnchorMid = anc.mid,   // <-- baseline till vyn (tooltip/omräkning)
+                        AtmOffset = pol.OffsetMid,
+                        AtmSpread = pol.SpreadTotal,
+
+                        AtmMid = mid,
+                        AtmBid = mid - half,
+                        AtmAsk = mid + half,
+
+                        // RR/BF null tills vidare
+                        Rr25Mid = null,
+                        Rr10Mid = null,
+                        Bf25Mid = null,
+                        Bf10Mid = null
+                    });
+                }
+                else
+                {
+                    // Saknar policy eller anchor-mid → tom rad (så att UI fortfarande kan editeras vid behov)
+                    outRows.Add(new VolSurfaceRow
+                    {
+                        TenorCode = t,
+                        TenorDaysNominal = anc.days,     // visa days om vi har dem
+                        AnchorMid = anc.mid,      // baseline om bara ankare är känt
+                        AtmOffset = pol?.OffsetMid,
+                        AtmSpread = pol?.SpreadTotal
+                        // övriga fält null
+                    });
+                }
+            }
+
+            return outRows;
+        }
+
+
+
+
 
         /// <summary>
         /// Returnerar true om paret ska betraktas som ankrat (ATM justeras som Offset).

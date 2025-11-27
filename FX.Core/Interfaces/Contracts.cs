@@ -91,27 +91,35 @@ namespace FX.Core.Interfaces
     public interface IVolRepository
     {
         /// <summary>
-        /// Hämtar snapshot-id för den senaste volytan för ett valutapar (MAX(ts_utc)).
-        /// Returnerar null om inget snapshot finns.
+        /// Hämtar snapshot-id för senaste volyta för valt par.
         /// </summary>
-        /// <param name="pairSymbol">Par som "EUR/USD", "USD/SEK" etc.</param>
-        /// <returns>Senaste snapshot-id eller null om saknas.</returns>
         long? GetLatestVolSnapshotId(string pairSymbol);
 
         /// <summary>
-        /// Hämtar samtliga tenor-rader (ATM och RR/BF på mid) för ett givet snapshot.
-        /// Resultatet är sorterat på tenor_days_nominal (om finns) och därefter tenor-kod.
+        /// Hämtar tenor-rader (ATM+RR/BF mid) för snapshot-id från vol_surface_expiry.
         /// </summary>
-        /// <param name="snapshotId">Id från vol_surface_snapshot.</param>
-        /// <returns>Enumerable av VolSurfaceRow.</returns>
-        IEnumerable<VolSurfaceRow> GetVolExpiries(long snapshotId);
+        IEnumerable<FX.Core.Domain.VolSurfaceRow> GetVolExpiries(long snapshotId);
 
         /// <summary>
         /// Hämtar header (konventioner + tidsstämpel + källa) för ett snapshot-id.
         /// </summary>
-        /// <param name="snapshotId">Id från vol_surface_snapshot.</param>
-        /// <returns>Header-objekt, eller null om snapshot saknas.</returns>
-        VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId);
+        FX.Core.Domain.VolSurfaceSnapshotHeader GetSnapshotHeader(long snapshotId);
+
+        /// <summary>
+        /// Hämtar effektiva ATM-rader per tenor för ett par från v_atm_effective_latest.
+        /// </summary>
+        IEnumerable<FX.Core.Domain.EffectiveAtmRow> GetEffectiveAtmRows(string pairSymbol);
+
+        /// <summary>
+        /// Returnerar true och sätter anchorPairSymbol om target-paret är ankrat enligt vol_anchor_map.
+        /// </summary>
+        bool TryGetAnchorPair(string targetPairSymbol, out string anchorPairSymbol);
+
+        /// <summary>
+        /// Läser current policy för ankrat par från fxvol.vol_anchor_atm_policy (alla tenorer).
+        /// </summary>
+        IEnumerable<AnchorAtmPolicyRow> GetAnchorAtmPolicy(string targetPairSymbol);
+
     }
 
     /// <summary>
@@ -186,5 +194,24 @@ namespace FX.Core.Interfaces
 
 
     }
+
+    /// <summary>
+    /// Policy för ankrat par: per tenor lagras offset (mot anchor-mid) och ATM-spread.
+    /// </summary>
+    public sealed class AnchorAtmPolicyRow
+    {
+        /// <summary>Tenor-kod (ex. "1M").</summary>
+        public string TenorCode { get; set; }
+
+        /// <summary>Offset i volpunkter: Mid = AnchorMid + Offset.</summary>
+        public decimal? OffsetMid { get; set; }
+
+        /// <summary>ATM total spread i volpunkter.</summary>
+        public decimal? SpreadTotal { get; set; }
+
+        /// <summary>Gällande från (UTC) för denna policy-rad.</summary>
+        public DateTime EffectiveFromUtc { get; set; }
+    }
+
 
 }

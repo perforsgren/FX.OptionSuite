@@ -45,6 +45,7 @@
     <Compile Include="Conventions\MarketConventions.cs" />
     <Compile Include="Domain\BookedTrade.cs" />
     <Compile Include="Domain\CurrencyPair.cs" />
+    <Compile Include="Domain\EffectiveAtmRow.cs" />
     <Compile Include="Domain\Enums.cs" />
     <Compile Include="Domain\Expiry.cs" />
     <Compile Include="Domain\MarketData\BackSolveService.cs" />

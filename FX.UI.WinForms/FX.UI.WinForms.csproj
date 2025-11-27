@@ -86,7 +86,9 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="App\BlotterAppInstance.cs" />
     <Compile Include="App\VolAppInstance.cs" />
+    <Compile Include="Features\Blotter\BlotterColumnMetadata.cs" />
     <Compile Include="Features\VolManager\VolManagerPresenter.cs" />
     <Compile Include="Features\VolManager\VolManagerView.cs">
       <SubType>UserControl</SubType>
@@ -108,6 +110,9 @@
     <Compile Include="Features\Pricer\LegPricingDisplay.cs" />
     <Compile Include="App\PricerAppInstance.cs" />
     <Compile Include="Features\Pricer\PricerSessionControl.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Include="Shell\Workspace\BlotterWorkspaceControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
     <Compile Include="Shell\Workspace\PricerWorkspaceControl.cs">
@@ -168,6 +173,10 @@
     <ProjectReference Include="..\FX.Services\FX.Services.csproj">
       <Project>{4b66c7dc-f0f0-4fd9-9e1c-cc91d916a346}</Project>
       <Name>FX.Services</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\FxTradeHub.Contracts\FxTradeHub.Contracts.csproj">
+      <Project>{a9e2039a-ac40-40fc-9527-da8eea8fe587}</Project>
+      <Name>FxTradeHub.Contracts</Name>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>

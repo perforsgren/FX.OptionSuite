@@ -7,6 +7,7 @@
 using System;
 using System.Windows.Forms;
 using FX.Core.Interfaces;
+using FxTradeHub.Contracts.Dtos;
 
 namespace FX.UI.WinForms
 {
