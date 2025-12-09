@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FxTradeHub.Contracts\FxTradeHub.Contracts.csproj" />
+    <ProjectReference Include="..\FxTradeHub.Domain\FxTradeHub.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Lookup\" />
+  </ItemGroup>
+
+</Project>

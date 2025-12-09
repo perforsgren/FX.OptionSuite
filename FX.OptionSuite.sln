@@ -21,11 +21,15 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "FxTradeHub.Domain", "FxTradeHub.Domain\FxTradeHub.Domain.csproj", "{B6E8CB2B-B06A-4F37-99B7-F01CBE14EA83}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FxTradeHub.Contracts", "FxTradeHub.Contracts\FxTradeHub.Contracts.csproj", "{A9E2039A-AC40-40FC-9527-DA8EEA8FE587}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "FxTradeHub.Contracts", "FxTradeHub.Contracts\FxTradeHub.Contracts.csproj", "{A9E2039A-AC40-40FC-9527-DA8EEA8FE587}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FxTradeHub.Data.MySql", "FxTradeHub.Data.MySql\FxTradeHub.Data.MySql\FxTradeHub.Data.MySql.csproj", "{2C1B04CD-6A70-4146-9F47-0F6EEEA8DBDA}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "FxTradeHub.Data.MySql", "FxTradeHub.Data.MySql\FxTradeHub.Data.MySql\FxTradeHub.Data.MySql.csproj", "{2C1B04CD-6A70-4146-9F47-0F6EEEA8DBDA}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FxTradeHub.Stp.ConsoleTest", "FxTradeHub.Stp.ConsoleTest\FxTradeHub.Stp.ConsoleTest.csproj", "{E003A34D-C457-44A8-AFAA-8EA5BBFB2B33}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "FxTradeHub.Services", "FxTradeHub.Services\FxTradeHub.Services.csproj", "{3AC0D9CF-E4C9-4A70-B64A-FC68BD780009}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FxTradeHub.VolbrokerAeTestApp", "FxTradeHub.VolbrokerAeTestApp\FxTradeHub.VolbrokerAeTestApp.csproj", "{4D6C78D0-514C-4A2C-9A78-F2CD12094245}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -69,6 +73,14 @@ Global
 		{E003A34D-C457-44A8-AFAA-8EA5BBFB2B33}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E003A34D-C457-44A8-AFAA-8EA5BBFB2B33}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E003A34D-C457-44A8-AFAA-8EA5BBFB2B33}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3AC0D9CF-E4C9-4A70-B64A-FC68BD780009}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3AC0D9CF-E4C9-4A70-B64A-FC68BD780009}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3AC0D9CF-E4C9-4A70-B64A-FC68BD780009}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3AC0D9CF-E4C9-4A70-B64A-FC68BD780009}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4D6C78D0-514C-4A2C-9A78-F2CD12094245}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4D6C78D0-514C-4A2C-9A78-F2CD12094245}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4D6C78D0-514C-4A2C-9A78-F2CD12094245}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4D6C78D0-514C-4A2C-9A78-F2CD12094245}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -100,6 +100,10 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\FxTradeHub.Contracts\FxTradeHub.Contracts.csproj">
+      <Project>{a9e2039a-ac40-40fc-9527-da8eea8fe587}</Project>
+      <Name>FxTradeHub.Contracts</Name>
+    </ProjectReference>
     <ProjectReference Include="..\FxTradeHub.Data.MySql\FxTradeHub.Data.MySql\FxTradeHub.Data.MySql.csproj">
       <Project>{2c1b04cd-6a70-4146-9f47-0f6eeea8dbda}</Project>
       <Name>FxTradeHub.Data.MySql</Name>
@@ -107,6 +111,10 @@
     <ProjectReference Include="..\FxTradeHub.Domain\FxTradeHub.Domain.csproj">
       <Project>{b6e8cb2b-b06a-4f37-99b7-f01cbe14ea83}</Project>
       <Name>FxTradeHub.Domain</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\FxTradeHub.Services\FxTradeHub.Services.csproj">
+      <Project>{3ac0d9cf-e4c9-4a70-b64a-fc68bd780009}</Project>
+      <Name>FxTradeHub.Services</Name>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />

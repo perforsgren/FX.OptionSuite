@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using FxTradeHub.Domain.Entities;
 
@@ -5,44 +6,60 @@ namespace FxTradeHub.Domain.Interfaces
 {
     /// <summary>
     /// Repository-interface för STP-hubben.
-    /// Hanterar inskrivning av meddelanden, trades, systemlänkar och workflow-event,
-    /// samt läsning av sammanfattande trade/system-data för blottrar.
+    /// Hanterar inskrivning av inkommande meddelanden, trades,
+    /// systemlänkar och workflow-events samt läsning av sammanfattningar
+    /// för blottern.
     /// </summary>
     public interface IStpRepository
     {
         /// <summary>
-        /// Infogar ett inkommande meddelande i MessageIn-tabellen.
+        /// Infogar en ny rad i tabellen trade_stp.MessageIn
+        /// och returnerar genererat MessageInId.
         /// </summary>
-        /// <param name="message">Meddelande att spara.</param>
-        /// <returns>Genererat MessageInId.</returns>
         long InsertMessageIn(MessageIn message);
 
         /// <summary>
-        /// Infogar en ny trade i Trade-tabellen.
+        /// Infogar en ny rad i tabellen trade_stp.Trade
+        /// och returnerar genererat StpTradeId.
         /// </summary>
-        /// <param name="trade">Trade-objekt att spara.</param>
-        /// <returns>Genererat StpTradeId.</returns>
         long InsertTrade(Trade trade);
 
         /// <summary>
-        /// Infogar en ny systemlänk i TradeSystemLink-tabellen.
+        /// Infogar en ny rad i tabellen trade_stp.TradeSystemLink
+        /// och returnerar genererat SystemLinkId.
         /// </summary>
-        /// <param name="link">Systemlänk att spara.</param>
-        /// <returns>Genererat TradeSystemLinkId.</returns>
         long InsertTradeSystemLink(TradeSystemLink link);
 
         /// <summary>
-        /// Infogar ett nytt workflow-event i TradeWorkflowEvent-tabellen.
+        /// Infogar en ny rad i tabellen trade_stp.TradeWorkflowEvent
+        /// och returnerar genererat WorkflowEventId.
         /// </summary>
-        /// <param name="evt">Workflow-event att spara.</param>
-        /// <returns>Genererat TradeWorkflowEventId.</returns>
-        long InsertWorkflowEvent(TradeWorkflowEvent evt);
+        long InsertTradeWorkflowEvent(TradeWorkflowEvent evt);
 
         /// <summary>
-        /// Hämtar alla trades med tillhörande systemlänkar i en sammanfattad vy,
-        /// avsedd som grund för blottrar och read-tjänster.
+        /// Hämtar en lista av TradeSystemSummary-rader baserat på
+        /// enkla filter (datumintervall, produkt, källa, motpart, trader).
+        /// Används av blotter-lagret (D1) för att bygga BlotterTradeRow.
         /// </summary>
-        /// <returns>Lista med TradeSystemSummary-rader.</returns>
-        IList<TradeSystemSummary> GetAllTradeSystemSummaries();
+        /// <param name="fromTradeDate">Nedre gräns för TradeDate (inklusive). Null = ingen nedre gräns.</param>
+        /// <param name="toTradeDate">Övre gräns för TradeDate (inklusive). Null = ingen övre gräns.</param>
+        /// <param name="productType">Produktkod (SPOT/FWD/SWAP/NDF/OPTION_VANILLA/OPTION_NDO) eller null/tomt = alla.</param>
+        /// <param name="sourceType">Källa (MAIL/FIX/API/FILE) eller null/tomt = alla.</param>
+        /// <param name="counterpartyCode">Normaliserad motpartskod, eller null/tomt = alla.</param>
+        /// <param name="traderId">TraderId, eller null/tomt = alla.</param>
+        /// <param name="maxRows">Max antal rader att returnera. Null = ingen limit.</param>
+        /// <returns>Lista med TradeSystemSummary, en rad per (trade, system)-kombination.</returns>
+        IList<TradeSystemSummary> GetTradeSystemSummaries(
+            DateTime? fromTradeDate,
+            DateTime? toTradeDate,
+            string productType,
+            string sourceType,
+            string counterpartyCode,
+            string traderId,
+            int? maxRows);
     }
+
+
+ 
+
 }
