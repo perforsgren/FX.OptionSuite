@@ -261,7 +261,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "BuySell",
                     VisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
                     DefaultVisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
-                    DisplayOrder = 30,
+                    DisplayOrder = 40,
                     Alignment = DataGridViewContentAlignment.MiddleCenter,
                     Format = string.Empty,
                     Tags = BlotterColumnTag.None,
@@ -280,7 +280,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "CcyPair",
                     VisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
                     DefaultVisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
-                    DisplayOrder = 50,
+                    DisplayOrder = 30,
                     Alignment = DataGridViewContentAlignment.MiddleCenter,
                     Format = string.Empty,
                     Tags = BlotterColumnTag.None,
@@ -298,7 +298,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "Notional",
                     VisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
                     DefaultVisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
-                    DisplayOrder = 100,
+                    DisplayOrder = 60,
                     Alignment = DataGridViewContentAlignment.MiddleRight,
                     Format = "N0",
                     Tags = BlotterColumnTag.None,
@@ -314,7 +314,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "NotionalCcy",
                     VisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
                     DefaultVisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
-                    DisplayOrder = 110,
+                    DisplayOrder = 70,
                     Alignment = DataGridViewContentAlignment.MiddleCenter,
                     Format = string.Empty,
                     Tags = BlotterColumnTag.None,
@@ -352,7 +352,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "Strike",
                     VisibleIn = BlotterGridVisibility.Options,
                     DefaultVisibleIn = BlotterGridVisibility.Options,
-                    DisplayOrder = 60,
+                    DisplayOrder = 55,
                     Alignment = DataGridViewContentAlignment.MiddleRight,
                     Format = "N4",
                     Tags = BlotterColumnTag.None,
@@ -456,7 +456,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     HeaderToolTip = "Premium settlement date"
                 },
 
-                // 15. Portfolio MX3
+                // 15. Portfolio MX3 & Calypso
                 new BlotterColumnDefinition
                 {
                     Key = "PortfolioMx3",
@@ -473,7 +473,24 @@ namespace FX.UI.WinForms.Features.Blotter
                     EditorType = BlotterEditorType.Combo,
                     IsEditable = true,
                     LookupKey = "PortfolioMx3",
+                },
 
+                new BlotterColumnDefinition
+                {
+                    Key = "CalypsoPortfolio",
+                    HeaderText = "Book Calypso",
+                    BindingPath = "CalypsoPortfolio",
+                    VisibleIn = BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
+                    DefaultVisibleIn = BlotterGridVisibility.Hedge,
+                    DisplayOrder = 155,
+                    Alignment = DataGridViewContentAlignment.MiddleLeft,
+                    Format = string.Empty,
+                    Tags = BlotterColumnTag.None,
+                    ProductTypes = new[] { "SPOT", "FWD", "NDF", "SWAP" },
+                    HeaderToolTip = "Calypso portfolio / book",
+                    EditorType = BlotterEditorType.Combo,
+                    IsEditable = true,
+                    LookupKey = "CalypsoPortfolio",
                 },
 
                 // 17. Status MX3
@@ -500,7 +517,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "HedgeType",
                     VisibleIn = BlotterGridVisibility.Hedge,
                     DefaultVisibleIn = BlotterGridVisibility.Hedge,
-                    DisplayOrder = 230,
+                    DisplayOrder = 86,
                     Alignment = DataGridViewContentAlignment.MiddleLeft,
                     Format = string.Empty,
                     Tags = BlotterColumnTag.None,
@@ -514,7 +531,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     BindingPath = "HedgeRate",
                     VisibleIn = BlotterGridVisibility.Hedge,
                     DefaultVisibleIn = BlotterGridVisibility.Hedge,
-                    DisplayOrder = 240,
+                    DisplayOrder = 85,
                     Alignment = DataGridViewContentAlignment.MiddleRight,
                     Format = "N6",
                     Tags = BlotterColumnTag.None,
@@ -529,7 +546,7 @@ namespace FX.UI.WinForms.Features.Blotter
                     HeaderText = "Execution Time",
                     BindingPath = "ExecutionTime",
                     VisibleIn = BlotterGridVisibility.Options | BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
-                    DefaultVisibleIn = BlotterGridVisibility.Hedge | BlotterGridVisibility.All,
+                    DefaultVisibleIn = BlotterGridVisibility.All,
                     DisplayOrder = 250,
                     Alignment = DataGridViewContentAlignment.MiddleCenter,
                     Format = "yyyy-MM-dd HH:mm:ss",

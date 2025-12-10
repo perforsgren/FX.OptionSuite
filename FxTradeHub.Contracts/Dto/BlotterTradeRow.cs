@@ -34,6 +34,12 @@ namespace FxTradeHub.Contracts.Dtos
         public string TradeId { get; set; }
 
         /// <summary>
+        /// Koppling tillbaka till inkommande meddelande (Trade.MessageInId).
+        /// NULL om traden inte är kopplad mot någon MessageIn-rad.
+        /// </summary>
+        public long? MessageInId { get; set; }
+
+        /// <summary>
         /// SPOT, FWD, SWAP, NDF, OPTION_VANILLA, OPTION_NDO.
         /// (1:1 mot DB-värdena i Trade.ProductType)
         /// </summary>
@@ -119,10 +125,14 @@ namespace FxTradeHub.Contracts.Dtos
         public DateTime? PremiumDate { get; set; }
 
         /// <summary>
-        /// Primär MX3-portfölj (kortkod).
+        /// Primär MX3-portfölj (kortkod) – Trade.PortfolioMx3.
         /// </summary>
         public string PortfolioMx3 { get; set; }
 
+        /// <summary>
+        /// Calypso-bok som traden ska bokas på i Calypso (Trade.CalypsoBook).
+        /// Namnet är anpassat för UI men mappar 1:1 mot kolumnen CalypsoBook.
+        /// </summary>
         public string CalypsoPortfolio { get; set; }
 
 

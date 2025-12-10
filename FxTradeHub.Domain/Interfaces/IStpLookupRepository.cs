@@ -49,5 +49,26 @@ namespace FxTradeHub.Domain.Interfaces
         /// </param>
         /// <returns>PortfolioCode eller null.</returns>
         string GetPortfolioCode(string systemCode, string currencyPair, string productType);
+
+        /// <summary>
+        /// Försöker mappa ett externt motpartsnamn/kod till ett internt CounterpartyCode
+        /// via tabellen trade_stp.counterpartynamepattern.
+        /// Returnerar null om ingen aktiv mappning hittas.
+        /// </summary>
+        /// <param name="sourceType">Källa, t.ex. "FIX".</param>
+        /// <param name="sourceVenueCode">Venue, t.ex. "VOLBROKER".</param>
+        /// <param name="externalName">Externt motparts-id/namn, t.ex. "DB".</param>
+        /// <returns>Internt CounterpartyCode eller null.</returns>
+        string ResolveCounterpartyCode(string sourceType, string sourceVenueCode, string externalName);
+
+        /// <summary>
+        /// Hämtar trader-routinginformation för en given venue-traderkod.
+        /// Bygger på tabellen trade_stp.stp_venue_trader_mapping och userprofile.
+        /// Returnerar null om ingen aktiv mappning hittas eller om användaren saknas.
+        /// </summary>
+        /// <param name="sourceVenueCode">Venue/källa, t.ex. "VOLBROKER".</param>
+        /// <param name="venueTraderCode">Traderkod från AE, t.ex. "FORSPE".</param>
+        /// <returns>TraderRoutingInfo eller null.</returns>
+        TraderRoutingInfo GetTraderRoutingInfo(string sourceVenueCode, string venueTraderCode);
     }
 }

@@ -89,12 +89,16 @@
     <Compile Include="App\BlotterAppInstance.cs" />
     <Compile Include="App\VolAppInstance.cs" />
     <Compile Include="Features\Blotter\BlotterColumnMetadata.cs" />
+    <Compile Include="Features\Blotter\BlotterPresenter.cs" />
     <Compile Include="Features\VolManager\VolManagerPresenter.cs" />
     <Compile Include="Features\VolManager\VolManagerView.cs">
       <SubType>UserControl</SubType>
     </Compile>
     <Compile Include="Features\VolManager\VolSessionControl.cs">
       <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Include="Shell\Controls\CustomTabControl.cs">
+      <SubType>Component</SubType>
     </Compile>
     <Compile Include="Shell\Form1.cs">
       <SubType>Form</SubType>
@@ -112,9 +116,6 @@
     <Compile Include="Features\Pricer\PricerSessionControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
-    <Compile Include="Shell\Workspace\BlotterWorkspaceControl.cs">
-      <SubType>UserControl</SubType>
-    </Compile>
     <Compile Include="Shell\Workspace\PricerWorkspaceControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
@@ -127,6 +128,12 @@
     <Compile Include="Shell\Docking\CustomFloatWindowFactory.cs" />
     <Compile Include="Features\Blotter\BlotterView.cs">
       <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Include="Shell\Workspace\BlotterWorkspaceControl.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Include="Shell\Workspace\BlotterWorkspaceControl.Designer.cs">
+      <DependentUpon>BlotterWorkspaceControl.cs</DependentUpon>
     </Compile>
     <Compile Include="Shell\Workspace\VolWorkspaceControl.cs">
       <SubType>UserControl</SubType>
@@ -143,6 +150,9 @@
       <AutoGen>True</AutoGen>
       <DependentUpon>Resources.resx</DependentUpon>
     </Compile>
+    <EmbeddedResource Include="Shell\Workspace\BlotterWorkspaceControl.resx">
+      <DependentUpon>BlotterWorkspaceControl.cs</DependentUpon>
+    </EmbeddedResource>
     <None Include="packages.config" />
     <None Include="Properties\Settings.settings">
       <Generator>SettingsSingleFileGenerator</Generator>
@@ -177,6 +187,10 @@
     <ProjectReference Include="..\FxTradeHub.Contracts\FxTradeHub.Contracts.csproj">
       <Project>{a9e2039a-ac40-40fc-9527-da8eea8fe587}</Project>
       <Name>FxTradeHub.Contracts</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\FxTradeHub.Services\FxTradeHub.Services.csproj">
+      <Project>{3ac0d9cf-e4c9-4a70-b64a-fc68bd780009}</Project>
+      <Name>FxTradeHub.Services</Name>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>

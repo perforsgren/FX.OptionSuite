@@ -222,6 +222,19 @@ namespace FxTradeHub.Domain.Entities
         /// </summary>
         public string PortfolioMx3 { get; set; }
 
+        /// <summary>
+        /// Calypso-bok som traden ska bokas på i Calypso.
+        /// Motsvarar kolumnen trade_stp.trade.CalypsoBook.
+        /// Sätts typiskt via mapping-tabellen stp_calypso_book_user baserat på TraderId.
+        /// </summary>
+        public string CalypsoBook { get; set; }
+
+
+        /// <summary>
+        /// Skapar en ny trade med defaultvärden för strängfält.
+        /// Numeriska fält lämnas på sina standardvärden (0 eller null) och
+        /// datumfält sätts inte här utan fylls vid parsning/normalisering.
+        /// </summary>
         public Trade()
         {
             TradeId = string.Empty;
@@ -245,6 +258,7 @@ namespace FxTradeHub.Domain.Entities
             Cut = string.Empty;
             PremiumCurrency = string.Empty;
             PortfolioMx3 = string.Empty;
+            CalypsoBook = string.Empty;
         }
     }
 }

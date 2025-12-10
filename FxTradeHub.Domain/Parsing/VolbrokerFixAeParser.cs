@@ -119,13 +119,52 @@ namespace FxTradeHub.Domain.Parsing
             public string Tvtic { get; set; }                     // 688/689 ("USI")
         }
 
-
-
         private sealed class FixTag
         {
             public int Tag { get; set; }
             public string Value { get; set; }
         }
+
+        /// <summary>
+        /// Intern representation av en PARTIES-post (448/452/523) i AE-meddelandet.
+        /// </summary>
+        private sealed class PartyInfo
+        {
+            /// <summary>
+            /// PartyID (tag 448), t.ex. "SWEDSTK", "DB".
+            /// </summary>
+            public string PartyId { get; set; }
+
+            /// <summary>
+            /// PartyRole (tag 452), t.ex. 1 = Kunde, 12 = Executing Firm, 122 = Trader-kod.
+            /// </summary>
+            public int? PartyRole { get; set; }
+
+            /// <summary>
+            /// Trader-kortkod (tag 523) om den finns på denna party-rad.
+            /// </summary>
+            public string TraderShortCode { get; set; }
+        }
+
+        /// <summary>
+        /// Intern representation av en Side (NoSides-grupp) i AE-meddelandet.
+        /// Används för att hitta Swedbanks egen side och dess 54-värde.
+        /// </summary>
+        private sealed class SideInfo
+        {
+            /// <summary>
+            /// Side (tag 54) på denna side, t.ex. "1" (Buy) eller "2" (Sell).
+            /// </summary>
+            public string Side { get; set; }
+
+            /// <summary>
+            /// Anger om denna side representerar Swedbanks sida
+            /// (dvs. innehåller party 448=SWEDSTK med 452=1).
+            /// </summary>
+            public bool IsOwnSide { get; set; }
+        }
+
+
 
         private readonly IStpLookupRepository _lookupRepository;
 
@@ -156,10 +195,12 @@ namespace FxTradeHub.Domain.Parsing
 
         /// <summary>
         /// Parsar ett Volbroker FIX AE-meddelande från MessageIn och skapar
-        /// en Trade per leg (optioner + eventuella hedge-legs, t.ex. FWD).
+        /// en Trade per leg (vanillaoptioner + eventuella hedge-legs, t.ex. FWD).
+        /// Lägger även TradeWorkflowEvent-varningar när lookup-data saknas
+        /// (trader-routing, cut, motpart, broker, MX3-portfölj, CalypsoBook).
         /// </summary>
         /// <param name="msg">MessageIn-raden som innehåller FIX-data.</param>
-        /// <returns>ParseResult med Success=true eller Failed() vid fel.</returns>
+        /// <returns>ParseResult med Success = true eller Failed() vid fel.</returns>
         public ParseResult Parse(MessageIn msg)
         {
             if (msg == null)
@@ -170,23 +211,19 @@ namespace FxTradeHub.Domain.Parsing
 
             try
             {
-                //
                 // 1. Parsning av hela FIX-meddelandet → lista med FixTag
-                //
                 var tags = ParseFixTags(msg.RawPayload);
                 if (tags == null || tags.Count == 0)
                     return ParseResult.Failed("Inga FIX-taggar hittades i RawPayload.");
 
-                //
-                // 2. Hämta headerfält
-                //
+                // 2. Headerfält
                 string currencyPair = GetTagValue(tags, 55) ?? string.Empty;
                 if (!string.IsNullOrWhiteSpace(currencyPair))
                     currencyPair = currencyPair.Replace("/", string.Empty).Trim().ToUpperInvariant();
 
                 string mic = GetTagValue(tags, 30) ?? string.Empty;
 
-                // Externt trade id: välj 818 → 571 → 17
+                // Externt trade-id: välj 818 → 571 → 17
                 string externalTradeKey =
                     GetTagValue(tags, 818) ??
                     GetTagValue(tags, 571) ??
@@ -203,56 +240,81 @@ namespace FxTradeHub.Domain.Parsing
                 if (!TryParseFixTimestamp(GetTagValue(tags, 60), out execTimeUtc))
                     execTimeUtc = msg.SourceTimestamp ?? msg.ReceivedUtc;
 
-                // Header-nivå spotkurs och forward-punkter (194 / 195) – används för FWD-legs
+                // Header spotkurs och forwardpunkter (194 / 195)
                 decimal? lastSpotRate = null;
                 if (TryParseDecimal(GetTagValue(tags, 194), out var tmpSpot))
-                {
                     lastSpotRate = tmpSpot;
-                }
 
                 decimal? lastForwardPoints = null;
                 if (TryParseDecimal(GetTagValue(tags, 195), out var tmpFwdPts))
-                {
                     lastForwardPoints = tmpFwdPts;
-                }
 
-                // UTI-prefix från 1903: ta första 20 tecknen (LEI)
+                // UTI-prefix från 1903
                 string utiPrefix = GetTagValue(tags, 1903) ?? string.Empty;
                 if (!string.IsNullOrWhiteSpace(utiPrefix) && utiPrefix.Length > 20)
-                {
                     utiPrefix = utiPrefix.Substring(0, 20);
-                }
 
-                //
-                // BUY/SELL (54) – fallback om leg.Side saknas
-                //
-                string headerBuySell = string.Empty;
-                var sideRaw = GetTagValue(tags, 54);
-                if (sideRaw == "1") headerBuySell = "BUY";
-                else if (sideRaw == "2") headerBuySell = "SELL";
+                // 2a. BUY/SELL – baseline ur Swedbanks side (NoSides/Party)
+                var sides = ExtractSides(tags);
 
-                //
-                // 3. Extrahera legs → FixAeLeg
-                //
-                var legTagGroups = ExtractLegTagGroups(tags);
-                var legs = new List<FixAeLeg>();
-
-                foreach (var legTags in legTagGroups)
+                string ourSideRaw = null;
+                foreach (var s in sides)
                 {
-                    var leg = ParseLeg(legTags);
-                    if (leg != null)
-                        legs.Add(leg);
+                    if (s.IsOwnSide)
+                    {
+                        ourSideRaw = s.Side;
+                        break;
+                    }
                 }
 
-                if (legs.Count == 0)
-                    return ParseResult.Failed("Inga legs hittades i AE-meddelandet.");
+                // Fallback om vi inte hittar vår side: använd första 54 i meddelandet
+                if (string.IsNullOrWhiteSpace(ourSideRaw))
+                    ourSideRaw = GetTagValue(tags, 54);
 
-                //
-                // 4. Lookups (cut, broker, portfölj)
-                //
+                string baselineBuySell = string.Empty;
+                if (ourSideRaw == "1") baselineBuySell = "BUY";
+                else if (ourSideRaw == "2") baselineBuySell = "SELL";
+
+                // 3. PARTY → motpart + trader
+                var parties = ExtractParties(tags);
+
+                var externalCounterpartyId = ResolveCounterpartyCodeFromParties(parties);
+                string externalCounterpartyIdForEvent = externalCounterpartyId ?? string.Empty;
+
+                string counterpartyCode = string.Empty;
+                bool hasCounterpartyMapping = false;
+
+                if (!string.IsNullOrWhiteSpace(externalCounterpartyId))
+                {
+                    var mappedCp = _lookupRepository.ResolveCounterpartyCode(
+                        msg.SourceType,
+                        msg.SourceVenueCode,
+                        externalCounterpartyId);
+
+                    if (!string.IsNullOrWhiteSpace(mappedCp))
+                    {
+                        counterpartyCode = mappedCp;
+                        hasCounterpartyMapping = true;
+                    }
+                    else
+                    {
+                        // Fallback: använd extern kod men logga varning per trade
+                        counterpartyCode = externalCounterpartyId;
+                    }
+                }
+
+                var traderShortCode = ExtractTraderShortCodeFromParties(parties);
+                TraderRoutingInfo traderRoutingInfo = null;
+                if (!string.IsNullOrWhiteSpace(traderShortCode))
+                {
+                    traderRoutingInfo = _lookupRepository.GetTraderRoutingInfo(
+                        msg.SourceVenueCode,
+                        traderShortCode);
+                }
+
+                // 4. Lookups: cut, broker, portfölj
                 string cutFromLookup = string.Empty;
                 bool hasCutMapping = false;
-
                 if (!string.IsNullOrWhiteSpace(currencyPair))
                 {
                     var cutRule = _lookupRepository.GetExpiryCutByCurrencyPair(currencyPair);
@@ -264,82 +326,117 @@ namespace FxTradeHub.Domain.Parsing
                 }
 
                 string brokerCodeFromLookup = string.Empty;
+                bool hasBrokerMapping = false;
                 if (!string.IsNullOrWhiteSpace(msg.SourceVenueCode))
                 {
-                    // v1: använder SourceVenueCode som extern brokerkod.
-                    var brokerMapping = _lookupRepository.GetBrokerMapping(msg.SourceVenueCode, msg.SourceVenueCode);
+                    var brokerMapping = _lookupRepository.GetBrokerMapping(
+                        msg.SourceVenueCode,
+                        msg.SourceVenueCode);
+
                     if (brokerMapping != null && brokerMapping.IsActive)
                     {
                         brokerCodeFromLookup = brokerMapping.NormalizedBrokerCode ?? string.Empty;
+                        hasBrokerMapping = !string.IsNullOrWhiteSpace(brokerCodeFromLookup);
                     }
                     else
                     {
-                        // Fallback: sätt broker = venue
+                        // Fallback: använd venue-koden som broker
                         brokerCodeFromLookup = msg.SourceVenueCode ?? string.Empty;
                     }
                 }
 
                 string portfolioMx3 = string.Empty;
+                bool hasPortfolioMapping = false;
                 if (!string.IsNullOrWhiteSpace(currencyPair))
                 {
-                    // v1: MX3-portfölj baserad på valutapar + produkttyp OPTION_VANILLA
+                    // V1: använder OPTION_VANILLA som default produkttyp i portföljregeln
                     portfolioMx3 = _lookupRepository.GetPortfolioCode("MX3", currencyPair, "OPTION_VANILLA")
                                    ?? string.Empty;
+
+                    hasPortfolioMapping = !string.IsNullOrWhiteSpace(portfolioMx3);
                 }
 
-                //
-                // 5. Skapa en Trade per leg
-                //
+                // 5. Legs (bygg per-leg-taggrupper på ett robust sätt)
+                var legTagGroups = ExtractLegTagGroups(tags);
+                var legs = new List<FixAeLeg>();
+                foreach (var legTags in legTagGroups)
+                {
+                    var leg = ParseLeg(legTags);
+                    if (leg != null)
+                        legs.Add(leg);
+                }
+
+                if (legs.Count == 0)
+                    return ParseResult.Failed("Inga legs hittades i AE-meddelandet.");
+
+                // 6. Bygg trades per leg
                 var parsedTrades = new List<ParsedTradeResult>();
 
                 foreach (var leg in legs)
                 {
+                    var workflowEvents = new List<TradeWorkflowEvent>();
+
+                    // Trader-routing
+                    string traderId = string.Empty;
+                    string invId = string.Empty;
+                    string reportingEntityId = string.Empty;
+
+                    if (traderRoutingInfo != null)
+                    {
+                        traderId = traderRoutingInfo.InternalUserId ?? string.Empty;
+                        invId = traderRoutingInfo.InvId ?? string.Empty;
+                        reportingEntityId = traderRoutingInfo.ReportingEntityId ?? string.Empty;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(traderShortCode))
+                    {
+                        var evt = new TradeWorkflowEvent
+                        {
+                            EventType = "WARNING",
+                            FieldName = "TraderId",
+                            OldValue = traderShortCode,
+                            NewValue = string.Empty,
+                            Description =
+                                $"Ingen trader-mappning hittades för venue '{msg.SourceVenueCode}' " +
+                                $"och traderkod '{traderShortCode}'. TraderId/InvId/ReportingEntityId lämnas tomma.",
+                            EventTimeUtc = DateTime.UtcNow,
+                            InitiatorId = "VolbrokerFixAeParser"
+                        };
+                        workflowEvents.Add(evt);
+                    }
+
                     // Notional: Volbroker skickar t.ex. "10" = 10 000 000
                     decimal notionalValue = 0m;
                     if (TryParseDecimal(leg.NotionalRaw, out var tmpNotional))
-                    {
                         notionalValue = tmpNotional * 1_000_000m;
-                    }
 
-                    // Strike (rå) – används endast för optioner
-                    decimal strikeValue = 0m;
-                    TryParseDecimal(leg.StrikeRaw, out strikeValue);
-
-                    // Premium (tag 614 = premium amount, ingen multiplikation) – endast optioner
-                    decimal premiumValue = 0m;
-                    TryParseDecimal(leg.PremiumRaw, out premiumValue);
-
-                    // Expiry – endast relevant för optioner
-                    DateTime expiryDate;
-                    if (!TryParseFixDate(leg.ExpiryRaw, out expiryDate))
-                    {
-                        expiryDate = tradeDate;
-                    }
-
-                    // Settlement – gemensamt för både optioner och FWD
-                    DateTime settlementDate;
-                    if (!TryParseFixDate(leg.SettlementDateRaw, out settlementDate))
-                    {
-                        settlementDate = tradeDate;
-                    }
-
-                    // ProductType per leg: OPT → OptionVanilla, FWD → Fwd
                     var productType = MapProductTypeForLeg(leg);
 
-                    // BUY/SELL per leg från tag 624 (B/C). Fallback till header 54 om saknas.
+                    // BUY/SELL per leg – ur Swedbanks perspektiv
                     string legBuySell;
                     var legSide = leg.Side != null ? leg.Side.Trim().ToUpperInvariant() : string.Empty;
+
                     if (legSide == "B")
-                        legBuySell = "BUY";
+                    {
+                        // Samma riktning som Swedbanks baseline
+                        legBuySell = baselineBuySell;
+                    }
                     else if (legSide == "C" || legSide == "S")
-                        legBuySell = "SELL";
+                    {
+                        // Motsatt riktning mot baseline
+                        if (baselineBuySell == "BUY")
+                            legBuySell = "SELL";
+                        else if (baselineBuySell == "SELL")
+                            legBuySell = "BUY";
+                        else
+                            legBuySell = baselineBuySell; // tom / okänd
+                    }
                     else
-                        legBuySell = headerBuySell;
+                    {
+                        // Om vi inte vet leg-side, använd baseline rakt av
+                        legBuySell = baselineBuySell;
+                    }
 
-                    // Workflow-events per leg (t.ex. varning vid saknad cut-mapping)
-                    var workflowEvents = new List<TradeWorkflowEvent>();
-
-                    // Basdata gemensamt för alla legs
+                    // Gemensamt trade-objekt (fylls sen per produkt-typ)
                     var trade = new Trade
                     {
                         MessageInId = msg.MessageInId,
@@ -350,12 +447,11 @@ namespace FxTradeHub.Domain.Parsing
                         SourceType = msg.SourceType ?? string.Empty,
                         SourceVenueCode = msg.SourceVenueCode ?? string.Empty,
 
-                        // Lookup-fält fylls i senare iterationer:
-                        CounterpartyCode = string.Empty,
+                        CounterpartyCode = counterpartyCode,
                         BrokerCode = brokerCodeFromLookup,
-                        TraderId = string.Empty,
-                        InvId = string.Empty,
-                        ReportingEntityId = string.Empty,
+                        TraderId = traderId,
+                        InvId = invId,
+                        ReportingEntityId = reportingEntityId,
 
                         CurrencyPair = currencyPair,
                         Mic = mic,
@@ -368,62 +464,67 @@ namespace FxTradeHub.Domain.Parsing
                         Notional = notionalValue,
                         NotionalCurrency = leg.NotionalCurrency ?? string.Empty,
                         SettlementCurrency = leg.NotionalCurrency ?? string.Empty,
-                        SettlementDate = settlementDate,
-
+                        SettlementDate = tradeDate,     // kan överstyras nedan
                         PortfolioMx3 = portfolioMx3
                     };
 
-                    // ----- UTI/TVTIC per leg -----
+                    // UTI + TVTIC per leg (unik per leg)
                     if (!string.IsNullOrWhiteSpace(leg.Tvtic))
                     {
                         trade.Tvtic = leg.Tvtic;
-
                         if (!string.IsNullOrWhiteSpace(utiPrefix))
-                        {
                             trade.Uti = utiPrefix + leg.Tvtic;
-                        }
                         else
-                        {
-                            // Fallback: använd leg.LegUti om vi inte har prefix
                             trade.Uti = leg.LegUti ?? string.Empty;
-                        }
                     }
                     else
                     {
-                        // Fallback: ingen TVTIC hittad → använd 2893 om den finns
                         trade.Tvtic = string.Empty;
                         trade.Uti = leg.LegUti ?? string.Empty;
                     }
 
-                    // ----- Produkt-beroende fält -----
+                    // Datum för settlement (gäller både optioner och FWD, men kommer oftast från 248)
+                    DateTime settlementDate;
+                    if (!TryParseFixDate(leg.SettlementDateRaw, out settlementDate))
+                        settlementDate = tradeDate;
+                    trade.SettlementDate = settlementDate;
+
                     if (productType == ProductType.OptionVanilla)
                     {
-                        // Option: Call/Put (mot basvalutan), strike, expiry, premium
+                        //
+                        // OPTION-FÄLT (ska INTE sättas på FWD-legs)
+                        //
+                        decimal strikeValue = 0m;
+                        TryParseDecimal(leg.StrikeRaw, out strikeValue);
+
+                        decimal premiumValue = 0m;
+                        TryParseDecimal(leg.PremiumRaw, out premiumValue);
+
+                        DateTime expiryDate;
+                        if (!TryParseFixDate(leg.ExpiryRaw, out expiryDate))
+                            expiryDate = tradeDate;
+
                         trade.CallPut = MapCallPutToBase(
                             leg.CallPut,
                             currencyPair,
                             leg.StrikeCurrency);
 
-                        // Cut från mapping-tabellen (inte Volbrokers egna syntax)
                         trade.Cut = hasCutMapping ? cutFromLookup : string.Empty;
 
                         if (!hasCutMapping)
                         {
-                            // Lägg ett workflow-event med varning om att cut-mapping saknas
                             var evt = new TradeWorkflowEvent
                             {
-                                // StpTradeId sätts senare i orchestratorn när traden skrivs till DB
                                 EventType = "WARNING",
-                                Description =
-                                    $"Ingen cut-mappning hittades för valutapar {currencyPair}. " +
-                                    $"Venue-cut '{leg.VenueCut}' ignoreras.",
                                 FieldName = "Cut",
                                 OldValue = leg.VenueCut ?? string.Empty,
                                 NewValue = string.Empty,
+                                Description =
+                                    $"Ingen cut-mappning hittades för valutapar {currencyPair}. " +
+                                    $"Venue-cut '{leg.VenueCut}' ignoreras.",
                                 EventTimeUtc = DateTime.UtcNow,
                                 InitiatorId = "VolbrokerFixAeParser"
                             };
-
                             workflowEvents.Add(evt);
                         }
 
@@ -433,33 +534,117 @@ namespace FxTradeHub.Domain.Parsing
                         trade.Premium = premiumValue;
                         trade.PremiumCurrency = leg.PremiumCurrency ?? leg.NotionalCurrency ?? string.Empty;
                         trade.PremiumDate = settlementDate;
-
-                        // Hedge-fält används inte för option-legs i v1
                     }
                     else if (productType == ProductType.Fwd)
                     {
-                        // FWD / hedge-leg:
-                        // - Sätt hedge-fält
-                        // - Låt option-fält (Strike/Expiry/Premium*) vara tomma
-
+                        //
+                        // HEDGE / FWD-FÄLT (ska INTE påverka option-ben)
+                        //
                         trade.HedgeType = "Forward";
 
-                        // HedgeRate från leg.HedgeRateRaw (LastPx, tag 637)
                         if (TryParseDecimal(leg.HedgeRateRaw, out var hedgeRate))
-                        {
                             trade.HedgeRate = hedgeRate;
-                        }
 
-                        // SpotRate / SwapPoints från header (194/195), om de finns
                         if (lastSpotRate.HasValue)
-                        {
                             trade.SpotRate = lastSpotRate.Value;
-                        }
 
                         if (lastForwardPoints.HasValue)
-                        {
                             trade.SwapPoints = lastForwardPoints.Value;
+                    }
+
+                    // ---------------------------------------------------------
+                    // CalypsoBook via stp_calypso_book_user (TraderId -> Book)
+                    // Gäller ENDAST för spot/fwd-deals (ProductType.Spot / ProductType.Fwd)
+                    // ---------------------------------------------------------
+                    bool hasCalypsoBookMapping = false;
+
+                    if ((productType == ProductType.Spot || productType == ProductType.Fwd)
+                        && !string.IsNullOrWhiteSpace(trade.TraderId))
+                    {
+                        var calypsoRule = _lookupRepository.GetCalypsoBookByTraderId(trade.TraderId);
+
+                        if (calypsoRule != null &&
+                            calypsoRule.IsActive &&
+                            !string.IsNullOrWhiteSpace(calypsoRule.CalypsoBook))
+                        {
+                            trade.CalypsoBook = calypsoRule.CalypsoBook;
+                            hasCalypsoBookMapping = true;
                         }
+                    }
+
+                    //
+                    // Header-baserade lookup-varningar som gäller denna trade
+                    //
+                    if (!hasCounterpartyMapping && !string.IsNullOrWhiteSpace(externalCounterpartyIdForEvent))
+                    {
+                        var evt = new TradeWorkflowEvent
+                        {
+                            EventType = "WARNING",
+                            FieldName = "CounterpartyCode",
+                            OldValue = externalCounterpartyIdForEvent,
+                            NewValue = string.Empty,
+                            Description =
+                                $"Ingen motpartsmappning hittades för extern kod '{externalCounterpartyIdForEvent}' " +
+                                $"(SourceType='{msg.SourceType}', SourceVenue='{msg.SourceVenueCode}'). " +
+                                "CounterpartyCode sätts till extern kod.",
+                            EventTimeUtc = DateTime.UtcNow,
+                            InitiatorId = "VolbrokerFixAeParser"
+                        };
+                        workflowEvents.Add(evt);
+                    }
+
+                    if (!hasBrokerMapping && !string.IsNullOrWhiteSpace(msg.SourceVenueCode))
+                    {
+                        var evt = new TradeWorkflowEvent
+                        {
+                            EventType = "WARNING",
+                            FieldName = "BrokerCode",
+                            OldValue = msg.SourceVenueCode,
+                            NewValue = brokerCodeFromLookup ?? string.Empty,
+                            Description =
+                                $"Ingen broker-mappning hittades för venue '{msg.SourceVenueCode}'. " +
+                                "BrokerCode sätts till venue-koden.",
+                            EventTimeUtc = DateTime.UtcNow,
+                            InitiatorId = "VolbrokerFixAeParser"
+                        };
+                        workflowEvents.Add(evt);
+                    }
+
+                    if (!hasPortfolioMapping && !string.IsNullOrWhiteSpace(currencyPair))
+                    {
+                        var evt = new TradeWorkflowEvent
+                        {
+                            EventType = "WARNING",
+                            FieldName = "PortfolioMx3",
+                            OldValue = currencyPair,
+                            NewValue = string.Empty,
+                            Description =
+                                $"Ingen MX3-portfölj hittades i ccypairportfoliorule för valutapar {currencyPair} " +
+                                $"och produkttyp {productType}. PortfolioMx3 lämnas tom.",
+                            EventTimeUtc = DateTime.UtcNow,
+                            InitiatorId = "VolbrokerFixAeParser"
+                        };
+                        workflowEvents.Add(evt);
+                    }
+
+                    // CalypsoBook-warning: bara för Spot/Fwd med känd TraderId
+                    if ((productType == ProductType.Spot || productType == ProductType.Fwd)
+                        && !string.IsNullOrWhiteSpace(trade.TraderId)
+                        && !hasCalypsoBookMapping)
+                    {
+                        var evt = new TradeWorkflowEvent
+                        {
+                            EventType = "WARNING",
+                            FieldName = "CalypsoBook",
+                            OldValue = trade.TraderId,
+                            NewValue = string.Empty,
+                            Description =
+                                $"Ingen CalypsoBook-mappning hittades i stp_calypso_book_user för TraderId '{trade.TraderId}'. " +
+                                "CalypsoBook lämnas tom.",
+                            EventTimeUtc = DateTime.UtcNow,
+                            InitiatorId = "VolbrokerFixAeParser"
+                        };
+                        workflowEvents.Add(evt);
                     }
 
                     parsedTrades.Add(new ParsedTradeResult
@@ -470,9 +655,6 @@ namespace FxTradeHub.Domain.Parsing
                     });
                 }
 
-                //
-                // 6. Returnera OK-resultat
-                //
                 return ParseResult.Ok(parsedTrades);
             }
             catch (Exception ex)
@@ -481,6 +663,169 @@ namespace FxTradeHub.Domain.Parsing
             }
         }
 
+
+
+
+        #region Helpers
+
+        /// <summary>
+        /// Extraherar sides (NoSides-gruppen) från AE-meddelandet och markerar
+        /// vilken side som är Swedbanks egen (448=SWEDSTK, 452=1).
+        /// </summary>
+        /// <param name="tags">Alla FIX-taggar i AE-meddelandet.</param>
+        /// <returns>Lista med SideInfo.</returns>
+        private static List<SideInfo> ExtractSides(List<FixTag> tags)
+        {
+            var result = new List<SideInfo>();
+            SideInfo currentSide = null;
+
+            bool insideSides = false;
+            string lastPartyId = null;
+
+            foreach (var tag in tags)
+            {
+                if (tag.Tag == 552)
+                {
+                    // NoSides – efter detta kommer side-grupper
+                    insideSides = true;
+                    continue;
+                }
+
+                if (!insideSides)
+                    continue;
+
+                if (tag.Tag == 54)
+                {
+                    // Start på en ny side
+                    if (currentSide != null)
+                        result.Add(currentSide);
+
+                    currentSide = new SideInfo
+                    {
+                        Side = tag.Value,
+                        IsOwnSide = false
+                    };
+
+                    lastPartyId = null;
+                    continue;
+                }
+
+                if (currentSide == null)
+                    continue;
+
+                if (tag.Tag == 448)
+                {
+                    // PartyID inom denna side
+                    lastPartyId = tag.Value;
+                    continue;
+                }
+
+                if (tag.Tag == 452)
+                {
+                    // PartyRole – vi markerar vår egen side om vi hittar SWEDSTK med role=1
+                    if (tag.Value == "1" &&
+                        !string.IsNullOrWhiteSpace(lastPartyId) &&
+                        string.Equals(lastPartyId, "SWEDSTK", StringComparison.OrdinalIgnoreCase))
+                    {
+                        currentSide.IsOwnSide = true;
+                    }
+                }
+            }
+
+            if (currentSide != null)
+                result.Add(currentSide);
+
+            return result;
+        }
+
+
+        /// <summary>
+        /// Bygger upp en lista av PartyInfo baserat på 448/452/523-taggarna
+        /// i AE-meddelandet (PARTIES-gruppen).
+        /// </summary>
+        private static List<PartyInfo> ExtractParties(List<FixTag> tags)
+        {
+            var result = new List<PartyInfo>();
+            PartyInfo current = null;
+
+            foreach (var tag in tags)
+            {
+                switch (tag.Tag)
+                {
+                    case 448: // PartyID
+                        // Starta en ny party-rad, pusha den föregående om den finns
+                        if (current != null)
+                            result.Add(current);
+
+                        current = new PartyInfo
+                        {
+                            PartyId = tag.Value
+                        };
+                        break;
+
+                    case 452: // PartyRole
+                        if (current != null && int.TryParse(tag.Value, out var role))
+                            current.PartyRole = role;
+                        break;
+
+                    case 523: // PartySubID (t.ex. trader-kortkod)
+                        if (current != null && !string.IsNullOrWhiteSpace(tag.Value))
+                            current.TraderShortCode = tag.Value;
+                        break;
+                }
+            }
+
+            if (current != null)
+                result.Add(current);
+
+            return result;
+        }
+
+        /// <summary>
+        /// Försöker ta fram motpartskoden (externt id, t.ex. "DB") ur PARTY-listan.
+        /// Regel:
+        /// 1) Ta sista party med role = 1 (Client/Customer) där PartyId != vårt eget ("SWEDSTK").
+        /// 2) Om ingen hittas: ta sista party med role = 12 (Executing Firm).
+        /// 3) Annars: returnera null.
+        /// </summary>
+        private static string ResolveCounterpartyCodeFromParties(List<PartyInfo> parties)
+        {
+            if (parties == null || parties.Count == 0)
+                return null;
+
+            const string ownFirmId = "SWEDSTK"; // v1: hårdkodat, kan tas från config senare
+
+            PartyInfo selected = null;
+
+            // 1) Sista party med role=1 och inte vår egen kod
+            for (int i = parties.Count - 1; i >= 0; i--)
+            {
+                var p = parties[i];
+                if (p.PartyRole == 1 &&
+                    !string.IsNullOrWhiteSpace(p.PartyId) &&
+                    !string.Equals(p.PartyId, ownFirmId, StringComparison.OrdinalIgnoreCase))
+                {
+                    selected = p;
+                    break;
+                }
+            }
+
+            // 2) Om ingen hittades, ta sista party med role=12 (Executing Firm)
+            if (selected == null)
+            {
+                for (int i = parties.Count - 1; i >= 0; i--)
+                {
+                    var p = parties[i];
+                    if (p.PartyRole == 12 && !string.IsNullOrWhiteSpace(p.PartyId))
+                    {
+                        selected = p;
+                        break;
+                    }
+                }
+            }
+
+            return selected?.PartyId;
+        }
 
 
         /// <summary>
@@ -546,53 +891,75 @@ namespace FxTradeHub.Domain.Parsing
 
 
         /// <summary>
-        /// Identifierar leg-grupper i FIX-taggarna.
-        /// Ett leg startar vid tag 600 och fortsätter tills nästa 600 eller slutet.
+        /// Delar upp hela FIX-taglistan i en lista av taggrupper,
+        /// en per leg, baserat på tag 600 (LegSymbol).
+        /// Avslutar legs-gruppen när vi når sides/party-delen (tag 552).
         /// </summary>
+        /// <param name="tags">Alla FIX-taggar i AE-meddelandet.</param>
+        /// <returns>Lista med en tag-lista per leg.</returns>
         private static List<List<FixTag>> ExtractLegTagGroups(List<FixTag> tags)
         {
             var result = new List<List<FixTag>>();
             List<FixTag> current = null;
 
-            foreach (var t in tags)
+            foreach (var tag in tags)
             {
-                if (t.Tag == 600) // start på nytt leg
+                if (tag.Tag == 600)
                 {
-                    if (current != null)
+                    // Ny leg börjar
+                    if (current != null && current.Count > 0)
                         result.Add(current);
 
-                    current = new List<FixTag>();
+                    current = new List<FixTag> { tag };
                 }
+                else
+                {
+                    if (current == null)
+                        continue;
 
-                if (current != null)
-                    current.Add(t);
+                    // När vi når sides/party-delen slutar vi samla legs
+                    if (tag.Tag == 552)
+                    {
+                        if (current.Count > 0)
+                            result.Add(current);
+
+                        current = null;
+                        break;
+                    }
+
+                    current.Add(tag);
+                }
             }
 
-            if (current != null)
+            if (current != null && current.Count > 0)
                 result.Add(current);
 
             return result;
         }
 
+
         /// <summary>
-        /// Bestämmer ProductType för ett leg baserat på SecurityType (tag 609).
-        /// OPT → OptionVanilla, FWD → Fwd, annars OptionVanilla som default.
+        /// Mappar en FixAeLeg till ProductType baserat på SecurityType (tag 609).
+        /// OPT → OptionVanilla, FWD → Fwd.
         /// </summary>
-        /// <param name="leg">Leg med SecurityType satt från FIX-tag 609.</param>
-        /// <returns>ProductType som ska användas på Trade.</returns>
+        /// <param name="leg">Leg-data extraherad från AE.</param>
+        /// <returns>ProductType.OptionVanilla eller ProductType.Fwd.</returns>
         private static ProductType MapProductTypeForLeg(FixAeLeg leg)
         {
-            if (leg == null || string.IsNullOrWhiteSpace(leg.SecurityType))
-                return ProductType.OptionVanilla;
+            var secType = leg.SecurityType != null
+                ? leg.SecurityType.Trim().ToUpperInvariant()
+                : string.Empty;
 
-            var secType = leg.SecurityType.Trim().ToUpperInvariant();
+            if (secType == "OPT")
+                return ProductType.OptionVanilla;
 
             if (secType == "FWD")
                 return ProductType.Fwd;
 
-            // OPT eller allt annat → OptionVanilla i v1
+            // Fallback: behandla som vanilla option
             return ProductType.OptionVanilla;
         }
+
 
         /// <summary>
         /// Mappar Volbrokers call/put (tag 764) till Call/Put definierat mot basvalutan.
@@ -650,7 +1017,37 @@ namespace FxTradeHub.Domain.Parsing
                    cp == "P" ? "Put" : string.Empty;
         }
 
+        /// <summary>
+        /// Försöker extrahera vår interna traderkod (short code) från PARTY-listan.
+        /// Regel (Volbroker):
+        /// - Hitta en party-rad med PartyRole (452) = 122 (Trader).
+        /// - Använd TraderShortCode (523) om den finns, annars PartyId (448).
+        /// Returnerar null om ingen trader hittas.
+        /// </summary>
+        /// <param name="parties">Lista av PartyInfo extraherad från AE.</param>
+        /// <returns>Trader short code, t.ex. "FORSPE", eller null.</returns>
+        private static string ExtractTraderShortCodeFromParties(List<PartyInfo> parties)
+        {
+            if (parties == null || parties.Count == 0)
+                return null;
 
+            foreach (var p in parties)
+            {
+                if (p.PartyRole == 122)
+                {
+                    if (!string.IsNullOrWhiteSpace(p.TraderShortCode))
+                        return p.TraderShortCode;
+
+                    if (!string.IsNullOrWhiteSpace(p.PartyId))
+                        return p.PartyId;
+                }
+            }
+
+            return null;
+        }
+
+
+        #endregion
 
         /// <summary>
         /// Bygger upp ett FixAeLeg-objekt från en lista FIX-taggar som tillhör ett leg.

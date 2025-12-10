@@ -260,6 +260,121 @@ LIMIT 1;";
         }
 
         /// <summary>
+        /// Försöker mappa ett externt motpartsnamn/kod till internt CounterpartyCode
+        /// via tabellen trade_stp.counterpartynamepattern.
+        /// </summary>
+        /// <param name="sourceType">Källa, t.ex. "FIX".</param>
+        /// <param name="sourceVenueCode">Venue, t.ex. "VOLBROKER".</param>
+        /// <param name="externalName">Externt motparts-id/namn, t.ex. "DB".</param>
+        /// <returns>CounterpartyCode eller null om ingen aktiv mappning hittas.</returns>
+        public string ResolveCounterpartyCode(string sourceType, string sourceVenueCode, string externalName)
+        {
+            if (string.IsNullOrWhiteSpace(externalName))
+            {
+                return null;
+            }
+
+            const string sql = @"
+SELECT
+    CounterpartyCode
+FROM trade_stp.counterpartynamepattern
+WHERE IsActive = 1
+  AND Pattern = @Pattern
+  AND (@SourceType IS NULL OR SourceType IS NULL OR SourceType = @SourceType)
+  AND (@SourceVenueCode IS NULL OR SourceVenueCode IS NULL OR SourceVenueCode = @SourceVenueCode)
+ORDER BY Priority ASC
+LIMIT 1;";
+
+            using (var connection = CreateConnection())
+            {
+                connection.Open();
+
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = sql;
+                    command.CommandType = CommandType.Text;
+
+                    command.Parameters.Add("@Pattern", MySqlDbType.VarChar, 200).Value = externalName;
+
+                    if (string.IsNullOrWhiteSpace(sourceType))
+                        command.Parameters.Add("@SourceType", MySqlDbType.VarChar, 20).Value = DBNull.Value;
+                    else
+                        command.Parameters.Add("@SourceType", MySqlDbType.VarChar, 20).Value = sourceType;
+
+                    if (string.IsNullOrWhiteSpace(sourceVenueCode))
+                        command.Parameters.Add("@SourceVenueCode", MySqlDbType.VarChar, 50).Value = DBNull.Value;
+                    else
+                        command.Parameters.Add("@SourceVenueCode", MySqlDbType.VarChar, 50).Value = sourceVenueCode;
+
+                    var result = command.ExecuteScalar();
+                    if (result == null || result == DBNull.Value)
+                    {
+                        return null;
+                    }
+
+                    return Convert.ToString(result);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Hämtar trader-routinginformation för en given venue-traderkod.
+        /// Bygger på tabellen trade_stp.stp_venue_trader_mapping och userprofile.
+        /// Returnerar null om ingen aktiv mappning hittas eller om användaren saknas.
+        /// </summary>
+        /// <param name="sourceVenueCode">Venue/källa, t.ex. "VOLBROKER".</param>
+        /// <param name="venueTraderCode">Traderkod från AE, t.ex. "FORSPE".</param>
+        /// <returns>TraderRoutingInfo eller null.</returns>
+        public TraderRoutingInfo GetTraderRoutingInfo(string sourceVenueCode, string venueTraderCode)
+        {
+            if (string.IsNullOrWhiteSpace(sourceVenueCode) || string.IsNullOrWhiteSpace(venueTraderCode))
+                return null;
+
+            const string sql = @"
+SELECT
+    m.InternalUserId,
+    u.Mx3Id,
+    u.ReportingEntityId
+FROM trade_stp.stp_venue_trader_mapping m
+JOIN trade_stp.userprofile u
+  ON u.UserId = m.InternalUserId
+WHERE m.SourceVenueCode = @SourceVenueCode
+  AND m.VenueTraderCode = @VenueTraderCode
+  AND m.IsActive = 1
+  AND u.IsActive = 1
+LIMIT 1;";
+
+            using (var connection = CreateConnection())
+            {
+                connection.Open();
+
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = sql;
+                    command.CommandType = CommandType.Text;
+
+                    command.Parameters.Add("@SourceVenueCode", MySqlDbType.VarChar, 50).Value = sourceVenueCode;
+                    command.Parameters.Add("@VenueTraderCode", MySqlDbType.VarChar, 50).Value = venueTraderCode;
+
+                    using (var reader = command.ExecuteReader())
+                    {
+                        if (!reader.Read())
+                            return null;
+
+                        var info = new TraderRoutingInfo
+                        {
+                            InternalUserId = reader["InternalUserId"] as string ?? string.Empty,
+                            InvId = reader["Mx3Id"] as string ?? string.Empty,
+                            ReportingEntityId = reader["ReportingEntityId"] as string ?? string.Empty
+                        };
+
+                        return info;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Mappar en datareader-rad till ExpiryCutCcyRule.
         /// </summary>
         /// <param name="reader">Datareader positionerad på en rad.</param>
