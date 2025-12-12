@@ -6,6 +6,7 @@ using FX.UI.WinForms;              // Form1, IAppInstance, PricerAppInstance, Le
 using System.Runtime.InteropServices;
 using FX.Core.Domain.MarketData;
 using FX.Services.MarketData;
+using FX.UI.WinForms.Features.Blotter;
 
 namespace FX.UI.WinForms
 {
@@ -36,6 +37,8 @@ namespace FX.UI.WinForms
 
             services.AddTransient<VolAppInstance>();
 
+            services.AddTransient<BlotterWorkspaceControl>();
+            services.AddTransient<BlotterPresenter>();
             services.AddTransient<BlotterAppInstance>();
 
             // Registrera EN global MarketStore för hela appen

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using FxTradeHub.Domain.Entities;
 using FxTradeHub.Domain.Interfaces;
 using FxTradeHub.Domain.Parsing;
+using FxTradeHub.Domain.Enums;
 using FxTradeHub.Domain.Repositories;
 
 namespace FxTradeHub.Services.Parsing
@@ -93,6 +94,13 @@ namespace FxTradeHub.Services.Parsing
             return null;
         }
 
+        /// <summary>
+        /// Kör parsing för ett MessageIn med vald parser och persisterar resultatet:
+        /// - Insert Trade (en per ParsedTradeResult)
+        /// - Insert TradeWorkflowEvent (per trade)
+        /// - Skapar och Insert TradeSystemLink (routing per trade, baserat på ProductType)
+        /// - Markerar MessageIn som ParsedFlag=true vid lyckad persistens av samtliga trades.
+        /// </summary>
         private void ParseAndPersist(MessageIn source, IInboundMessageParser parser)
         {
             try
@@ -119,23 +127,22 @@ namespace FxTradeHub.Services.Parsing
                         return;
                     }
 
-                    // 1) Koppla Trade tillbaka till MessageIn och spara via IStpRepository
+                    // 1) Koppla Trade tillbaka till MessageIn och spara Trade
                     var trade = tradeBundle.Trade;
                     trade.MessageInId = source.MessageInId;
 
                     var stpTradeId = _stpRepository.InsertTrade(trade);
 
-                    // 2) Spara TradeSystemLink-rader och sätt FK mot Trade.StpTradeId
-                    if (tradeBundle.SystemLinks != null)
+                    // 2) Skapa systemlänkar (routing) i orchestratorn
+                    var systemLinks = BuildSystemLinksForTrade(source, trade);
+
+                    foreach (var link in systemLinks)
                     {
-                        foreach (var link in tradeBundle.SystemLinks)
-                        {
-                            link.StpTradeId = stpTradeId;
-                            _stpRepository.InsertTradeSystemLink(link);
-                        }
+                        link.StpTradeId = stpTradeId;
+                        _stpRepository.InsertTradeSystemLink(link);
                     }
 
-                    // 3) Spara WorkflowEvents och sätt FK mot Trade.StpTradeId
+                    // 3) Spara WorkflowEvents och sätt FK mot StpTradeId
                     if (tradeBundle.WorkflowEvents != null)
                     {
                         foreach (var evt in tradeBundle.WorkflowEvents)
@@ -154,6 +161,137 @@ namespace FxTradeHub.Services.Parsing
                 MarkFailed(source, ex.ToString());
             }
         }
+
+        /// <summary>
+        /// Bygger standardlänkar (TradeSystemLink) för en ny trade baserat på produkt och venue.
+        /// Orchestratorn äger denna logik för att hålla parsern fokuserad på Trade-normalisering.
+        /// </summary>
+        private IList<TradeSystemLink> BuildSystemLinksForTrade(MessageIn source, Trade trade)
+        {
+            var now = DateTime.UtcNow;
+            var links = new List<TradeSystemLink>();
+
+            // Gemensamma defaults
+            const string stpModeManual = "MANUAL";
+            const string stpModeAuto = "AUTO";
+
+            // OPTION: bokas i MX3 och kan kräva ACK tillbaka (VOLBROKER_STP-länk).
+            if (trade.ProductType == ProductType.OptionVanilla ||
+                trade.ProductType == ProductType.OptionNdo)
+            {
+                // MX3
+                links.Add(CreateSystemLink(
+                    systemCode: SystemCode.Mx3,
+                    status: TradeSystemStatus.New,
+                    portfolioCode: trade.PortfolioMx3,
+                    bookFlag: true,
+                    stpMode: stpModeManual,
+                    externalTradeId: null,
+                    createdUtc: now,
+                    lastUpdatedUtc: now,
+                    importedBy: "STP"));
+
+                // VOLBROKER_STP (för ACK-flöde / spårbarhet).
+                // ExternalTradeId = Volbrokers trade-id (Trade.TradeId).
+                if (string.Equals(trade.SourceVenueCode, "VOLBROKER", StringComparison.OrdinalIgnoreCase))
+                {
+                    links.Add(CreateSystemLink(
+                        systemCode: SystemCode.VolbrokerStp,
+                        status: TradeSystemStatus.New,
+                        portfolioCode: null,
+                        bookFlag: false,
+                        stpMode: stpModeAuto,
+                        externalTradeId: trade.TradeId,
+                        createdUtc: now,
+                        lastUpdatedUtc: now,
+                        importedBy: "STP"));
+                }
+
+                return links;
+            }
+
+            // SPOT/FWD: bokas i MX3 och i Calypso (Calypso endast relevant för spot/hedge-flöden).
+            if (trade.ProductType == ProductType.Spot ||
+                trade.ProductType == ProductType.Fwd)
+            {
+                // MX3
+                links.Add(CreateSystemLink(
+                    systemCode: SystemCode.Mx3,
+                    status: TradeSystemStatus.New,
+                    portfolioCode: trade.PortfolioMx3,
+                    bookFlag: true,
+                    stpMode: stpModeManual,
+                    externalTradeId: null,
+                    createdUtc: now,
+                    lastUpdatedUtc: now,
+                    importedBy: "STP"));
+
+                // CALYPSO (PortfolioCode = Trade.CalypsoBook)
+                links.Add(CreateSystemLink(
+                    systemCode: SystemCode.Calypso,
+                    status: TradeSystemStatus.New,
+                    portfolioCode: trade.CalypsoBook,
+                    bookFlag: true,
+                    stpMode: stpModeManual,
+                    externalTradeId: null,
+                    createdUtc: now,
+                    lastUpdatedUtc: now,
+                    importedBy: "STP"));
+
+                return links;
+            }
+
+            // Övriga produkttyper (SWAP/NDF etc) – V1: endast MX3 som default.
+            links.Add(CreateSystemLink(
+                systemCode: SystemCode.Mx3,
+                status: TradeSystemStatus.New,
+                portfolioCode: trade.PortfolioMx3,
+                bookFlag: true,
+                stpMode: stpModeManual,
+                externalTradeId: null,
+                createdUtc: now,
+                lastUpdatedUtc: now,
+                importedBy: "STP"));
+
+            return links;
+        }
+
+        /// <summary>
+        /// Skapar en TradeSystemLink med konsistenta defaults (timestamps, feltexter, flaggor).
+        /// </summary>
+        private TradeSystemLink CreateSystemLink(
+            SystemCode systemCode,
+            TradeSystemStatus status,
+            string portfolioCode,
+            bool? bookFlag,
+            string stpMode,
+            string externalTradeId,
+            DateTime createdUtc,
+            DateTime lastUpdatedUtc,
+            string importedBy)
+        {
+            return new TradeSystemLink
+            {
+                SystemCode = systemCode,
+                Status = status,
+                PortfolioCode = portfolioCode ?? string.Empty,
+                BookFlag = bookFlag,
+                StpMode = stpMode ?? string.Empty,
+                ExternalTradeId = externalTradeId ?? string.Empty,
+                ErrorCode = string.Empty,
+                ErrorMessage = string.Empty,
+                ImportedBy = importedBy ?? string.Empty,
+                BookedBy = string.Empty,
+                FirstBookedUtc = null,
+                LastBookedUtc = null,
+                StpFlag = null,
+                IsDeleted = false,
+                CreatedUtc = createdUtc,
+                LastUpdatedUtc = lastUpdatedUtc
+            };
+        }
+
+
 
         private void MarkSuccess(MessageIn msg)
         {

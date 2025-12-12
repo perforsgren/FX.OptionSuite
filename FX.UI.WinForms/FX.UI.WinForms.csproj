@@ -90,6 +90,7 @@
     <Compile Include="App\VolAppInstance.cs" />
     <Compile Include="Features\Blotter\BlotterColumnMetadata.cs" />
     <Compile Include="Features\Blotter\BlotterPresenter.cs" />
+    <Compile Include="Features\Blotter\IBlotterView.cs" />
     <Compile Include="Features\VolManager\VolManagerPresenter.cs" />
     <Compile Include="Features\VolManager\VolManagerView.cs">
       <SubType>UserControl</SubType>

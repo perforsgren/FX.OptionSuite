@@ -35,6 +35,9 @@ namespace FX.UI.WinForms
             System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle4 = new System.Windows.Forms.DataGridViewCellStyle();
             System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle5 = new System.Windows.Forms.DataGridViewCellStyle();
             System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle6 = new System.Windows.Forms.DataGridViewCellStyle();
+            System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle7 = new System.Windows.Forms.DataGridViewCellStyle();
+            System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle8 = new System.Windows.Forms.DataGridViewCellStyle();
+            System.Windows.Forms.DataGridViewCellStyle dataGridViewCellStyle9 = new System.Windows.Forms.DataGridViewCellStyle();
             this._menuTopSpacer = new System.Windows.Forms.Panel();
             this._menu = new System.Windows.Forms.MenuStrip();
             this.fileToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
@@ -85,13 +88,6 @@ namespace FX.UI.WinForms
             this.pnlOptionsHeader = new System.Windows.Forms.Panel();
             this.lblOptionsCount = new System.Windows.Forms.Label();
             this.lblOptionsTitle = new System.Windows.Forms.Label();
-            this.pnlHedgeHeader = new System.Windows.Forms.Panel();
-            this.lblHedgeCount = new System.Windows.Forms.Label();
-            this.lblHedgeHeader = new System.Windows.Forms.Label();
-            this.panel1 = new System.Windows.Forms.Panel();
-            this.lblDetailsHeader = new System.Windows.Forms.Label();
-            this.pageAll = new System.Windows.Forms.TabPage();
-            this.pageSettings = new System.Windows.Forms.TabPage();
             this.dgvHedge = new System.Windows.Forms.DataGridView();
             this.dataGridViewTextBoxColumn1 = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dataGridViewTextBoxColumn2 = new System.Windows.Forms.DataGridViewTextBoxColumn();
@@ -100,6 +96,21 @@ namespace FX.UI.WinForms
             this.dataGridViewTextBoxColumn4 = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dataGridViewTextBoxColumn5 = new System.Windows.Forms.DataGridViewTextBoxColumn();
             this.dataGridViewTextBoxColumn6 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.pnlHedgeHeader = new System.Windows.Forms.Panel();
+            this.lblHedgeCount = new System.Windows.Forms.Label();
+            this.lblHedgeHeader = new System.Windows.Forms.Label();
+            this.panel1 = new System.Windows.Forms.Panel();
+            this.lblDetailsHeader = new System.Windows.Forms.Label();
+            this.pageAll = new System.Windows.Forms.TabPage();
+            this.dgvAll = new System.Windows.Forms.DataGridView();
+            this.dataGridViewTextBoxColumn7 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dataGridViewTextBoxColumn8 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dataGridViewTextBoxColumn9 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dataGridViewCheckBoxColumn2 = new System.Windows.Forms.DataGridViewCheckBoxColumn();
+            this.dataGridViewTextBoxColumn10 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dataGridViewTextBoxColumn11 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.dataGridViewTextBoxColumn12 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.pageSettings = new System.Windows.Forms.TabPage();
             this._menu.SuspendLayout();
             this._sideBarHost.SuspendLayout();
             this._sideBar.SuspendLayout();
@@ -116,9 +127,11 @@ namespace FX.UI.WinForms
             this.splitOptionsHedge.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)(this.dgvOptions)).BeginInit();
             this.pnlOptionsHeader.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.dgvHedge)).BeginInit();
             this.pnlHedgeHeader.SuspendLayout();
             this.panel1.SuspendLayout();
-            ((System.ComponentModel.ISupportInitialize)(this.dgvHedge)).BeginInit();
+            this.pageAll.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.dgvAll)).BeginInit();
             this.SuspendLayout();
             // 
             // _menuTopSpacer
@@ -387,6 +400,7 @@ namespace FX.UI.WinForms
             this.toolStripButton1.Name = "toolStripButton1";
             this.toolStripButton1.Size = new System.Drawing.Size(46, 20);
             this.toolStripButton1.Text = "toolStripButton1";
+            this.toolStripButton1.Click += new System.EventHandler(this.HandleRefreshRequested);
             // 
             // _panelMain
             // 
@@ -615,80 +629,6 @@ namespace FX.UI.WinForms
             this.lblOptionsTitle.TabIndex = 0;
             this.lblOptionsTitle.Text = "Options";
             // 
-            // pnlHedgeHeader
-            // 
-            this.pnlHedgeHeader.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(40)))), ((int)(((byte)(40)))), ((int)(((byte)(48)))));
-            this.pnlHedgeHeader.Controls.Add(this.lblHedgeCount);
-            this.pnlHedgeHeader.Controls.Add(this.lblHedgeHeader);
-            this.pnlHedgeHeader.Dock = System.Windows.Forms.DockStyle.Top;
-            this.pnlHedgeHeader.Location = new System.Drawing.Point(0, 0);
-            this.pnlHedgeHeader.Name = "pnlHedgeHeader";
-            this.pnlHedgeHeader.Size = new System.Drawing.Size(1028, 32);
-            this.pnlHedgeHeader.TabIndex = 2;
-            // 
-            // lblHedgeCount
-            // 
-            this.lblHedgeCount.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
-            this.lblHedgeCount.AutoSize = true;
-            this.lblHedgeCount.Font = new System.Drawing.Font("Segoe UI", 8.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.lblHedgeCount.ForeColor = System.Drawing.Color.Gainsboro;
-            this.lblHedgeCount.Location = new System.Drawing.Point(975, 11);
-            this.lblHedgeCount.Name = "lblHedgeCount";
-            this.lblHedgeCount.Size = new System.Drawing.Size(48, 13);
-            this.lblHedgeCount.TabIndex = 1;
-            this.lblHedgeCount.Text = "0 trades";
-            // 
-            // lblHedgeHeader
-            // 
-            this.lblHedgeHeader.AutoSize = true;
-            this.lblHedgeHeader.Font = new System.Drawing.Font("Segoe UI", 9.75F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.lblHedgeHeader.ForeColor = System.Drawing.Color.WhiteSmoke;
-            this.lblHedgeHeader.Location = new System.Drawing.Point(8, 7);
-            this.lblHedgeHeader.Name = "lblHedgeHeader";
-            this.lblHedgeHeader.Size = new System.Drawing.Size(48, 17);
-            this.lblHedgeHeader.TabIndex = 0;
-            this.lblHedgeHeader.Text = "Hedge";
-            // 
-            // panel1
-            // 
-            this.panel1.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(40)))), ((int)(((byte)(40)))), ((int)(((byte)(48)))));
-            this.panel1.Controls.Add(this.lblDetailsHeader);
-            this.panel1.Dock = System.Windows.Forms.DockStyle.Top;
-            this.panel1.Location = new System.Drawing.Point(0, 0);
-            this.panel1.Name = "panel1";
-            this.panel1.Size = new System.Drawing.Size(428, 32);
-            this.panel1.TabIndex = 2;
-            // 
-            // lblDetailsHeader
-            // 
-            this.lblDetailsHeader.AutoSize = true;
-            this.lblDetailsHeader.Font = new System.Drawing.Font("Segoe UI", 9.75F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
-            this.lblDetailsHeader.ForeColor = System.Drawing.Color.WhiteSmoke;
-            this.lblDetailsHeader.Location = new System.Drawing.Point(8, 7);
-            this.lblDetailsHeader.Name = "lblDetailsHeader";
-            this.lblDetailsHeader.Size = new System.Drawing.Size(51, 17);
-            this.lblDetailsHeader.TabIndex = 0;
-            this.lblDetailsHeader.Text = "Details";
-            // 
-            // pageAll
-            // 
-            this.pageAll.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(32)))), ((int)(((byte)(32)))), ((int)(((byte)(36)))));
-            this.pageAll.Location = new System.Drawing.Point(0, 4);
-            this.pageAll.Name = "pageAll";
-            this.pageAll.Padding = new System.Windows.Forms.Padding(3);
-            this.pageAll.Size = new System.Drawing.Size(1178, 620);
-            this.pageAll.TabIndex = 1;
-            this.pageAll.Text = "All";
-            // 
-            // pageSettings
-            // 
-            this.pageSettings.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(32)))), ((int)(((byte)(32)))), ((int)(((byte)(36)))));
-            this.pageSettings.Location = new System.Drawing.Point(0, 4);
-            this.pageSettings.Name = "pageSettings";
-            this.pageSettings.Size = new System.Drawing.Size(1178, 620);
-            this.pageSettings.TabIndex = 2;
-            this.pageSettings.Text = "Settings";
-            // 
             // dgvHedge
             // 
             this.dgvHedge.AllowUserToAddRows = false;
@@ -797,6 +737,188 @@ namespace FX.UI.WinForms
             this.dataGridViewTextBoxColumn6.ReadOnly = true;
             this.dataGridViewTextBoxColumn6.Width = 170;
             // 
+            // pnlHedgeHeader
+            // 
+            this.pnlHedgeHeader.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(40)))), ((int)(((byte)(40)))), ((int)(((byte)(48)))));
+            this.pnlHedgeHeader.Controls.Add(this.lblHedgeCount);
+            this.pnlHedgeHeader.Controls.Add(this.lblHedgeHeader);
+            this.pnlHedgeHeader.Dock = System.Windows.Forms.DockStyle.Top;
+            this.pnlHedgeHeader.Location = new System.Drawing.Point(0, 0);
+            this.pnlHedgeHeader.Name = "pnlHedgeHeader";
+            this.pnlHedgeHeader.Size = new System.Drawing.Size(1028, 32);
+            this.pnlHedgeHeader.TabIndex = 2;
+            // 
+            // lblHedgeCount
+            // 
+            this.lblHedgeCount.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.lblHedgeCount.AutoSize = true;
+            this.lblHedgeCount.Font = new System.Drawing.Font("Segoe UI", 8.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.lblHedgeCount.ForeColor = System.Drawing.Color.Gainsboro;
+            this.lblHedgeCount.Location = new System.Drawing.Point(975, 11);
+            this.lblHedgeCount.Name = "lblHedgeCount";
+            this.lblHedgeCount.Size = new System.Drawing.Size(48, 13);
+            this.lblHedgeCount.TabIndex = 1;
+            this.lblHedgeCount.Text = "0 trades";
+            // 
+            // lblHedgeHeader
+            // 
+            this.lblHedgeHeader.AutoSize = true;
+            this.lblHedgeHeader.Font = new System.Drawing.Font("Segoe UI", 9.75F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.lblHedgeHeader.ForeColor = System.Drawing.Color.WhiteSmoke;
+            this.lblHedgeHeader.Location = new System.Drawing.Point(8, 7);
+            this.lblHedgeHeader.Name = "lblHedgeHeader";
+            this.lblHedgeHeader.Size = new System.Drawing.Size(48, 17);
+            this.lblHedgeHeader.TabIndex = 0;
+            this.lblHedgeHeader.Text = "Hedge";
+            // 
+            // panel1
+            // 
+            this.panel1.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(40)))), ((int)(((byte)(40)))), ((int)(((byte)(48)))));
+            this.panel1.Controls.Add(this.lblDetailsHeader);
+            this.panel1.Dock = System.Windows.Forms.DockStyle.Top;
+            this.panel1.Location = new System.Drawing.Point(0, 0);
+            this.panel1.Name = "panel1";
+            this.panel1.Size = new System.Drawing.Size(428, 32);
+            this.panel1.TabIndex = 2;
+            // 
+            // lblDetailsHeader
+            // 
+            this.lblDetailsHeader.AutoSize = true;
+            this.lblDetailsHeader.Font = new System.Drawing.Font("Segoe UI", 9.75F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.lblDetailsHeader.ForeColor = System.Drawing.Color.WhiteSmoke;
+            this.lblDetailsHeader.Location = new System.Drawing.Point(8, 7);
+            this.lblDetailsHeader.Name = "lblDetailsHeader";
+            this.lblDetailsHeader.Size = new System.Drawing.Size(51, 17);
+            this.lblDetailsHeader.TabIndex = 0;
+            this.lblDetailsHeader.Text = "Details";
+            // 
+            // pageAll
+            // 
+            this.pageAll.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(32)))), ((int)(((byte)(32)))), ((int)(((byte)(36)))));
+            this.pageAll.Controls.Add(this.dgvAll);
+            this.pageAll.Location = new System.Drawing.Point(0, 4);
+            this.pageAll.Name = "pageAll";
+            this.pageAll.Padding = new System.Windows.Forms.Padding(3);
+            this.pageAll.Size = new System.Drawing.Size(1468, 714);
+            this.pageAll.TabIndex = 1;
+            this.pageAll.Text = "All";
+            // 
+            // dgvAll
+            // 
+            this.dgvAll.AllowUserToAddRows = false;
+            this.dgvAll.AllowUserToDeleteRows = false;
+            this.dgvAll.AllowUserToResizeRows = false;
+            dataGridViewCellStyle7.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(50)))), ((int)(((byte)(50)))), ((int)(((byte)(60)))));
+            this.dgvAll.AlternatingRowsDefaultCellStyle = dataGridViewCellStyle7;
+            this.dgvAll.BackgroundColor = System.Drawing.Color.FromArgb(((int)(((byte)(45)))), ((int)(((byte)(45)))), ((int)(((byte)(55)))));
+            this.dgvAll.BorderStyle = System.Windows.Forms.BorderStyle.None;
+            this.dgvAll.ColumnHeadersBorderStyle = System.Windows.Forms.DataGridViewHeaderBorderStyle.Single;
+            dataGridViewCellStyle8.Alignment = System.Windows.Forms.DataGridViewContentAlignment.MiddleLeft;
+            dataGridViewCellStyle8.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(55)))), ((int)(((byte)(65)))));
+            dataGridViewCellStyle8.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            dataGridViewCellStyle8.ForeColor = System.Drawing.Color.WhiteSmoke;
+            dataGridViewCellStyle8.SelectionBackColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(55)))), ((int)(((byte)(65)))));
+            dataGridViewCellStyle8.SelectionForeColor = System.Drawing.Color.WhiteSmoke;
+            dataGridViewCellStyle8.WrapMode = System.Windows.Forms.DataGridViewTriState.True;
+            this.dgvAll.ColumnHeadersDefaultCellStyle = dataGridViewCellStyle8;
+            this.dgvAll.ColumnHeadersHeight = 26;
+            this.dgvAll.Columns.AddRange(new System.Windows.Forms.DataGridViewColumn[] {
+            this.dataGridViewTextBoxColumn7,
+            this.dataGridViewTextBoxColumn8,
+            this.dataGridViewTextBoxColumn9,
+            this.dataGridViewCheckBoxColumn2,
+            this.dataGridViewTextBoxColumn10,
+            this.dataGridViewTextBoxColumn11,
+            this.dataGridViewTextBoxColumn12});
+            dataGridViewCellStyle9.Alignment = System.Windows.Forms.DataGridViewContentAlignment.MiddleLeft;
+            dataGridViewCellStyle9.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(45)))), ((int)(((byte)(45)))), ((int)(((byte)(55)))));
+            dataGridViewCellStyle9.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            dataGridViewCellStyle9.ForeColor = System.Drawing.Color.WhiteSmoke;
+            dataGridViewCellStyle9.SelectionBackColor = System.Drawing.Color.FromArgb(((int)(((byte)(70)))), ((int)(((byte)(100)))), ((int)(((byte)(160)))));
+            dataGridViewCellStyle9.SelectionForeColor = System.Drawing.Color.White;
+            dataGridViewCellStyle9.WrapMode = System.Windows.Forms.DataGridViewTriState.False;
+            this.dgvAll.DefaultCellStyle = dataGridViewCellStyle9;
+            this.dgvAll.EnableHeadersVisualStyles = false;
+            this.dgvAll.GridColor = System.Drawing.Color.FromArgb(((int)(((byte)(60)))), ((int)(((byte)(60)))), ((int)(((byte)(70)))));
+            this.dgvAll.Location = new System.Drawing.Point(91, 247);
+            this.dgvAll.MultiSelect = false;
+            this.dgvAll.Name = "dgvAll";
+            this.dgvAll.RowHeadersVisible = false;
+            this.dgvAll.SelectionMode = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
+            this.dgvAll.Size = new System.Drawing.Size(1028, 357);
+            this.dgvAll.TabIndex = 4;
+            // 
+            // dataGridViewTextBoxColumn7
+            // 
+            this.dataGridViewTextBoxColumn7.DataPropertyName = "SessionKey";
+            this.dataGridViewTextBoxColumn7.HeaderText = "Session";
+            this.dataGridViewTextBoxColumn7.MinimumWidth = 130;
+            this.dataGridViewTextBoxColumn7.Name = "dataGridViewTextBoxColumn7";
+            this.dataGridViewTextBoxColumn7.ReadOnly = true;
+            this.dataGridViewTextBoxColumn7.Width = 170;
+            // 
+            // dataGridViewTextBoxColumn8
+            // 
+            this.dataGridViewTextBoxColumn8.DataPropertyName = "VenueCode";
+            this.dataGridViewTextBoxColumn8.HeaderText = "Venue";
+            this.dataGridViewTextBoxColumn8.MinimumWidth = 80;
+            this.dataGridViewTextBoxColumn8.Name = "dataGridViewTextBoxColumn8";
+            this.dataGridViewTextBoxColumn8.ReadOnly = true;
+            this.dataGridViewTextBoxColumn8.Width = 120;
+            // 
+            // dataGridViewTextBoxColumn9
+            // 
+            this.dataGridViewTextBoxColumn9.DataPropertyName = "ConnectionType";
+            this.dataGridViewTextBoxColumn9.HeaderText = "Type";
+            this.dataGridViewTextBoxColumn9.MinimumWidth = 80;
+            this.dataGridViewTextBoxColumn9.Name = "dataGridViewTextBoxColumn9";
+            this.dataGridViewTextBoxColumn9.ReadOnly = true;
+            this.dataGridViewTextBoxColumn9.Width = 120;
+            // 
+            // dataGridViewCheckBoxColumn2
+            // 
+            this.dataGridViewCheckBoxColumn2.DataPropertyName = "IsEnabled";
+            this.dataGridViewCheckBoxColumn2.HeaderText = "Enabled";
+            this.dataGridViewCheckBoxColumn2.MinimumWidth = 60;
+            this.dataGridViewCheckBoxColumn2.Name = "dataGridViewCheckBoxColumn2";
+            this.dataGridViewCheckBoxColumn2.Width = 70;
+            // 
+            // dataGridViewTextBoxColumn10
+            // 
+            this.dataGridViewTextBoxColumn10.DataPropertyName = "RuntimeStatus";
+            this.dataGridViewTextBoxColumn10.HeaderText = "Status";
+            this.dataGridViewTextBoxColumn10.MinimumWidth = 100;
+            this.dataGridViewTextBoxColumn10.Name = "dataGridViewTextBoxColumn10";
+            this.dataGridViewTextBoxColumn10.ReadOnly = true;
+            this.dataGridViewTextBoxColumn10.Width = 140;
+            // 
+            // dataGridViewTextBoxColumn11
+            // 
+            this.dataGridViewTextBoxColumn11.DataPropertyName = "RuntimeLastHeartbeat";
+            this.dataGridViewTextBoxColumn11.HeaderText = "Last heartbeat";
+            this.dataGridViewTextBoxColumn11.MinimumWidth = 90;
+            this.dataGridViewTextBoxColumn11.Name = "dataGridViewTextBoxColumn11";
+            this.dataGridViewTextBoxColumn11.ReadOnly = true;
+            this.dataGridViewTextBoxColumn11.Width = 130;
+            // 
+            // dataGridViewTextBoxColumn12
+            // 
+            this.dataGridViewTextBoxColumn12.DataPropertyName = "RuntimeLastError";
+            this.dataGridViewTextBoxColumn12.HeaderText = "Error";
+            this.dataGridViewTextBoxColumn12.MinimumWidth = 120;
+            this.dataGridViewTextBoxColumn12.Name = "dataGridViewTextBoxColumn12";
+            this.dataGridViewTextBoxColumn12.ReadOnly = true;
+            this.dataGridViewTextBoxColumn12.Width = 170;
+            // 
+            // pageSettings
+            // 
+            this.pageSettings.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(32)))), ((int)(((byte)(32)))), ((int)(((byte)(36)))));
+            this.pageSettings.Location = new System.Drawing.Point(0, 4);
+            this.pageSettings.Name = "pageSettings";
+            this.pageSettings.Size = new System.Drawing.Size(1468, 714);
+            this.pageSettings.TabIndex = 2;
+            this.pageSettings.Text = "Settings";
+            // 
             // BlotterWorkspaceControl
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
@@ -826,11 +948,13 @@ namespace FX.UI.WinForms
             ((System.ComponentModel.ISupportInitialize)(this.dgvOptions)).EndInit();
             this.pnlOptionsHeader.ResumeLayout(false);
             this.pnlOptionsHeader.PerformLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.dgvHedge)).EndInit();
             this.pnlHedgeHeader.ResumeLayout(false);
             this.pnlHedgeHeader.PerformLayout();
             this.panel1.ResumeLayout(false);
             this.panel1.PerformLayout();
-            ((System.ComponentModel.ISupportInitialize)(this.dgvHedge)).EndInit();
+            this.pageAll.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)(this.dgvAll)).EndInit();
             this.ResumeLayout(false);
             this.PerformLayout();
 
@@ -903,5 +1027,13 @@ namespace FX.UI.WinForms
         private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn4;
         private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn5;
         private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn6;
+        private System.Windows.Forms.DataGridView dgvAll;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn7;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn8;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn9;
+        private System.Windows.Forms.DataGridViewCheckBoxColumn dataGridViewCheckBoxColumn2;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn10;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn11;
+        private System.Windows.Forms.DataGridViewTextBoxColumn dataGridViewTextBoxColumn12;
     }
 }

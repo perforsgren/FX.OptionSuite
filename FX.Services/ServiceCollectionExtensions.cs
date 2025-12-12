@@ -3,6 +3,9 @@ using System;
 using Microsoft.Extensions.DependencyInjection;
 using CoreI = FX.Core.Interfaces;
 using FX.Infrastructure.VolDb;
+using FxTradeHub.Services;
+using FxTradeHub.Domain.Interfaces;
+using FxTradeHub.Data.MySql.Repositories;
 
 namespace FX.Services
 {
@@ -43,12 +46,43 @@ namespace FX.Services
                 "Password=" + password + ";" +
                 "Connection Timeout=15;SslMode=None;TreatTinyAsBoolean=false;";
 
-            // Read
+            // Blotter read service – kan vara Singleton eftersom den bara är ett tunt lager över IStpRepository
+            services.AddSingleton<IBlotterReadService, BlotterReadService>();
+
+            // Asynkron blotter-lässervice för async presenter
+            services.AddSingleton<IBlotterReadServiceAsync, BlotterReadServiceAsync>();
+
+            var tradeStpConnectionString = BuildTradeStpConnectionString();
+
+            // STP-repositories (synkrona)
+            services.AddSingleton<IStpRepository>(_ => new MySqlStpRepository(tradeStpConnectionString));
+            services.AddSingleton<IStpLookupRepository>(_ => new MySqlStpLookupRepository(tradeStpConnectionString));
+
+            // STP-repository (asynkront) – används av blotterns async read-path
+            services.AddSingleton<IStpRepositoryAsync>(_ => new MySqlStpRepositoryAsync(tradeStpConnectionString));
+
+            // Volatility read & write
             services.AddSingleton<CoreI.IVolRepository>(_ => new MySqlVolRepository(fxvolConn));
-            // Write
             services.AddSingleton<CoreI.IVolWriteRepository>(_ => new MySqlVolWriteRepository(fxvolConn));
 
             return services;
         }
+
+        /// <summary>
+        /// Bygger connection string för trade_stp-databasen.
+        /// </summary>
+        private static string BuildTradeStpConnectionString()
+        {
+            string username = "fxopt";
+            string password = "fxopt987";
+
+            return
+                "Server=srv78506;Port=3306;Database=trade_stp;" +
+                "User Id=" + username + ";" +
+                "Password=" + password + ";" +
+                "Connection Timeout=15;TreatTinyAsBoolean=false;";
+        }
+
+
     }
 }

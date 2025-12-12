@@ -717,7 +717,9 @@ namespace FX.UI.WinForms
 
         #region === Blotter (en-instans via DI) ===
 
-        /// <summary>Öppnar eller fokuserar Blotter-appen (en instans), med samma mönster som Pricer/Vol.</summary>
+        /// <summary>
+        /// Öppnar eller fokuserar Blotter-appen (en instans), med samma mönster som Pricer/Vol.
+        /// </summary>
         private void OpenOrFocusBlotter()
         {
             const string key = "Blotter";
@@ -756,7 +758,12 @@ namespace FX.UI.WinForms
 
             // Visa enligt aktuell window mode (Attached/Detached).
             ShowInCurrentMode(doc);
+
+            // Säkerställ att initial aktivering alltid körs en gång,
+            // även om DockContent.Activated inte triggas vid första visningen.
+            Safe(blotter.OnActivated);
         }
+
 
 
 

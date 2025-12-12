@@ -1,21 +1,15 @@
 using System;
-using System.Collections.Generic;
-using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using FX.UI.WinForms.Features.Blotter;
-using static System.Windows.Forms.VisualStyles.VisualStyleElement;
-using FxTradeHub.Contracts.Dtos;
-using FxTradeHub.Services;
+
 
 
 namespace FX.UI.WinForms
 {
-    public partial class BlotterWorkspaceControl : UserControl
+    public partial class BlotterWorkspaceControl : UserControl, IBlotterView
     {
 
 
@@ -25,14 +19,20 @@ namespace FX.UI.WinForms
         private BlotterPresenter _presenter;
 
         /// <summary>
-        /// BindingSource för Options-griden (binder mot presenter.OptionsTrades).
+        /// BindingSource för Options-griden (binder mot presenterns OptionsTrades-lista).
         /// </summary>
-        private BindingSource _optionsBindingSource;
+        //private BindingSource _optionsBindingSource;
 
         /// <summary>
-        /// BindingSource för Hedge/FX Linear-griden (binder mot presenter.HedgeTrades).
+        /// BindingSource för Hedge-griden (binder mot presenterns HedgeTrades-lista).
         /// </summary>
-        private BindingSource _hedgeBindingSource;
+        //private BindingSource _hedgeBindingSource;
+
+        /// <summary>
+        /// Flagga som markerar om initial dataladdning redan är gjord.
+        /// Förhindrar att vi laddar om varje gång fönstret aktiveras.
+        /// </summary>
+        private bool _initialLoadDone;
 
 
         public BlotterWorkspaceControl()
@@ -48,67 +48,76 @@ namespace FX.UI.WinForms
             ConfigureGrid(dgvHedge);
             CreateColumnsHedge(dgvHedge);
 
-            //ConfigureGrid(dgvAll);
-            //CreateColumnsAll(dgvAll);
+            ConfigureGrid(dgvAll);
+            CreateColumnsAll(dgvAll);
 
         }
 
         /// <summary>
-        /// Initialiserar blotter-workspacet med en presenter och kopplar
-        /// presenter-listorna till Options- respektive Hedge-griden.
-        /// 
-        /// v1:
-        /// - Skapar BindingSource:or mot presenter.OptionsTrades/HedgeTrades.
-        /// - Gör en första laddning mot STP-hubben med ett enkelt datumfilter.
+        /// Initierar blotter-workspacet med en given presenter.
+        /// Kopplar ihop presenter och view samt sätter upp databindning
+        /// mot Options-, Hedge- och All-grids.
         /// </summary>
-        /// <param name="presenter">
-        /// BlotterPresenter som ansvarar för att läsa data från STP-hubben.
-        /// Får inte vara null och får bara initieras en gång per kontroll-instans.
-        /// </param>
+        /// <param name="presenter">Presenter som äger blotter-logiken.</param>
         public void Initialize(BlotterPresenter presenter)
         {
             if (presenter == null) throw new ArgumentNullException(nameof(presenter));
 
-            if (_presenter != null)
-            {
-                // Skydd mot dubbel-initiering om någon försöker kalla Initialize två gånger.
-                throw new InvalidOperationException("BlotterWorkspaceControl är redan initialiserad.");
-            }
-
             _presenter = presenter;
+            _presenter.AttachView(this);
 
-            // --- Skapa BindingSource:or och koppla till grids ---
+            // Bind grids till presenterns BindingList:ar (read-only v1).
+            var optionsSource = new BindingSource { DataSource = _presenter.OptionsTrades };
+            var hedgeSource = new BindingSource { DataSource = _presenter.HedgeTrades };
+            var allSource = new BindingSource { DataSource = _presenter.AllTrades };
 
-            _optionsBindingSource = new BindingSource
-            {
-                DataSource = _presenter.OptionsTrades
-            };
-            dgvOptions.AutoGenerateColumns = false;
-            dgvOptions.DataSource = _optionsBindingSource;
+            dgvOptions.DataSource = optionsSource;
+            dgvHedge.DataSource = hedgeSource;
+            dgvAll.DataSource = allSource;
 
-            _hedgeBindingSource = new BindingSource
-            {
-                DataSource = _presenter.HedgeTrades
-            };
-            dgvHedge.AutoGenerateColumns = false;
-            dgvHedge.DataSource = _hedgeBindingSource;
-
-            // --- Enkel default-filtrering v1 ---
-            // v1: "senaste dygnet" runt idag, max t.ex. 2000 rader.
-            var filter = new BlotterFilter
-            {
-                FromTradeDate = DateTime.Today.AddDays(-1),
-                ToTradeDate = DateTime.Today.AddDays(1),
-                MaxRows = 2000,
-                // Kan användas server-side för "mina trades"-logik om du vill.
-                CurrentUserId = Environment.UserName
-            };
-
-            _presenter.LoadInitial(filter);
-
-            // Uppdatera rubrikerna med antal trades.
+            // Initiera row-count-labels till 0 tills första laddningen är gjord.
             UpdateRowCounts();
         }
+
+
+        /// <summary>
+        /// Anropas när blotter-fönstret aktiveras i shellen.
+        /// Delegerar till presentern och uppdaterar sedan rad-räknarna.
+        /// </summary>
+        public void OnActivated()
+        {
+            if (_presenter == null)
+            {
+                return;
+            }
+
+            _presenter.OnActivated();
+
+            // Efter att presentern ev. laddat initial data uppdaterar vi counts.
+            UpdateRowCounts();
+        }
+
+
+        public void OnDeactivated() => _presenter?.OnDeactivated();
+
+        /// <summary>
+        /// Grid som används för att visa options-trades i blottern.
+        /// Presentern binder sina options-rader mot denna grid.
+        /// </summary>
+        public DataGridView OptionsGrid => dgvOptions;
+
+        /// <summary>
+        /// Grid som används för att visa hedge/linjära trades i blottern.
+        /// Presentern binder sina hedge-rader mot denna grid.
+        /// </summary>
+        public DataGridView HedgeGrid => dgvHedge;
+
+        /// <summary>
+        /// Grid som används för att visa alla trades (alla produkt-typer).
+        /// Presentern binder sina "All"-rader mot denna grid.
+        /// </summary>
+        public DataGridView AllGrid => dgvAll;
+
 
 
         /// <summary>
@@ -178,10 +187,12 @@ namespace FX.UI.WinForms
                 // Välj kolumntyp utifrån editor-metadata
                 if (def.EditorType == BlotterEditorType.Combo && def.IsEditable)
                 {
-                    var combo = new DataGridViewComboBoxColumn
+                    var combo = new CustomComboBoxColumn
                     {
+
                         DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton,
-                        FlatStyle = FlatStyle.Flat
+                        FlatStyle = FlatStyle.Flat,
+                        //DisplayStyleForCurrentCellOnly = true
                     };
 
                     // Tillfälliga standardval – ersätts senare med riktiga lookups.
@@ -273,7 +284,7 @@ namespace FX.UI.WinForms
                 // Välj kolumntyp utifrån editor-metadata
                 if (def.EditorType == BlotterEditorType.Combo && def.IsEditable)
                 {
-                    var combo = new DataGridViewComboBoxColumn
+                    var combo = new CustomComboBoxColumn
                     {
                         DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton,
                         FlatStyle = FlatStyle.Flat
@@ -368,7 +379,7 @@ namespace FX.UI.WinForms
                 // Välj kolumntyp utifrån editor-metadata
                 if (def.EditorType == BlotterEditorType.Combo && def.IsEditable)
                 {
-                    var combo = new DataGridViewComboBoxColumn
+                    var combo = new CustomComboBoxColumn
                     {
                         DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton,
                         FlatStyle = FlatStyle.Flat
@@ -434,27 +445,6 @@ namespace FX.UI.WinForms
         }
 
 
-
-        // === Publikt API (activation) ===
-
-        /// <summary>
-        /// Anropas när blotter-fönstret aktiveras i shellen.
-        /// Här ser vi bara till att sidomenyn hamnar i rätt höjd mot innehållet.
-        /// </summary>
-        public void OnActivated()
-        {
-
-        }
-
-        /// <summary>
-        /// Anropas när blotter-fönstret tappar fokus i shellen.
-        /// Första versionen gör inget särskilt, men hooken finns för framtiden.
-        /// </summary>
-        public void OnDeactivated()
-        {
-
-        }
-
         // === Hjälpare ===
 
         /// <summary>
@@ -509,14 +499,107 @@ namespace FX.UI.WinForms
         {
             if (_presenter == null)
             {
-                lblOptionsCount.Text = "0";
-                lblHedgeCount.Text = "0";
+                lblOptionsCount.Text = "0 trades";
+                lblHedgeCount.Text = "0 trades";
                 return;
             }
 
-            lblOptionsCount.Text = _presenter.OptionsTrades.Count.ToString();
-            lblHedgeCount.Text = _presenter.HedgeTrades.Count.ToString();
+            lblOptionsCount.Text = _presenter.OptionsTrades.Count.ToString() + " trades";
+            lblHedgeCount.Text = _presenter.HedgeTrades.Count.ToString() + " trades";
         }
 
+
+        //Event handlers
+
+        /// <summary>
+        /// Hanterar manuellt refresh-kommando (meny eller toolbar).
+        /// Delegerar till presentern och uppdaterar rad-räknarna i UI:t.
+        /// </summary>
+        private void HandleRefreshRequested(object sender, EventArgs e)
+        {
+            if (_presenter == null)
+            {
+                return;
+            }
+
+            _presenter.Refresh();
+            UpdateRowCounts();
+        }
     }
+
+    public class CustomComboBoxCell : DataGridViewComboBoxCell
+    {
+        protected override void Paint(Graphics graphics,
+            Rectangle clipBounds,
+            Rectangle cellBounds,
+            int rowIndex,
+            DataGridViewElementStates cellState,
+            object value,
+            object formattedValue,
+            string errorText,
+            DataGridViewCellStyle cellStyle,
+            DataGridViewAdvancedBorderStyle advancedBorderStyle,
+            DataGridViewPaintParts paintParts)
+        {
+            // Låt basen rita allt som vanligt (text, borders, osv)
+            base.Paint(graphics, clipBounds, cellBounds, rowIndex,
+                       cellState, value, formattedValue, errorText,
+                       cellStyle, advancedBorderStyle, paintParts);
+
+            // Vilken bakgrund ska knappen ha? (selected eller ej)
+            bool isSelected = (cellState & DataGridViewElementStates.Selected) != 0;
+            Color backColor = isSelected
+                ? cellStyle.SelectionBackColor
+                : cellStyle.BackColor;
+
+            // Rektangel för knapp/pil-ytan
+            int buttonWidth = 18; // justera efter smak
+            var buttonRect = new Rectangle(
+                cellBounds.Right - buttonWidth - 1,
+                cellBounds.Top + 1,
+                buttonWidth,
+                cellBounds.Height - 2);
+
+            // Måla om knappytan i samma färg som cellen
+            using (var backBrush = new SolidBrush(backColor))
+            {
+                graphics.FillRectangle(backBrush, buttonRect);
+            }
+
+            // (valfritt) tunn ram runt knappytan
+            //using (var borderPen = new Pen(cellStyle.ForeColor))
+            //{
+            //    graphics.DrawRectangle(borderPen,
+            //        buttonRect.X, buttonRect.Y,
+            //        buttonRect.Width - 1, buttonRect.Height - 1);
+            //}
+
+            // Rita vit pil i mitten av knappytan
+            int cx = buttonRect.Left + buttonRect.Width / 2;
+            int cy = buttonRect.Top + buttonRect.Height / 2;
+
+            Point[] arrow =
+            {
+            new Point(cx - 4, cy - 2),
+            new Point(cx + 4, cy - 2),
+            new Point(cx,     cy + 3)
+        };
+
+            using (var arrowBrush = new SolidBrush(Color.White))
+            {
+                graphics.FillPolygon(arrowBrush, arrow);
+            }
+        }
+    }
+
+    public class CustomComboBoxColumn : DataGridViewComboBoxColumn
+    {
+        public CustomComboBoxColumn()
+        {
+            this.CellTemplate = new CustomComboBoxCell();
+            this.FlatStyle = FlatStyle.Flat; // ser oftast bäst ut ihop med custom-paint
+        }
+    }
+
+
 }
